@@ -221,7 +221,7 @@
       "proxy"
     ],
     "env": {
-      "STITCH_API_KEY": "AQ.Ab8RN6LVk1uWs3v7wKo1yEpSX9e9fsksdjUH6SHB3TV0CiQj3A"
+      "STITCH_API_KEY": "your_api_key"
     }
   }
 }
