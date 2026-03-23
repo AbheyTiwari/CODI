@@ -61,17 +61,19 @@ python main.py
 ## 🔌 MCP Servers (Plugins)
 
 Model Context Protocol (MCP) servers allow Codi to instantly gain new tools without custom Python code.  
-By default, Codi connects via `mcp_servers.json`. Codi supports 12+ free community tools out of the box including:
-- `filesystem`: Deep OS file management.
-- `fetch`: URL scraping and reading.
-- `git`: Full version control operations.
-- `memory`: Cross-session persistent knowledge graph.
-- `sequential-thinking`: Enforced reasoning scaffolding.
+Codi natively bundles configurations for **21 powerful MCP servers** inside `mcp_servers.json`. Most are disabled by default (except for filesystem/git essentials) but can be instantly activated using `/mcp on <name>`.
 
-To install standard free MCP plugins, ask Codi to run:
-```bash
-/plan Set up all free MCP servers for Codi
-```
+### The Pre-Configured MCP Arsenal:
+- **Core Engineering:** `filesystem`, `memory`, `sequential-thinking`, `git`, `python-sandbox`
+- **Third-Party APIs:** `brave-search`, `github`, `gitlab`, `searxng` (free, open-source web search)
+- **Databases:** `postgres`, `sqlite`, `mysql`, `redis`
+- **DevOps & Infra:** `docker`, `kubernetes`
+- **Monitoring & QA:** `sentry`, `prometheus`
+- **Automation & Scraping:** `puppeteer`, `playwright`, `fetch`
+- **Design:** `stitch` (Google UI/UX code extractor via SSE)
+- **API Interfaces:** `openapi`
+
+Easily add any open-source or custom MCP module to the JSON registry to instantly give Codi those capabilities.
 
 ## 🧠 Architecture
 - `main.py`: The core REPL loop, terminal UI (`rich`), and command routing.
