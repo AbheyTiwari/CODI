@@ -203,15 +203,16 @@
   "searxng": {
     "enabled": true,
     "description": "Free self-hosted web search, no API key needed",
-    "command": "uvx",
+    "command": "npx",
     "args": [
-      "mcp-server-searxng",
+      "-y",
+      "mcp-searxng",
       "--url",
       "https://searx.be"
     ]
   },
   "stitch": {
-    "enabled": false,
+    "enabled": true,
     "description": "Google Stitch UI/UX design components",
     "command": "npx",
     "args": [
@@ -220,7 +221,7 @@
       "proxy"
     ],
     "env": {
-      "STITCH_API_KEY": "your-key-here"
+      "STITCH_API_KEY": "AQ.Ab8RN6LVk1uWs3v7wKo1yEpSX9e9fsksdjUH6SHB3TV0CiQj3A"
     }
   }
 }

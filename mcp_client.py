@@ -4,6 +4,7 @@ import json
 import os
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 MCP_CONFIG_FILE = "mcp_servers.json"
@@ -16,16 +17,26 @@ def load_mcp_config() -> dict:
 
 async def get_mcp_tools_async(server_name: str, server_config: dict):
     """Connect to a single MCP server and return its tools as LangChain tools."""
-    params = StdioServerParameters(
-        command=server_config["command"],
-        args=server_config.get("args", []),
-        env={**os.environ, **server_config.get("env", {})}
-    )
     tools = []
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tools = await load_mcp_tools(session)
+    
+    if server_config.get("type") == "sse":
+        url = server_config.get("url")
+        # Stitch and other SSE proxy servers run autonomously and expect external connections.
+        async with sse_client(url) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await load_mcp_tools(session)
+    else:
+        params = StdioServerParameters(
+            command=server_config["command"],
+            args=server_config.get("args", []),
+            env={**os.environ, **server_config.get("env", {})}
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await load_mcp_tools(session)
+                
     return tools
 
 def get_mcp_tools(server_name: str, server_config: dict):
