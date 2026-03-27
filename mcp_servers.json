@@ -6,7 +6,7 @@
     "args": [
       "-y",
       "@modelcontextprotocol/server-filesystem",
-      "/home/kali"
+      "C:\\Users\\Abhey Dev\\Desktop\\codi"
     ]
   },
   "memory": {
@@ -29,7 +29,7 @@
   },
   "brave-search": {
     "enabled": false,
-    "description": "Web search — get free key at brave.com/search/api (2000 req/month free)",
+    "description": "Web search \u2014 get free key at brave.com/search/api (2000 req/month free)",
     "command": "npx",
     "args": [
       "-y",
@@ -40,7 +40,7 @@
     }
   },
   "github": {
-    "enabled": false,
+    "enabled": true,
     "description": "Read/write GitHub repos, issues, PRs",
     "command": "npx",
     "args": [
@@ -48,7 +48,7 @@
       "@modelcontextprotocol/server-github"
     ],
     "env": {
-      "GITHUB_PERSONAL_ACCESS_TOKEN": "your-github-token"
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
     }
   },
   "gitlab": {
@@ -75,14 +75,14 @@
     ]
   },
   "sqlite": {
-    "enabled": false,
+    "enabled": true,
     "description": "Query local SQLite databases",
     "command": "npx",
     "args": [
       "-y",
       "@modelcontextprotocol/server-sqlite",
       "--db-path",
-      "/home/kali/Desktop/codi/codi.db"
+      "C:/Users/Abhey Dev/Desktop/codi/coding-agent/codi.db"
     ]
   },
   "puppeteer": {
@@ -104,12 +104,12 @@
   },
   "git": {
     "enabled": true,
-    "description": "Full git operations on local repos",
+    "description": "Full git operations on local repos \u2014 pointed at coding-agent directory",
     "command": "uvx",
     "args": [
       "mcp-server-git",
       "--repository",
-      "/home/kali/Desktop/codi"
+      "C:/Users/Abhey Dev/Desktop/codi/coding-agent"
     ]
   },
   "python-sandbox": {
@@ -201,8 +201,8 @@
     ]
   },
   "searxng": {
-    "enabled": true,
-    "description": "Free self-hosted web search, no API key needed",
+    "enabled": false,
+    "description": "Free self-hosted web search \u2014 searx.be is unreliable, use brave-search instead",
     "command": "npx",
     "args": [
       "-y",
@@ -213,15 +213,11 @@
   },
   "stitch": {
     "enabled": true,
-    "description": "Google Stitch UI/UX design components",
-    "command": "npx",
-    "args": [
-      "-y",
-      "@_davideast/stitch-mcp",
-      "proxy"
-    ],
-    "env": {
-      "STITCH_API_KEY": "your_api_key"
+    "description": "Google Stitch \u2014 UI/UX code via HTTP MCP",
+    "type": "http",
+    "url": "https://stitch.googleapis.com/mcp",
+    "headers": {
+      "X-Goog-Api-Key": "${STITCH_API_KEY}"
     }
   }
 }

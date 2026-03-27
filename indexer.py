@@ -1,7 +1,9 @@
 import os
+import json
+import hashlib
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma          # updated — replaces deprecated langchain_community.vectorstores.Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
 CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
@@ -10,8 +12,6 @@ def get_embeddings():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 def get_vectorstore():
-    # Chroma requires the directory to exist, but if it doesn't have a valid index, it might throw if queried.
-    # To be safe, we check if there's an index created (e.g., chroma.sqlite3 exists inside).
     if not os.path.exists(CHROMA_PERSIST_DIR) or not os.listdir(CHROMA_PERSIST_DIR):
         return None
     try:
@@ -20,53 +20,59 @@ def get_vectorstore():
     except Exception:
         return None
 
-def index_codebase(directory_path: str):
-    print(f"Indexing codebase at: {directory_path} ...")
-    
-    try:
-        # User requested TextLoader paired with DirectoryLoader
-        # Note: glob="**/*" tries to read all files which might include binary ones. 
-        # Using a restricted glob if necessary, but we'll autodetect encoding and swallow errors on binaries if needed.
-        # It's cleaner to list allowed file types if possible, or just ignore errors.
-        
-        loader = DirectoryLoader(
-            directory_path, 
-            glob="**/*",
-            exclude=[
-                "**/.git/**/*", "**/node_modules/**/*", "**/__pycache__/**/*", 
-                "**/venv/**/*", "**/dist/**/*", "**/build/**/*", "**/.*/"
-            ],
-            loader_cls=TextLoader, 
-            loader_kwargs={"autodetect_encoding": True},
-            show_progress=True,
-            use_multithreading=True
-        )
-        docs = loader.load()
-    except Exception as e:
-        print(f"Error loading files: {e}")
-        return
+def file_hash(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
 
-    if not docs:
-        print("No readable documents found to index.")
-        return
+def walk_codebase(root_path: str):
+    skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', 'dist', 'build', '.idea', 'chroma_db'}
+    for root, dirs, files in os.walk(root_path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+        for f in files:
+            path = os.path.join(root, f)
+            try:
+                with open(path, "r", encoding="utf-8") as file:
+                    yield path, file.read()
+            except Exception:
+                continue
 
-    print(f"Loaded {len(docs)} documents. Splitting text...")
+def index_codebase(root_path: str, db_path: str = CHROMA_PERSIST_DIR):
+    print(f"Indexing codebase at: {root_path} ...")
+    os.makedirs(db_path, exist_ok=True)
+    ef = get_embeddings()
+
+    cache_path = os.path.join(db_path, "file_hashes.json")
+    cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}
+
+    vectorstore = Chroma(persist_directory=db_path, embedding_function=ef)
+
+    new_cache = {}
+    updated = 0
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-    splits = text_splitter.split_documents(docs)
-    
-    print(f"Created {len(splits)} chunks. Generating embeddings and storing in ChromaDB...")
-    embeddings = get_embeddings()
-    
-    if os.path.exists(CHROMA_PERSIST_DIR):
-        import shutil
-        shutil.rmtree(CHROMA_PERSIST_DIR)
-        
-    vectorstore = Chroma.from_documents(
-        documents=splits, 
-        embedding=embeddings, 
-        persist_directory=CHROMA_PERSIST_DIR
-    )
-    print("Indexing complete!")
+
+    for fpath, content in walk_codebase(root_path):
+        try:
+            h = file_hash(fpath)
+        except Exception:
+            continue
+
+        new_cache[fpath] = h
+        if cache.get(fpath) == h:
+            continue  # unchanged, skip
+
+        try:
+            vectorstore.delete(where={"source": fpath})
+        except Exception:
+            pass
+
+        splits = text_splitter.split_text(content)
+        if splits:
+            docs = text_splitter.create_documents(splits, metadatas=[{"source": fpath}] * len(splits))
+            vectorstore.add_documents(docs)
+        updated += 1
+
+    json.dump(new_cache, open(cache_path, "w"))
+    print(f"Indexed {updated} changed files. {len(new_cache)} total tracked.")
 
 if __name__ == "__main__":
     import sys

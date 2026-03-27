@@ -1,29 +1,46 @@
 from langchain_core.prompts import PromptTemplate
 from llm_factory import get_refiner_llm
 
-def refine_prompt(user_input: str) -> str:
-    """Refines a messy user prompt into a clear statement of intent."""
-    if len(user_input.strip()) < 10:
-        return user_input
-        
-    llm = get_refiner_llm()
-    
-    template = """You are a prompt refiner for an advanced local coding agent named Codi. 
-The user might type messy, typo-filled, or overly brief instructions.
-Rewrite their input into a highly detailed, clear, and actionable instruction for the coding agent.
-Ensure you capture the complete intent of the user. Do exactly what is asked. 
-Embellish the prompt so the coding agent fully implements every feature without cutting any corners or skipping logic.
-Do NOT answer the prompt or add pleasantries. Just return the refined prompt.
+# Keywords that indicate the input actually needs refining
+REFINE_TRIGGERS = (
+    "create", "write", "make", "build", "fix", "edit",
+    "update", "generate", "refactor", "implement", "add"
+)
 
-Original prompt: {user_input}
-Refined prompt:"""
-    
+def refine_prompt(user_input: str) -> str:
+    """
+    Refines user prompt only when it's worth the token cost.
+    Short inputs, greetings, and questions are returned as-is.
+    Only action-oriented prompts (create, build, fix...) get refined.
+    """
+    text = user_input.strip()
+
+    # Skip refining if too short
+    if len(text) < 50:
+        return text
+
+    # Skip refining if no action keywords — it's probably a question
+    if not any(trigger in text.lower() for trigger in REFINE_TRIGGERS):
+        return text
+
+    llm = get_refiner_llm()
+
+    template = """Rewrite this coding task as a clear 1-2 sentence instruction for an AI agent.
+No bullet points. No headers. No extra context. Just the core instruction.
+
+Task: {user_input}
+Instruction:"""
+
     prompt = PromptTemplate(template=template, input_variables=["user_input"])
     chain = prompt | llm
-    
+
     try:
-        response = chain.invoke({"user_input": user_input})
-        return response.content.strip() if hasattr(response, 'content') else str(response).strip()
+        response = chain.invoke({"user_input": text})
+        refined = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+        # Safety — if refiner bloats the prompt, discard and use original
+        if len(refined) > len(text) * 2 or len(refined) < 10:
+            return text
+        return refined
     except Exception as e:
-        print(f"Error refining prompt: {e}")
-        return user_input
+        print(f"Refiner error (using original): {e}")
+        return text

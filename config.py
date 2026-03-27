@@ -2,19 +2,27 @@
 # Change these to switch modes
 
 # "local" or "cloud"
-MODE = "local"
+MODE = "cloud"
 
-# Cloud provider: "anthropic", "openai", or "groq"
-CLOUD_PROVIDER = "groq"  # groq is free and fast
+# Cloud provider: "anthropic", "openai", "groq", or "gemini"
+CLOUD_PROVIDER = "gemini"  # groq is free and fast
 
-# Model routing
-REFINER_MODEL_LOCAL = "llama3:8b"
+# Model routing — local
+REFINER_MODEL_LOCAL = "qwen2.5-coder:7b"
 CODER_MODEL_LOCAL   = "qwen2.5-coder:7b"
 
-REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"   # groq
-CODER_MODEL_CLOUD   = "llama-3.1-70b-versatile" # groq — much better at CSS/JS
+# Model routing — cloud
+REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"
+CODER_MODEL_CLOUD   = "llama-3.3-70b-versatile"
+
+# Gemini model options (used when CLOUD_PROVIDER = "gemini")
+# Refiner: gemini-2.0-flash  (fast, cheap, good at instruction following)
+# Coder:   gemini-2.5-pro    (best reasoning, use for complex codegen)
+REFINER_MODEL_GEMINI = "gemini-2.5-pro"
+CODER_MODEL_GEMINI   = "gemini-2.5-flash-lite"  # free experimental tier
 
 # API keys (only needed when MODE = "cloud")
-GROQ_API_KEY     = "your-groq-api-key-here"
-OPENAI_API_KEY   = "your-openai-api-key-here"
-ANTHROPIC_API_KEY = "your-anthropic-api-key-here"
+GROQ_API_KEY      = ""
+OPENAI_API_KEY    = ""
+ANTHROPIC_API_KEY = ""
+GEMINI_API_KEY    = ""
