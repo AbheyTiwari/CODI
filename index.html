@@ -214,10 +214,6 @@ nav{
 }
 @keyframes blink{50%{opacity:0}}
 
-/* typing demo outputs */
-.demo-line{display:none}
-.demo-line.show{display:block}
-
 /* ── STATS ── */
 .stats{
   position:relative;z-index:1;
@@ -258,7 +254,7 @@ nav{
   color:var(--white);line-height:1.1;margin-bottom:1rem;letter-spacing:-0.01em;
 }
 .sec-title em{font-style:italic;color:var(--green)}
-.sec-desc{font-size:0.72rem;color:var(--soft);line-height:2;max-width:440px;margin-bottom:3rem}
+.sec-desc{font-size:0.72rem;color:var(--soft);line-height:2;max-width:480px;margin-bottom:3rem}
 
 /* ── FEATURES ── */
 .feat-grid{display:grid;grid-template-columns:repeat(3,1fr);border:1px solid var(--border)}
@@ -321,7 +317,13 @@ nav{
 
 /* ── INSTALL ── */
 .install-cols{display:grid;grid-template-columns:1fr 1fr;gap:4rem;align-items:start}
-.step-lbl{font-size:0.56rem;color:var(--green);letter-spacing:0.25em;text-transform:uppercase;margin-bottom:0.5rem}
+.step-lbl{
+  font-size:0.56rem;color:var(--green);letter-spacing:0.25em;
+  text-transform:uppercase;margin-bottom:0.5rem;
+  display:flex;align-items:center;gap:0.6rem;
+}
+.step-lbl::before{content:'';width:12px;height:1px;background:var(--green)}
+
 .code-box{
   background:var(--ink2);border:1px solid var(--border);border-left:2px solid var(--green);
   padding:1rem 1.4rem;margin-bottom:1.4rem;overflow-x:auto;
@@ -329,6 +331,14 @@ nav{
 .code-box pre{font-size:0.7rem;color:var(--bright);line-height:1.9}
 .code-box .cm{color:var(--muted);font-style:italic}
 .code-box .kw{color:var(--green)}
+.code-box .str{color:#a8c7a8}
+.code-box .hl-line{color:var(--white);background:rgba(122,184,122,0.06);display:block;margin:0 -1.4rem;padding:0 1.4rem}
+
+.note-box{
+  background:var(--gdim);border:1px solid var(--gborder);border-left:2px solid var(--green);
+  padding:0.9rem 1.2rem;margin-bottom:1.4rem;font-size:0.65rem;color:var(--soft);line-height:1.8;
+}
+.note-box strong{color:var(--green);font-weight:500}
 
 .cfg-table{border:1px solid var(--border)}
 .cfg-row{display:grid;grid-template-columns:155px 1fr;border-bottom:1px solid var(--border)}
@@ -341,6 +351,31 @@ nav{
 .arch-item:hover{background:rgba(122,184,122,0.03)}
 .arch-file{color:var(--green);font-size:0.67rem;white-space:nowrap;flex-shrink:0}
 .arch-desc{font-size:0.63rem;color:var(--muted);line-height:1.7}
+
+/* ── MODE GRID ── */
+.mode-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--border);border:1px solid var(--border);margin-top:2rem;margin-bottom:2rem}
+.mode-item{background:var(--ink2);padding:1.4rem 1.6rem;transition:background 0.2s}
+.mode-item:hover{background:rgba(122,184,122,0.03)}
+.mode-badge{
+  display:inline-block;font-family:'Syne',sans-serif;font-size:0.6rem;font-weight:700;
+  color:var(--ink);background:var(--green);padding:0.18rem 0.6rem;
+  letter-spacing:0.1em;margin-bottom:0.7rem;
+}
+.mode-badge.dim{background:var(--surface);color:var(--soft)}
+.mode-title{font-family:'Syne',sans-serif;font-size:0.82rem;font-weight:700;color:var(--bright);margin-bottom:0.4rem}
+.mode-desc{font-size:0.63rem;color:var(--muted);line-height:1.8}
+.mode-cmd{font-size:0.62rem;color:var(--green);margin-top:0.5rem}
+
+/* ── AIRLLM ── */
+.airllm-steps{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--border);border:1px solid var(--border);margin-top:2rem}
+.airllm-step{background:var(--ink2);padding:1.4rem 1.6rem}
+.airllm-n{
+  font-family:'Instrument Serif',serif;font-size:1.6rem;color:var(--green);
+  opacity:0.4;line-height:1;margin-bottom:0.6rem;
+}
+.airllm-title{font-family:'Syne',sans-serif;font-size:0.8rem;font-weight:700;color:var(--bright);margin-bottom:0.4rem}
+.airllm-desc{font-size:0.63rem;color:var(--muted);line-height:1.8}
+.airllm-desc code{color:var(--green);background:var(--gdim);padding:0.1rem 0.4rem;font-size:0.6rem}
 
 /* ── MCP ── */
 .mcp-wrap{display:flex;flex-wrap:wrap;gap:0.4rem;margin-top:2.5rem}
@@ -398,7 +433,7 @@ footer{
   .feat-card{border-right:none}
   .feat-card:nth-child(4),.feat-card:nth-child(5){border-bottom:1px solid var(--border)}
   .install-cols{grid-template-columns:1fr;gap:2rem}
-  .cmd-grid,.arch-grid,.outcome-grid{grid-template-columns:1fr}
+  .cmd-grid,.arch-grid,.outcome-grid,.mode-grid,.airllm-steps{grid-template-columns:1fr}
   .stats{flex-wrap:wrap}
   .stat-item{border-right:none;border-bottom:1px solid var(--border);max-width:100%;width:50%}
   nav{padding:1rem 1.5rem}
@@ -415,43 +450,24 @@ footer{
 <div class="orbital-bg">
   <svg viewBox="0 0 1000 1100" fill="none" xmlns="http://www.w3.org/2000/svg">
     <g transform="translate(500,560)">
-
-      <!-- PRIMARY DISC RINGS — tight concentric ellipses in perspective, tilted ~20deg -->
-      <!-- Outermost ring -->
       <ellipse cx="0" cy="0" rx="430" ry="115" stroke="white" stroke-width="0.6" opacity="0.9" transform="rotate(-18)"/>
-      <!-- Ring 2 -->
       <ellipse cx="0" cy="0" rx="380" ry="100" stroke="white" stroke-width="0.5" opacity="0.8" transform="rotate(-18)"/>
-      <!-- Ring 3 -->
       <ellipse cx="0" cy="0" rx="328" ry="86" stroke="white" stroke-width="0.7" opacity="0.9" transform="rotate(-18)"/>
-      <!-- Ring 4 — thicker, prominent -->
       <ellipse cx="0" cy="0" rx="280" ry="74" stroke="white" stroke-width="1.2" opacity="1" transform="rotate(-18)"/>
-      <!-- Ring 5 -->
       <ellipse cx="0" cy="0" rx="235" ry="62" stroke="white" stroke-width="0.5" opacity="0.7" transform="rotate(-18)"/>
-      <!-- Ring 6 -->
       <ellipse cx="0" cy="0" rx="192" ry="51" stroke="white" stroke-width="0.8" opacity="0.85" transform="rotate(-18)"/>
-      <!-- Ring 7 -->
       <ellipse cx="0" cy="0" rx="152" ry="40" stroke="white" stroke-width="0.5" opacity="0.65" transform="rotate(-18)"/>
-      <!-- Ring 8 -->
       <ellipse cx="0" cy="0" rx="115" ry="30" stroke="white" stroke-width="0.6" opacity="0.7" transform="rotate(-18)"/>
-      <!-- Ring 9 -->
       <ellipse cx="0" cy="0" rx="82" ry="22" stroke="white" stroke-width="0.4" opacity="0.5" transform="rotate(-18)"/>
-      <!-- Ring 10 innermost -->
       <ellipse cx="0" cy="0" rx="52" ry="14" stroke="white" stroke-width="0.4" opacity="0.5" transform="rotate(-18)"/>
-
-      <!-- CENTRE CORE — small cylindrical structure -->
       <ellipse cx="0" cy="0" rx="22" ry="6" stroke="white" stroke-width="1" opacity="0.9" transform="rotate(-18)"/>
       <ellipse cx="0" cy="-18" rx="18" ry="5" stroke="white" stroke-width="0.8" opacity="0.8" transform="rotate(-18)"/>
       <ellipse cx="0" cy="-32" rx="14" ry="4" stroke="white" stroke-width="0.6" opacity="0.7" transform="rotate(-18)"/>
-      <!-- Core vertical lines -->
       <line x1="-22" y1="0" x2="-18" y2="-18" stroke="white" stroke-width="0.6" opacity="0.7"/>
       <line x1="22" y1="0" x2="18" y2="-18" stroke="white" stroke-width="0.6" opacity="0.7"/>
       <line x1="-18" y1="-18" x2="-14" y2="-32" stroke="white" stroke-width="0.5" opacity="0.6"/>
       <line x1="18" y1="-18" x2="14" y2="-32" stroke="white" stroke-width="0.5" opacity="0.6"/>
-
-      <!-- VERTICAL NEEDLE / TOWER — rises from centre -->
-      <!-- Tower segments with tick marks -->
       <line x1="0" y1="-32" x2="0" y2="-520" stroke="white" stroke-width="1.2" opacity="0.95"/>
-      <!-- Tower segment ticks -->
       <line x1="-4" y1="-80" x2="4" y2="-80" stroke="white" stroke-width="0.8"/>
       <line x1="-3" y1="-130" x2="3" y2="-130" stroke="white" stroke-width="0.6"/>
       <line x1="-4" y1="-190" x2="4" y2="-190" stroke="white" stroke-width="0.8"/>
@@ -459,112 +475,49 @@ footer{
       <line x1="-4" y1="-320" x2="4" y2="-320" stroke="white" stroke-width="0.8"/>
       <line x1="-3" y1="-390" x2="3" y2="-390" stroke="white" stroke-width="0.6"/>
       <line x1="-4" y1="-460" x2="4" y2="-460" stroke="white" stroke-width="0.8"/>
-      <!-- Tower tip -->
       <circle cx="0" cy="-520" r="3" fill="none" stroke="white" stroke-width="0.8"/>
       <circle cx="0" cy="-520" r="1" fill="white"/>
-      <!-- Tower tip extension -->
       <line x1="0" y1="-523" x2="0" y2="-545" stroke="white" stroke-width="0.7" opacity="0.6"/>
       <line x1="-2" y1="-545" x2="2" y2="-545" stroke="white" stroke-width="0.5" opacity="0.5"/>
-
-      <!-- DOWNWARD STEM below disc -->
       <line x1="0" y1="0" x2="0" y2="120" stroke="white" stroke-width="0.8" opacity="0.5"/>
       <line x1="-3" y1="60" x2="3" y2="60" stroke="white" stroke-width="0.5" opacity="0.5"/>
       <line x1="-2" y1="100" x2="2" y2="100" stroke="white" stroke-width="0.4" opacity="0.4"/>
-
-      <!-- LARGE ORBITING SPHERE — left side, on outermost ring -->
       <g transform="rotate(-18) translate(-415, 0) rotate(18)">
         <circle cx="0" cy="0" r="11" fill="none" stroke="white" stroke-width="0.8" opacity="0.9"/>
         <circle cx="0" cy="0" r="6" fill="rgba(255,255,255,0.15)" stroke="white" stroke-width="0.5"/>
         <circle cx="0" cy="0" r="2.5" fill="white"/>
-        <!-- Halo ring around sphere -->
         <ellipse cx="0" cy="0" rx="16" ry="5" stroke="white" stroke-width="0.4" opacity="0.4"/>
       </g>
-
-      <!-- MEDIUM ORBITING SPHERE — right side, ring 3 -->
       <g transform="rotate(-18) translate(305, 0) rotate(18)">
         <circle cx="0" cy="0" r="8" fill="none" stroke="white" stroke-width="0.7" opacity="0.85"/>
         <circle cx="0" cy="0" r="4" fill="rgba(255,255,255,0.1)" stroke="white" stroke-width="0.4"/>
         <circle cx="0" cy="0" r="1.8" fill="white"/>
         <ellipse cx="0" cy="0" rx="12" ry="4" stroke="white" stroke-width="0.35" opacity="0.35"/>
       </g>
-
-      <!-- SMALL SPHERE — upper right arc -->
       <g transform="rotate(-18) translate(168, -46) rotate(18)">
         <circle cx="0" cy="0" r="5" fill="none" stroke="white" stroke-width="0.6" opacity="0.8"/>
         <circle cx="0" cy="0" r="2" fill="white" opacity="0.9"/>
       </g>
-
-      <!-- SMALL SPHERE — lower left arc -->
       <g transform="rotate(-18) translate(-210, 56) rotate(18)">
         <circle cx="0" cy="0" r="4" fill="none" stroke="white" stroke-width="0.5" opacity="0.7"/>
         <circle cx="0" cy="0" r="1.5" fill="white" opacity="0.8"/>
       </g>
-
-      <!-- ANNOTATION LINES — right side, pointing to rings -->
-      <!-- Top right annotations -->
       <line x1="220" y1="-52" x2="360" y2="-140" stroke="white" stroke-width="0.4" opacity="0.5"/>
       <line x1="360" y1="-140" x2="430" y2="-140" stroke="white" stroke-width="0.4" opacity="0.5"/>
       <circle cx="220" cy="-52" r="1.5" fill="white" opacity="0.6"/>
-
       <line x1="300" y1="-70" x2="430" y2="-105" stroke="white" stroke-width="0.35" opacity="0.45"/>
       <line x1="430" y1="-105" x2="490" y2="-105" stroke="white" stroke-width="0.35" opacity="0.45"/>
-      <circle cx="300" cy="-70" r="1" fill="white" opacity="0.5"/>
-
       <line x1="360" y1="-88" x2="430" y2="-70" stroke="white" stroke-width="0.3" opacity="0.4"/>
       <line x1="430" y1="-70" x2="490" y2="-70" stroke="white" stroke-width="0.3" opacity="0.4"/>
-
-      <line x1="390" y1="-100" x2="490" y2="-35" stroke="white" stroke-width="0.3" opacity="0.35"/>
-      <line x1="490" y1="-35" x2="540" y2="-35" stroke="white" stroke-width="0.3" opacity="0.35"/>
-      <circle cx="390" cy="-100" r="1" fill="white" opacity="0.4"/>
-
-      <!-- Bottom right annotations -->
-      <line x1="370" y1="90" x2="450" y2="140" stroke="white" stroke-width="0.35" opacity="0.4"/>
-      <line x1="450" y1="140" x2="510" y2="140" stroke="white" stroke-width="0.35" opacity="0.4"/>
-
-      <line x1="410" y1="105" x2="510" y2="170" stroke="white" stroke-width="0.3" opacity="0.35"/>
-      <line x1="510" y1="170" x2="560" y2="170" stroke="white" stroke-width="0.3" opacity="0.35"/>
-
-      <!-- Left side annotations -->
       <line x1="-340" y1="-82" x2="-440" y2="-140" stroke="white" stroke-width="0.35" opacity="0.4"/>
       <line x1="-440" y1="-140" x2="-490" y2="-140" stroke="white" stroke-width="0.35" opacity="0.4"/>
-      <circle cx="-340" cy="-82" r="1" fill="white" opacity="0.5"/>
-
-      <line x1="-380" y1="-95" x2="-490" y2="-105" stroke="white" stroke-width="0.3" opacity="0.35"/>
-      <line x1="-490" y1="-105" x2="-540" y2="-105" stroke="white" stroke-width="0.3" opacity="0.35"/>
-
-      <!-- NEEDLE annotations -->
-      <line x1="6" y1="-200" x2="80" y2="-200" stroke="white" stroke-width="0.35" opacity="0.4"/>
-      <line x1="80" y1="-200" x2="120" y2="-200" stroke="white" stroke-width="0.35" opacity="0.4"/>
-      <circle cx="6" cy="-200" r="1" fill="white" opacity="0.5"/>
-
-      <line x1="4" y1="-320" x2="60" y2="-310" stroke="white" stroke-width="0.3" opacity="0.35"/>
-      <line x1="60" y1="-310" x2="100" y2="-310" stroke="white" stroke-width="0.3" opacity="0.35"/>
-
-      <!-- SCATTERED DATA POINTS -->
       <circle cx="-460" cy="-180" r="1.2" fill="white" opacity="0.5"/>
-      <circle cx="-420" cy="-210" r="0.8" fill="white" opacity="0.35"/>
-      <circle cx="-480" cy="-120" r="0.9" fill="white" opacity="0.4"/>
       <circle cx="460" cy="-160" r="1.2" fill="white" opacity="0.5"/>
-      <circle cx="490" cy="-200" r="0.8" fill="white" opacity="0.35"/>
-      <circle cx="440" cy="-130" r="0.9" fill="white" opacity="0.4"/>
       <circle cx="200" cy="-300" r="1" fill="white" opacity="0.4"/>
-      <circle cx="250" cy="-340" r="0.7" fill="white" opacity="0.3"/>
       <circle cx="-180" cy="-280" r="1" fill="white" opacity="0.4"/>
       <circle cx="380" cy="180" r="1.1" fill="white" opacity="0.45"/>
       <circle cx="-360" cy="160" r="1" fill="white" opacity="0.4"/>
-      <circle cx="-400" cy="200" r="0.7" fill="white" opacity="0.3"/>
-      <circle cx="100" cy="-420" r="1" fill="white" opacity="0.4"/>
-      <circle cx="-80" cy="-460" r="0.8" fill="white" opacity="0.3"/>
-      <circle cx="30" cy="-480" r="0.7" fill="white" opacity="0.35"/>
-      <circle cx="-30" cy="-500" r="0.6" fill="white" opacity="0.25"/>
-
-      <!-- SUBTLE CROSS-AXIS LINE through disc plane -->
-      <line x1="-460" y1="0" x2="460" y2="0" stroke="white" stroke-width="0.3" opacity="0.2" transform="rotate(-18)"/>
-
-      <!-- SECONDARY TILTED RING (different angle, outermost) -->
       <ellipse cx="0" cy="0" rx="450" ry="60" stroke="white" stroke-width="0.3" opacity="0.25" transform="rotate(5)"/>
-      <ellipse cx="0" cy="0" rx="400" ry="52" stroke="white" stroke-width="0.25" opacity="0.18" transform="rotate(5)"/>
-
     </g>
   </svg>
 </div>
@@ -654,11 +607,11 @@ footer{
         <div class="demo-body" id="demoBody">
           <div><span class="t-g">✧</span> <span class="t-w">Vector DB connected</span></div>
           <div><span class="t-g">✧</span> <span class="t-w">Cognitive Refiner online</span></div>
-          <div><span class="t-g">★</span> <span class="t-w">Ready for input</span></div>
+          <div><span class="t-g">★ Mode: HYBRID</span> <span class="t-d">(groq)</span></div>
           <br>
           <div class="t-d">&nbsp;&nbsp;[Tools] 5 native + 28 MCP = <span class="t-w">33 total</span></div>
           <br>
-          <span class="t-g">>> </span><span class="t-cursor"></span>
+          <span class="t-g">❯ </span><span class="t-cursor"></span>
         </div>
       </div>
     </div>
@@ -685,7 +638,7 @@ footer{
     <div class="feat-card reveal"><div class="feat-num">03 · Verify</div><div class="feat-title">Checks its own work</div><p class="feat-desc">After each execution, CODI checks whether the task was actually completed. If not, it retries with context from the failure.</p></div>
     <div class="feat-card reveal"><div class="feat-num">04 · RAG</div><div class="feat-title">Knows your codebase</div><p class="feat-desc">ChromaDB vector search over your entire project. CODI finds relevant code before editing — no hallucinated imports.</p></div>
     <div class="feat-card reveal"><div class="feat-num">05 · Plugins</div><div class="feat-title">21+ MCP servers</div><p class="feat-desc">Git, browser automation, PostgreSQL, Redis, Docker, GitHub — toggle any at runtime. No code changes needed.</p></div>
-    <div class="feat-card reveal"><div class="feat-num">06 · Providers</div><div class="feat-title">Any LLM, one line</div><p class="feat-desc">Ollama locally, Groq for speed, Anthropic for quality, Gemini as fallback. Switch with MODE in config.py.</p></div>
+    <div class="feat-card reveal"><div class="feat-num">06 · Providers</div><div class="feat-title">Any LLM, one line</div><p class="feat-desc">Ollama locally, Groq for speed, Anthropic for quality, Gemini as fallback. Switch with /mode in the CLI.</p></div>
   </div>
 </section>
 
@@ -706,13 +659,17 @@ footer{
     <div style="margin-top:3rem">
       <div class="sec-ey reveal">Commands</div>
       <div class="cmd-grid">
-        <div class="cmd-row reveal"><span class="cmd-tag">/index &lt;path&gt;</span><span class="cmd-desc">Index a directory for semantic search</span></div>
+        <div class="cmd-row reveal"><span class="cmd-tag">/index [path]</span><span class="cmd-desc">Index a directory for semantic search</span></div>
+        <div class="cmd-row reveal"><span class="cmd-tag">/mode</span><span class="cmd-desc">Show current mode</span></div>
+        <div class="cmd-row reveal"><span class="cmd-tag">/mode &lt;n&gt;</span><span class="cmd-desc">Switch: local · hybrid · cloud · air</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/mcp</span><span class="cmd-desc">List MCP servers and enabled state</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/mcp on &lt;n&gt;</span><span class="cmd-desc">Enable a server at runtime</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/mcp off &lt;n&gt;</span><span class="cmd-desc">Disable a server at runtime</span></div>
+        <div class="cmd-row reveal"><span class="cmd-tag">/tools</span><span class="cmd-desc">List all loaded tools</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/logs</span><span class="cmd-desc">Open live telemetry dashboard</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/clear</span><span class="cmd-desc">Clear session memory</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/history</span><span class="cmd-desc">Show current memory state</span></div>
+        <div class="cmd-row reveal"><span class="cmd-tag">/help</span><span class="cmd-desc">Show all commands</span></div>
         <div class="cmd-row reveal"><span class="cmd-tag">/quit</span><span class="cmd-desc">Exit CODI</span></div>
       </div>
     </div>
@@ -730,7 +687,7 @@ footer{
     <span class="stack-chip">LangGraph</span>
     <span class="stack-chip">ChromaDB</span>
     <span class="stack-chip">Ollama</span>
-    <span class="stack-chip">FastAPI</span>
+    <span class="stack-chip">AirLLM</span>
     <span class="stack-chip">Groq API</span>
     <span class="stack-chip">Anthropic API</span>
     <span class="stack-chip">Gemini API</span>
@@ -738,55 +695,216 @@ footer{
     <span class="stack-chip">sentence-transformers</span>
     <span class="stack-chip">Rich CLI</span>
     <span class="stack-chip">HuggingFace</span>
+    <span class="stack-chip">prompt-toolkit</span>
   </div>
 </section>
 
-<!-- INSTALL -->
+<!-- ══════════════════════════════════════════════════════════════════════ -->
+<!-- INSTALL — FULLY REWRITTEN                                             -->
+<!-- ══════════════════════════════════════════════════════════════════════ -->
 <div class="alt-bg" id="install">
   <div class="alt-inner">
     <div class="sec-ey reveal">Setup</div>
     <h2 class="sec-title reveal">Running in <em>5 minutes</em></h2>
-    <p class="sec-desc reveal">Windows, macOS, Linux. Local needs Ollama. Cloud needs one free API key.</p>
+    <p class="sec-desc reveal">Windows, macOS, Linux. Works fully offline with Ollama, or with a free Groq API key for cloud speed.</p>
+
     <div class="install-cols">
+
+      <!-- LEFT: step-by-step -->
       <div>
-        <div class="reveal"><div class="step-lbl">01 — Clone</div>
+
+        <div class="reveal">
+          <div class="step-lbl">01 — Clone the repo</div>
           <div class="code-box"><pre><span class="kw">git clone</span> https://github.com/AbheyTiwari/CODI
-<span class="kw">cd</span> CODI/coding-agent</pre></div></div>
-        <div class="reveal"><div class="step-lbl">02 — Environment</div>
-          <div class="code-box"><pre><span class="cm"># Windows</span>
-<span class="kw">python -m venv</span> .venv
-.\.venv\Scripts\Activate.ps1
+<span class="kw">cd</span> CODI/coding-agent</pre></div>
+        </div>
+
+        <div class="reveal">
+          <div class="step-lbl">02 — Create a virtual environment</div>
+          <div class="code-box"><pre><span class="cm"># Windows (PowerShell)</span>
+<span class="kw">python -m venv</span> codi
+.\codi\Scripts\Activate.ps1
 
 <span class="cm"># macOS / Linux</span>
-<span class="kw">source</span> .venv/bin/activate</pre></div></div>
-        <div class="reveal"><div class="step-lbl">03 — Install</div>
-          <div class="code-box"><pre><span class="kw">pip install</span> -r requirements.txt</pre></div></div>
-        <div class="reveal"><div class="step-lbl">04 — Configure & Run</div>
-          <div class="code-box"><pre><span class="cm"># add your API key to .env</span>
-<span class="cm"># CODI_GROQ_API_KEY=your_key</span>
-<span class="kw">python</span> main.py</pre></div></div>
+<span class="kw">python3 -m venv</span> codi
+<span class="kw">source</span> codi/bin/activate</pre></div>
+        </div>
+
+        <div class="reveal">
+          <div class="step-lbl">03 — Install dependencies</div>
+          <div class="code-box"><pre><span class="kw">pip install</span> -r requirements.txt</pre></div>
+        </div>
+
+        <div class="reveal">
+          <div class="step-lbl">04 — Register the global <code style="color:var(--green)">codi</code> command</div>
+          <div class="code-box"><pre><span class="cm"># Run once from inside coding-agent/</span>
+<span class="kw">pip install</span> -e .</pre></div>
+          <div class="note-box">
+            <strong>Now you can type <code>codi</code> in any project directory</strong> and it auto-launches with that folder indexed. No more <code>python main.py</code>.
+          </div>
+        </div>
+
+        <div class="reveal">
+          <div class="step-lbl">05 — Add your API key (optional for cloud/hybrid)</div>
+          <div class="code-box"><pre><span class="cm"># Create a .env file in coding-agent/</span>
+<span class="kw">CODI_GROQ_API_KEY</span>=<span class="str">gsk_your_key_here</span>
+
+<span class="cm"># Other providers (use whichever you have)</span>
+<span class="kw">CODI_ANTHROPIC_API_KEY</span>=<span class="str">sk-ant-...</span>
+<span class="kw">CODI_OPENAI_API_KEY</span>=<span class="str">sk-...</span>
+<span class="kw">CODI_GEMINI_API_KEY</span>=<span class="str">AIza...</span></pre></div>
+        </div>
+
+        <div class="reveal">
+          <div class="step-lbl">06 — Navigate to any project and launch</div>
+          <div class="code-box"><pre><span class="cm"># Works in any folder on your system</span>
+<span class="kw">cd</span> C:\Users\you\projects\my-react-app
+<span class="kw">codi</span>
+
+<span class="cm"># CODI auto-indexes the folder and starts</span></pre></div>
+        </div>
+
+        <div class="reveal" style="margin-top:1rem">
+          <div class="step-lbl">Windows: codi not found in new terminals?</div>
+          <div class="note-box">
+            The <code>codi</code> command lives inside your venv. To make it work in every new terminal without activating the venv first, run this <strong>once</strong> in an admin PowerShell:
+          </div>
+          <div class="code-box"><pre><span class="cm"># Replace the path with your actual venv Scripts folder</span>
+$p = <span class="str">"C:\path\to\CODI\coding-agent\codi\Scripts"</span>
+[Environment]::SetEnvironmentVariable(
+  <span class="str">"PATH"</span>,
+  [Environment]::GetEnvironmentVariable(<span class="str">"PATH"</span>,<span class="str">"User"</span>) + <span class="str">";$p"</span>,
+  <span class="str">"User"</span>
+)
+<span class="cm"># Restart all terminals after running this</span></pre></div>
+        </div>
+
       </div>
+
+      <!-- RIGHT: config + architecture -->
       <div>
-        <div class="sec-ey reveal" style="margin-bottom:1rem">Configuration</div>
-        <div class="cfg-table reveal" style="margin-bottom:2rem">
-          <div class="cfg-row"><div class="cfg-k">MODE</div><div class="cfg-v">local · cloud · remote</div></div>
+
+        <div class="sec-ey reveal" style="margin-bottom:1rem">Modes</div>
+        <p class="reveal" style="font-size:0.65rem;color:var(--muted);line-height:1.8;margin-bottom:1rem">Switch modes instantly at runtime with <span style="color:var(--green)">/mode &lt;name&gt;</span> — no restart needed.</p>
+
+        <div class="mode-grid reveal">
+          <div class="mode-item">
+            <div class="mode-badge">LOCAL</div>
+            <div class="mode-title">100% offline</div>
+            <p class="mode-desc">Ollama only. No internet. No API costs. Your code never leaves your machine.</p>
+            <div class="mode-cmd">Needs: ollama pull phi3:mini + qwen2.5-coder:7b</div>
+          </div>
+          <div class="mode-item">
+            <div class="mode-badge">HYBRID</div>
+            <div class="mode-title">Local first, cloud fallback</div>
+            <p class="mode-desc">Ollama handles most tasks. Escalates to cloud only when context overflows or local is unavailable.</p>
+            <div class="mode-cmd">Recommended default</div>
+          </div>
+          <div class="mode-item">
+            <div class="mode-badge dim">CLOUD</div>
+            <div class="mode-title">Maximum capability</div>
+            <p class="mode-desc">Every call goes to your cloud provider. Groq is free and fast. Anthropic for best quality.</p>
+            <div class="mode-cmd">Needs: API key in .env</div>
+          </div>
+          <div class="mode-item">
+            <div class="mode-badge dim">AIR</div>
+            <div class="mode-title">Phone inference</div>
+            <p class="mode-desc">Runs a quantized model on your Android phone over Wi-Fi. Good middle ground — no GPU needed on PC.</p>
+            <div class="mode-cmd">See AirLLM setup below ↓</div>
+          </div>
+        </div>
+
+        <div class="sec-ey reveal" style="margin-top:2.5rem;margin-bottom:1rem">Local models (Ollama)</div>
+        <div class="code-box reveal"><pre><span class="cm"># Minimum — works on any machine with 8 GB RAM</span>
+<span class="kw">ollama pull</span> phi3:mini          <span class="cm"># 2.2 GB  fast refiner</span>
+<span class="kw">ollama pull</span> qwen2.5-coder:7b  <span class="cm"># 4.7 GB  main coder</span>
+
+<span class="cm"># Upgrade — 16 GB RAM or GPU</span>
+<span class="kw">ollama pull</span> qwen2.5-coder:14b <span class="cm"># 9.0 GB  better quality</span>
+<span class="kw">ollama pull</span> deepseek-r1:8b    <span class="cm"># 5.0 GB  reasoning tasks</span></pre></div>
+
+        <div class="sec-ey reveal" style="margin-top:2rem;margin-bottom:1rem">Configuration reference</div>
+        <div class="cfg-table reveal">
+          <div class="cfg-row"><div class="cfg-k">MODE</div><div class="cfg-v">local · hybrid · cloud · air</div></div>
           <div class="cfg-row"><div class="cfg-k">CLOUD_PROVIDER</div><div class="cfg-v">groq · openai · anthropic · gemini</div></div>
-          <div class="cfg-row"><div class="cfg-k">REFINER_MODEL</div><div class="cfg-v">fast model for prompt refinement</div></div>
-          <div class="cfg-row"><div class="cfg-k">CODER_MODEL</div><div class="cfg-v">heavy model for code generation</div></div>
+          <div class="cfg-row"><div class="cfg-k">REFINER_MODEL</div><div class="cfg-v">fast model for planning & refinement</div></div>
+          <div class="cfg-row"><div class="cfg-k">CODER_MODEL</div><div class="cfg-v">stronger model for code generation</div></div>
+          <div class="cfg-row"><div class="cfg-k">AIR_LLM_URL</div><div class="cfg-v">http://&lt;phone-ip&gt;:8080</div></div>
+          <div class="cfg-row"><div class="cfg-k">HYBRID_TOKEN_LIMIT</div><div class="cfg-v">tokens before escalating to cloud (default 3500)</div></div>
         </div>
-        <div class="sec-ey reveal">Architecture</div>
+
+        <div class="sec-ey reveal" style="margin-top:2rem;margin-bottom:1rem">Architecture</div>
         <div class="arch-grid reveal">
-          <div class="arch-item"><span class="arch-file">main.py</span><span class="arch-desc">CLI loop, command routing</span></div>
-          <div class="arch-item"><span class="arch-file">agent.py</span><span class="arch-desc">LangGraph workflow</span></div>
+          <div class="arch-item"><span class="arch-file">main.py</span><span class="arch-desc">CLI loop, auto-index on launch</span></div>
+          <div class="arch-item"><span class="arch-file">agent.py</span><span class="arch-desc">LangGraph plan→execute→verify loop</span></div>
           <div class="arch-item"><span class="arch-file">tools.py</span><span class="arch-desc">Native tools + MCP loading</span></div>
-          <div class="arch-item"><span class="arch-file">indexer.py</span><span class="arch-desc">ChromaDB indexing</span></div>
-          <div class="arch-item"><span class="arch-file">refiner.py</span><span class="arch-desc">Prompt rewriting</span></div>
-          <div class="arch-item"><span class="arch-file">memory.py</span><span class="arch-desc">Session + compression</span></div>
-          <div class="arch-item"><span class="arch-file">llm_factory.py</span><span class="arch-desc">Provider selection</span></div>
-          <div class="arch-item"><span class="arch-file">logger.py</span><span class="arch-desc">Structured event log</span></div>
+          <div class="arch-item"><span class="arch-file">indexer.py</span><span class="arch-desc">Per-project ChromaDB indexing</span></div>
+          <div class="arch-item"><span class="arch-file">llm_factory.py</span><span class="arch-desc">Provider routing (local/air/cloud)</span></div>
+          <div class="arch-item"><span class="arch-file">context_trimmer.py</span><span class="arch-desc">Token budget management</span></div>
+          <div class="arch-item"><span class="arch-file">mcp_manager.py</span><span class="arch-desc">Persistent MCP sessions</span></div>
+          <div class="arch-item"><span class="arch-file">config.py</span><span class="arch-desc">All settings in one place</span></div>
         </div>
+
       </div>
     </div>
+
+    <!-- AIRLLM SECTION -->
+    <div style="margin-top:5rem">
+      <div class="sec-ey reveal">AirLLM — phone inference</div>
+      <h3 class="sec-title reveal" style="font-size:clamp(1.4rem,2.5vw,2.2rem)">Run LLMs on your <em>Android phone</em></h3>
+      <p class="sec-desc reveal">
+        <a href="https://github.com/lyogavin/airllm" target="_blank" style="color:var(--green)">AirLLM</a> is a Python library that runs quantized GGUF models with extreme memory efficiency. Install it on a Python server, point CODI at it over Wi-Fi, and your phone becomes a local inference backend.
+      </p>
+
+      <div class="airllm-steps reveal">
+        <div class="airllm-step">
+          <div class="airllm-n">01</div>
+          <div class="airllm-title">Install AirLLM</div>
+          <p class="airllm-desc">On the machine or device you want to run inference on (can be your phone via Termux, a Raspberry Pi, or a second PC):<br><br><code>pip install airllm</code></p>
+        </div>
+        <div class="airllm-step">
+          <div class="airllm-n">02</div>
+          <div class="airllm-title">Create a server script</div>
+          <p class="airllm-desc">AirLLM exposes an OpenAI-compatible HTTP server. Create <code>llm_server.py</code> and run it — CODI connects to it automatically when MODE is set to <code>air</code>.</p>
+        </div>
+        <div class="airllm-step">
+          <div class="airllm-n">03</div>
+          <div class="airllm-title">Set the URL in config.py</div>
+          <p class="airllm-desc">Find the LAN IP of the device running AirLLM (e.g. <code>192.168.1.42</code>) and set:<br><br><code>AIR_LLM_URL = "http://192.168.1.42:8080"</code></p>
+        </div>
+        <div class="airllm-step">
+          <div class="airllm-n">04</div>
+          <div class="airllm-title">Switch CODI to air mode</div>
+          <p class="airllm-desc">In the CODI CLI type <code>/mode air</code>, or set <code>MODE = "air"</code> in config.py. In hybrid mode, CODI falls back to AirLLM automatically when Ollama is offline.</p>
+        </div>
+      </div>
+
+      <div class="note-box reveal" style="margin-top:1.5rem">
+        <strong>Recommended models for AirLLM:</strong> Phi-3-mini-4k-instruct (Q4_K_M, ~2.2 GB) or Llama-3.2-3B-Instruct (Q4_K_M, ~1.8 GB). AirLLM's layer-by-layer loading means it runs on devices with as little as 3 GB RAM.
+        See the <a href="https://github.com/lyogavin/airllm" target="_blank" style="color:var(--green)">AirLLM GitHub</a> for the full model list and server setup guide.
+      </div>
+
+      <div class="code-box reveal" style="margin-top:1.5rem"><pre><span class="cm"># Minimal AirLLM server (save as llm_server.py, run on inference device)</span>
+<span class="kw">from</span> airllm <span class="kw">import</span> AutoModel
+<span class="kw">from</span> fastapi <span class="kw">import</span> FastAPI
+<span class="kw">import</span> uvicorn
+
+model = AutoModel.from_pretrained(<span class="str">"microsoft/Phi-3-mini-4k-instruct"</span>)
+app   = FastAPI()
+
+@app.post(<span class="str">"/v1/chat/completions"</span>)
+<span class="kw">async def</span> chat(req: dict):
+    msgs    = req.get(<span class="str">"messages"</span>, [])
+    prompt  = <span class="str">"\n"</span>.join(m[<span class="str">"content"</span>] <span class="kw">for</span> m <span class="kw">in</span> msgs)
+    tokens  = model.tokenizer(prompt, return_tensors=<span class="str">"pt"</span>)
+    out     = model.generate(**tokens, max_new_tokens=<span class="str">512</span>)
+    text    = model.tokenizer.decode(out[0], skip_special_tokens=<span class="kw">True</span>)
+    <span class="kw">return</span> {<span class="str">"choices"</span>: [{<span class="str">"message"</span>: {<span class="str">"content"</span>: text}}]}
+
+<span class="kw">if</span> __name__ == <span class="str">"__main__"</span>:
+    uvicorn.run(app, host=<span class="str">"0.0.0.0"</span>, port=<span class="str">8080</span>)</pre></div>
+    </div>
+
   </div>
 </div>
 
@@ -794,7 +912,7 @@ footer{
 <section class="section" id="mcp">
   <div class="sec-ey reveal">Plugins</div>
   <h2 class="sec-title reveal">The MCP <em>arsenal</em></h2>
-  <p class="sec-desc reveal">Toggle any server at runtime with <code style="color:var(--green)">/mcp on &lt;name&gt;</code>. Local mode auto-filters to keep context small.</p>
+  <p class="sec-desc reveal">Toggle any server at runtime with <code style="color:var(--green)">/mcp on &lt;name&gt;</code>. Local and Air modes auto-filter to keep context small.</p>
   <div class="mcp-wrap">
     <div class="mcp-chip on reveal"><div class="mdot"></div>filesystem</div>
     <div class="mcp-chip on reveal"><div class="mdot"></div>memory</div>
@@ -802,7 +920,7 @@ footer{
     <div class="mcp-chip on reveal"><div class="mdot"></div>playwright</div>
     <div class="mcp-chip on reveal"><div class="mdot"></div>git</div>
     <div class="mcp-chip on reveal"><div class="mdot"></div>fetch</div>
-    <div class="mcp-chip off reveal"><div class="mdot"></div>github</div>
+    <div class="mcp-chip on reveal"><div class="mdot"></div>github</div>
     <div class="mcp-chip off reveal"><div class="mdot"></div>brave-search</div>
     <div class="mcp-chip off reveal"><div class="mdot"></div>postgres</div>
     <div class="mcp-chip off reveal"><div class="mdot"></div>sqlite</div>
@@ -854,75 +972,72 @@ document.querySelectorAll('.reveal').forEach(el=>obs.observe(el));
 // Demo simulation
 const demos = {
   default: [
-    {t:0, html:'<div><span class="t-g">>> </span><span class="t-w">create a Flask REST API with /health and /users endpoints</span></div>'},
-    {t:400, html:'<div class="t-d">Refining prompt...</div>'},
-    {t:900, html:'<div class="t-d">Planning: create app.py, models.py, requirements.txt</div>'},
-    {t:1400, html:'<div><span class="t-g">✓</span> Written 847 chars → app.py</div>'},
-    {t:1800, html:'<div><span class="t-g">✓</span> Written 312 chars → models.py</div>'},
-    {t:2100, html:'<div><span class="t-g">✓</span> Written 156 chars → requirements.txt</div>'},
-    {t:2500, html:'<div class="t-d">Verifying... running flask --version</div>'},
-    {t:3000, html:'<div class="t-g">✓ Done. 3 files created. API ready on port 5000.</div>'},
+    {t:0,   html:'<div><span class="t-g">❯ </span><span class="t-w">create a Flask REST API with /health and /users endpoints</span></div>'},
+    {t:400, html:'<div class="t-d">  → refining prompt...</div>'},
+    {t:900, html:'<div class="t-d">  planning: create app.py, models.py, requirements.txt</div>'},
+    {t:1400,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  847 chars → app.py</span></div>'},
+    {t:1800,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  312 chars → models.py</span></div>'},
+    {t:2100,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  156 chars → requirements.txt</span></div>'},
+    {t:2500,html:'<div class="t-d">  ✓  run_command  flask --version → ok</div>'},
+    {t:3000,html:'<div class="t-g">  ✓ done — 3 files created. API ready on port 5000.</div>'},
   ],
   jwt: [
-    {t:0, html:'<div><span class="t-g">>> </span><span class="t-w">add JWT authentication to this FastAPI project</span></div>'},
-    {t:400, html:'<div class="t-d">Indexing codebase... 8 files found</div>'},
-    {t:900, html:'<div class="t-d">Planning: auth.py, middleware.py, update main.py</div>'},
-    {t:1400, html:'<div><span class="t-g">✓</span> Written 1240 chars → auth/auth.py</div>'},
-    {t:1800, html:'<div><span class="t-g">✓</span> Written 480 chars → auth/middleware.py</div>'},
-    {t:2200, html:'<div><span class="t-g">✓</span> Updated → main.py (injected router)</div>'},
-    {t:2700, html:'<div class="t-d">Running: pytest tests/ — 4 passed</div>'},
-    {t:3200, html:'<div class="t-g">✓ Done. JWT auth active on /auth/login and /auth/refresh.</div>'},
+    {t:0,   html:'<div><span class="t-g">❯ </span><span class="t-w">add JWT authentication to this FastAPI project</span></div>'},
+    {t:400, html:'<div class="t-d">  indexing codebase... 8 files found</div>'},
+    {t:900, html:'<div class="t-d">  planning: auth.py, middleware.py, update main.py</div>'},
+    {t:1400,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  1240 chars → auth/auth.py</span></div>'},
+    {t:1800,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  480 chars → auth/middleware.py</span></div>'},
+    {t:2200,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  updated main.py (router injected)</span></div>'},
+    {t:2700,html:'<div class="t-d">  ✓  run_command  pytest tests/ → 4 passed</div>'},
+    {t:3200,html:'<div class="t-g">  ✓ done — JWT auth on /auth/login and /auth/refresh.</div>'},
   ],
   bug: [
-    {t:0, html:'<div><span class="t-g">>> </span><span class="t-w">fix the KeyError in utils/parser.py line 42</span></div>'},
-    {t:400, html:'<div class="t-d">Reading: utils/parser.py</div>'},
-    {t:800, html:'<div class="t-d">Found: dict access without .get() — line 42</div>'},
-    {t:1300, html:'<div><span class="t-g">✓</span> Patched → utils/parser.py</div>'},
-    {t:1700, html:'<div class="t-d">Running: python -m pytest tests/test_parser.py</div>'},
-    {t:2300, html:'<div class="t-g">✓ Tests pass. KeyError resolved.</div>'},
+    {t:0,   html:'<div><span class="t-g">❯ </span><span class="t-w">fix the KeyError in utils/parser.py line 42</span></div>'},
+    {t:400, html:'<div class="t-d">  ·  read_file  utils/parser.py</div>'},
+    {t:800, html:'<div class="t-d">  ·  dict access without .get() — line 42</div>'},
+    {t:1300,html:'<div><span class="t-g">  ✓  write_file</span><span class="t-d">  patched utils/parser.py</span></div>'},
+    {t:1700,html:'<div class="t-d">  ✓  run_command  pytest tests/test_parser.py</div>'},
+    {t:2300,html:'<div class="t-g">  ✓ done — KeyError resolved. Tests pass.</div>'},
   ],
 };
 
 function getDemo(input) {
   const t = input.toLowerCase();
-  if(t.includes('jwt') || t.includes('auth')) return demos.jwt;
-  if(t.includes('bug') || t.includes('fix') || t.includes('error')) return demos.bug;
+  if(t.includes('jwt')||t.includes('auth')) return demos.jwt;
+  if(t.includes('bug')||t.includes('fix')||t.includes('error')) return demos.bug;
   return demos.default;
 }
 
 function runDemo() {
   const input = document.getElementById('demoInput').value.trim() || 'create a Flask REST API with /health and /users endpoints';
-  const body = document.getElementById('demoBody');
+  const body  = document.getElementById('demoBody');
   const steps = getDemo(input);
 
   body.innerHTML = `
     <div><span class="t-g">✧</span> <span class="t-w">Vector DB connected</span></div>
     <div><span class="t-g">✧</span> <span class="t-w">Cognitive Refiner online</span></div>
-    <div><span class="t-g">★</span> <span class="t-w">Ready for input</span></div>
+    <div><span class="t-g">★ Mode: HYBRID</span> <span class="t-d">(groq)</span></div>
     <br>
     <div class="t-d">&nbsp;&nbsp;[Tools] 5 native + 28 MCP = <span class="t-w">33 total</span></div>
     <br>
   `;
 
-  // Override first step text with actual input
   const actualSteps = [...steps];
-  actualSteps[0] = {t:0, html:`<div><span class="t-g">>> </span><span class="t-w">${input}</span></div>`};
+  actualSteps[0] = {t:0, html:`<div><span class="t-g">❯ </span><span class="t-w">${input}</span></div>`};
 
   actualSteps.forEach(step => {
     setTimeout(() => {
       body.innerHTML += step.html;
       body.scrollTop = body.scrollHeight;
-      // Add cursor at end if last step
       if(step === actualSteps[actualSteps.length-1]) {
         setTimeout(() => {
-          body.innerHTML += `<br><span class="t-g">>> </span><span class="t-cursor"></span>`;
+          body.innerHTML += `<br><span class="t-g">❯ </span><span class="t-cursor"></span>`;
         }, 400);
       }
     }, step.t);
   });
 }
 
-// Allow Enter key in demo input
 document.getElementById('demoInput').addEventListener('keydown', e => {
   if(e.key === 'Enter') runDemo();
 });
