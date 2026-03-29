@@ -1,3 +1,4 @@
+import os
 from typing import TypedDict, Annotated, Sequence
 import operator
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -6,14 +7,12 @@ from tools import get_all_tools
 from llm_factory import get_coder_llm, get_refiner_llm
 from logger import log
 
-# Words that mean "just answer me" — no file ops needed
 SIMPLE_TRIGGERS = (
     "hello", "hi ", "hey ", "what is", "what are", "who is", "explain",
     "how do", "how does", "tell me", "what's", "whats", "thanks", "thank you",
     "yes", "no", "ok", "okay", "sure", "help", "why ", "when ", "where "
 )
 
-# Words that mean "do something" — must go through full agentic loop
 ACTION_TRIGGERS = (
     "create", "write", "make", "build", "fix", "edit", "update", "delete",
     "run", "execute", "generate", "refactor", "implement", "add", "code",
@@ -22,7 +21,8 @@ ACTION_TRIGGERS = (
     "rename", "move", "copy", "read", "open", "parse", "fetch", "download",
     "list", "search", "find", "show", "get", "check", "access", "browse",
     "navigate", "click", "screenshot", "scrape", "query", "lookup", "pull",
-    "push", "commit", "clone", "diff", "status", "remember", "store"
+    "push", "commit", "clone", "diff", "status", "remember", "store",
+    "repo", "repository", "github", "git",
 )
 
 def is_simple_input(text: str) -> bool:
@@ -35,6 +35,25 @@ def is_simple_input(text: str) -> bool:
         return True
     return False
 
+def _system_prompt() -> str:
+    """
+    Build a system prompt that tells the agent exactly where it is.
+    This is the fix for "which directory are you in?" giving a nonsense answer.
+    """
+    working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+    return (
+        f"You are Codi, an offline-first AI coding agent.\n\n"
+        f"CURRENT PROJECT DIRECTORY: {working_dir}\n"
+        f"All file operations, shell commands, and searches are relative to this directory.\n"
+        f"When the user says 'list files', 'read file', or 'run command' — always operate "
+        f"in {working_dir} unless they specify a different absolute path.\n\n"
+        f"You have tools: run_command, read_file, write_file, list_files, search_codebase, "
+        f"and MCP tools (filesystem, git, github, fetch, memory, playwright, etc).\n"
+        f"Use tools immediately — do not explain what you're about to do, just do it.\n"
+        f"For GitHub operations use the github MCP tools, not the gh CLI.\n"
+        f"For git operations on the local repo use run_command with git commands.\n"
+    )
+
 class AgentState(TypedDict):
     input: str
     history: str
@@ -45,25 +64,27 @@ class AgentState(TypedDict):
     iterations: int
 
 def create_agent():
-    tools = get_all_tools()
-    llm = get_coder_llm()
+    tools        = get_all_tools()
+    llm          = get_coder_llm()
     llm_with_tools = llm.bind_tools(tools)
-    refiner_llm = get_refiner_llm()
+    refiner_llm  = get_refiner_llm()
 
-    # ── Short-circuit — single LLM call for simple Q&A ─────────────
+    # ── Direct Q&A (no tools) ─────────────────────────────────────────────────
     def direct_node(state: AgentState):
         log("direct_response", {"input": state["input"][:100]})
         response = refiner_llm.invoke([
-            SystemMessage(content="You are Codi, a helpful coding assistant. Answer concisely."),
-            HumanMessage(content=state["input"])
+            SystemMessage(content=_system_prompt()),
+            HumanMessage(content=state["input"]),
         ])
         return {"messages": [AIMessage(content=response.content)], "status": "complete"}
 
-    # ── Full agentic loop ───────────────────────────────────────────
+    # ── Plan ──────────────────────────────────────────────────────────────────
     def plan_node(state: AgentState):
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
         prompt = (
+            f"Project directory: {working_dir}\n"
             f"Task: {state['input']}\n"
-            f"Write a concise step-by-step plan (max 4 steps) using tools to complete this."
+            f"Write a concise step-by-step plan (max 4 steps) using available tools."
         )
         response = refiner_llm.invoke([HumanMessage(content=prompt)])
         log("plan_created", {"plan": response.content[:200]})
@@ -73,29 +94,29 @@ def create_agent():
             "messages": [SystemMessage(content=f"Plan:\n{response.content}")]
         }
 
+    # ── Execute ───────────────────────────────────────────────────────────────
     def execute_node(state: AgentState):
-        sys_msg = SystemMessage(content=(
-            "You are an executor. Call tools immediately to complete the task. "
-            "Do NOT explain — just call tools now."
+        sys_msg = SystemMessage(content=_system_prompt())
+        recent  = list(state.get("messages", []))[-6:]
+        user_msg = HumanMessage(content=(
+            f"Task: {state['input']}\n"
+            f"Project dir: {os.environ.get('CODI_WORKING_DIR', os.getcwd())}\n"
+            f"Execute using tools NOW. Do not explain."
         ))
-        recent_messages = list(state.get("messages", []))[-6:]
-        user_msg = HumanMessage(content=f"Task: {state['input']}\nExecute using tools NOW.")
-        messages = [sys_msg] + recent_messages + [user_msg]
+        messages = [sys_msg] + recent + [user_msg]
 
         try:
             response = llm_with_tools.invoke(messages)
         except Exception as e:
             err = str(e)
-            # Groq returns 400 when tool call JSON is malformed (tool_use_failed).
-            # Fall back to a plain call so the graph doesn't crash.
             if "tool_use_failed" in err or "400" in err:
-                log("execute_node_tool_fallback", {"error": err[:200]})
-                plain_response = refiner_llm.invoke([
-                    SystemMessage(content="You are Codi, a helpful coding assistant. Answer concisely."),
-                    HumanMessage(content=state["input"])
+                log("execute_fallback", {"error": err[:200]})
+                plain = refiner_llm.invoke([
+                    SystemMessage(content=_system_prompt()),
+                    HumanMessage(content=state["input"]),
                 ])
                 return {
-                    "messages": [AIMessage(content=plain_response.content)],
+                    "messages": [AIMessage(content=plain.content)],
                     "status": "complete",
                 }
             raise
@@ -104,58 +125,60 @@ def create_agent():
         log("execute_node", {"iteration": state["iterations"], "has_tool_calls": has_calls})
         return {"messages": [response]}
 
+    # ── Tool execution ────────────────────────────────────────────────────────
     def tool_node(state: AgentState):
-        last_message = state["messages"][-1]
+        last_message  = state["messages"][-1]
         tool_messages = []
-        outputs = []
+        outputs       = []
+
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
             for tool_call in last_message.tool_calls:
                 tool_obj = next((t for t in tools if t.name == tool_call["name"]), None)
                 if tool_obj:
                     try:
                         result = tool_obj.invoke(tool_call["args"])
-                        msg = f"{tool_obj.name}: {str(result)[:500]}"
+                        msg    = f"{tool_obj.name}: {str(result)[:500]}"
                     except Exception as e:
                         msg = f"{tool_obj.name} error: {e}"
                 else:
                     msg = f"Tool not found: {tool_call['name']}"
+
                 outputs.append(msg)
                 tool_messages.append(ToolMessage(
                     content=msg,
                     name=tool_call["name"],
-                    tool_call_id=tool_call["id"]
+                    tool_call_id=tool_call["id"],
                 ))
-        # increment iterations so the cap accounts for every tool round
+
         return {
             "messages": tool_messages,
             "tool_outputs": outputs,
             "iterations": state["iterations"] + 1,
         }
 
+    # ── Verify ────────────────────────────────────────────────────────────────
     def verify_node(state: AgentState):
-        # Honour complete status set by execute_node fallback
         if state.get("status") == "complete":
             return {"status": "complete"}
 
         if not state.get("tool_outputs"):
-            log("verify_node", {"iteration": state["iterations"], "response": "NO_OUTPUTS"})
             return {
                 "status": "incomplete",
                 "iterations": state["iterations"] + 1,
                 "messages": [SystemMessage(content=(
-                    "CRITICAL: You have not called any tools yet. "
-                    "You MUST call write_file to create files. Execute now, do not explain."
+                    "You have not called any tools yet. "
+                    "You MUST use tools to complete this task. Call them now."
                 ))]
             }
+
         recent_outputs = "\n".join(state['tool_outputs'][-3:])
         prompt = (
             f"Task: {state['input']}\n"
-            f"Tool outputs: {recent_outputs}\n"
-            f"Done? Reply YES or NO only."
+            f"Tool outputs so far:\n{recent_outputs}\n"
+            f"Is the task fully complete? Reply YES or NO only."
         )
-        response = refiner_llm.invoke([HumanMessage(content=prompt)])
-        content = response.content.strip().upper()
-        is_complete = content.startswith("YES")
+        response   = refiner_llm.invoke([HumanMessage(content=prompt)])
+        is_complete = response.content.strip().upper().startswith("YES")
         log("verify_node", {"iteration": state["iterations"], "is_complete": is_complete})
 
         if is_complete:
@@ -163,37 +186,34 @@ def create_agent():
         return {
             "status": "incomplete",
             "iterations": state["iterations"] + 1,
-            "messages": [SystemMessage(content="Not done yet. Continue with tools.")]
+            "messages": [SystemMessage(content="Not done yet. Continue using tools.")]
         }
 
+    # ── Synthesize ────────────────────────────────────────────────────────────
     def synthesize_node(state: AgentState):
         if not state.get("tool_outputs"):
-            log("synthesize_node", {"output": "NO_TOOLS_CALLED"})
-            # Surface any direct AI response from the fallback path
             msgs = state.get("messages", [])
             for m in reversed(msgs):
                 if isinstance(m, AIMessage) and m.content:
                     return {"messages": [m]}
             return {"messages": [AIMessage(content=(
                 "Task could not be completed — no tools were executed. "
-                "Try rephrasing with an explicit file path."
+                "Try rephrasing or check /mcp to see if required servers are running."
             ))]}
+
         outputs_summary = "\n".join(state['tool_outputs'][-5:])
         response = refiner_llm.invoke([
-            SystemMessage(content="Summarize what was completed in 2-3 sentences. Be direct."),
+            SystemMessage(content="Summarize what was completed in 2-3 sentences. Be direct and specific."),
             HumanMessage(content=f"Task: {state['input']}\nResults:\n{outputs_summary}")
         ])
         log("synthesize_node", {"output": response.content[:200]})
         return {"messages": [AIMessage(content=response.content)]}
 
-    # ── Routing ─────────────────────────────────────────────────────
+    # ── Routing ───────────────────────────────────────────────────────────────
     def route_input(state: AgentState):
-        if is_simple_input(state["input"]):
-            return "direct"
-        return "plan"
+        return "direct" if is_simple_input(state["input"]) else "plan"
 
     def should_use_tools(state: AgentState):
-        # Fallback path: execute_node set status=complete, skip tool execution
         if state.get("status") == "complete":
             return "verify"
         last = state["messages"][-1]
@@ -206,20 +226,19 @@ def create_agent():
             return "synthesize"
         return "execute"
 
-    # ── Graph ────────────────────────────────────────────────────────
+    # ── Graph ─────────────────────────────────────────────────────────────────
     workflow = StateGraph(AgentState)
-    workflow.add_node("direct", direct_node)
-    workflow.add_node("plan", plan_node)
-    workflow.add_node("execute", execute_node)
-    workflow.add_node("tool", tool_node)
-    workflow.add_node("verify", verify_node)
-    workflow.add_node("synthesize", synthesize_node)
+    workflow.add_node("direct",    direct_node)
+    workflow.add_node("plan",      plan_node)
+    workflow.add_node("execute",   execute_node)
+    workflow.add_node("tool",      tool_node)
+    workflow.add_node("verify",    verify_node)
+    workflow.add_node("synthesize",synthesize_node)
 
     workflow.set_conditional_entry_point(route_input, {"direct": "direct", "plan": "plan"})
     workflow.add_edge("direct", END)
-    workflow.add_edge("plan", "execute")
+    workflow.add_edge("plan",   "execute")
     workflow.add_conditional_edges("execute", should_use_tools, {"tool": "tool", "verify": "verify"})
-    # tool → verify (not tool → execute) prevents infinite tool loops
     workflow.add_edge("tool", "verify")
     workflow.add_conditional_edges("verify", should_loop, {"synthesize": "synthesize", "execute": "execute"})
     workflow.add_edge("synthesize", END)
@@ -232,23 +251,24 @@ def create_agent():
 
         def invoke(self, inputs: dict) -> dict:
             state = {
-                "input": inputs["input"],
-                "history": inputs.get("history", ""),
-                "plan": "",
-                "messages": [],
-                "tool_outputs": [],
-                "status": "start",
-                "iterations": 0
+                "input":       inputs["input"],
+                "history":     inputs.get("history", ""),
+                "plan":        "",
+                "messages":    [],
+                "tool_outputs":[],
+                "status":      "start",
+                "iterations":  0,
             }
             try:
                 result = self.graph.invoke(state, {"recursion_limit": 60})
-                msgs = result.get("messages", [])
+                msgs   = result.get("messages", [])
+                tool_outputs = result.get("tool_outputs", [])
                 if msgs and isinstance(msgs[-1], AIMessage):
-                    return {"output": msgs[-1].content}
-                return {"output": "Completed but no output generated."}
+                    return {"output": msgs[-1].content, "tool_outputs": tool_outputs}
+                return {"output": "Completed but no output generated.", "tool_outputs": tool_outputs}
             except Exception as e:
                 log("agent_error", {"error": str(e)})
-                return {"output": f"Graph execution failed: {e}"}
+                return {"output": f"Agent error: {e}", "tool_outputs": []}
 
-    log("agent_executor_created", {"engine": "langgraph_v2_optimized"})
+    log("agent_created", {"tools": len(tools)})
     return CodiGraphAgent(app)

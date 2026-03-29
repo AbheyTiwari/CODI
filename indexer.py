@@ -1,22 +1,26 @@
 import os
 import json
 import hashlib
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma          # updated — replaces deprecated langchain_community.vectorstores.Chroma
+from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-CHROMA_PERSIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+# ── ChromaDB location ─────────────────────────────────────────────────────────
+# When launched via `codi` CLI, CODI_CHROMA_DIR is set per-project by cli.py.
+# When run directly (python indexer.py), fall back to the repo-local chroma_db/.
+_REPO_CHROMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+CHROMA_PERSIST_DIR = os.environ.get("CODI_CHROMA_DIR", _REPO_CHROMA)
 
 def get_embeddings():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 def get_vectorstore():
-    if not os.path.exists(CHROMA_PERSIST_DIR) or not os.listdir(CHROMA_PERSIST_DIR):
+    chroma_dir = os.environ.get("CODI_CHROMA_DIR", CHROMA_PERSIST_DIR)
+    if not os.path.exists(chroma_dir) or not os.listdir(chroma_dir):
         return None
     try:
         embeddings = get_embeddings()
-        return Chroma(persist_directory=CHROMA_PERSIST_DIR, embedding_function=embeddings)
+        return Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
     except Exception:
         return None
 
@@ -25,19 +29,38 @@ def file_hash(path: str) -> str:
         return hashlib.md5(f.read()).hexdigest()
 
 def walk_codebase(root_path: str):
-    skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', 'dist', 'build', '.idea', 'chroma_db'}
+    skip_dirs = {
+        '.git', 'node_modules', '__pycache__', 'venv', 'dist', 'build',
+        '.idea', 'chroma_db', '.mypy_cache', '.pytest_cache', '.tox',
+    }
+    code_exts = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.scss',
+        '.json', '.yaml', '.yml', '.toml', '.md', '.txt', '.sh', '.bash',
+        '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.rb', '.php',
+        '.sql', '.graphql',
+    }
+    named_files = {'Dockerfile', 'Makefile', '.env.example'}
+
     for root, dirs, files in os.walk(root_path):
         dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
         for f in files:
+            _, ext = os.path.splitext(f)
+            if ext.lower() not in code_exts and f not in named_files:
+                continue
             path = os.path.join(root, f)
             try:
-                with open(path, "r", encoding="utf-8") as file:
-                    yield path, file.read()
+                with open(path, "r", encoding="utf-8", errors="ignore") as file:
+                    content = file.read()
+                if content.strip():
+                    yield path, content
             except Exception:
                 continue
 
-def index_codebase(root_path: str, db_path: str = CHROMA_PERSIST_DIR):
-    print(f"Indexing codebase at: {root_path} ...")
+def index_codebase(root_path: str, db_path: str = None):
+    if db_path is None:
+        db_path = os.environ.get("CODI_CHROMA_DIR", CHROMA_PERSIST_DIR)
+
+    print(f"  Indexing: {root_path}")
     os.makedirs(db_path, exist_ok=True)
     ef = get_embeddings()
 
@@ -58,7 +81,7 @@ def index_codebase(root_path: str, db_path: str = CHROMA_PERSIST_DIR):
 
         new_cache[fpath] = h
         if cache.get(fpath) == h:
-            continue  # unchanged, skip
+            continue
 
         try:
             vectorstore.delete(where={"source": fpath})
@@ -67,12 +90,15 @@ def index_codebase(root_path: str, db_path: str = CHROMA_PERSIST_DIR):
 
         splits = text_splitter.split_text(content)
         if splits:
-            docs = text_splitter.create_documents(splits, metadatas=[{"source": fpath}] * len(splits))
+            docs = text_splitter.create_documents(
+                splits,
+                metadatas=[{"source": fpath}] * len(splits)
+            )
             vectorstore.add_documents(docs)
         updated += 1
 
     json.dump(new_cache, open(cache_path, "w"))
-    print(f"Indexed {updated} changed files. {len(new_cache)} total tracked.")
+    print(f"  Indexed {updated} changed / {len(new_cache)} total files.")
 
 if __name__ == "__main__":
     import sys

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codi-agent"
+version = "0.1.0"
+description = "Codi — offline-first AI coding agent"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain",
+    "langchain-core",
+    "langchain-community",
+    "langchain-ollama",
+    "langchain-groq",
+    "langchain-openai",
+    "langchain-anthropic",
+    "langchain-google-genai",
+    "langchain-huggingface",
+    "langchain-chroma",
+    "langchain-mcp-adapters",
+    "langgraph",
+    "mcp",
+    "chromadb",
+    "sentence-transformers",
+    "rich",
+    "prompt_toolkit",
+    "python-dotenv",
+    "requests",
+    "pydantic",
+]
+
+[project.scripts]
+codi = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.package-dir]
+"" = "."

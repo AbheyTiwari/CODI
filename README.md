@@ -1,148 +1,128 @@
-# Codi — Local / Cloud AI Coding Agent
+# Codi — Local AI Coding Agent
 
-Codi is a Python CLI agent for codebase-aware development workflows. It combines model-driven reasoning, tool execution, semantic search, and optional MCP plugins for flexible developer automation.
+Codi is a lightweight Python CLI agent for code-aware development workflows. It uses local or cloud LLMs, semantic search, and tool execution to help you inspect, edit, and automate code in any directory.
 
-## 🚀 What Codi does
+## 🚀 Quick Start
 
-- Runs as a CLI assistant from `main.py`
-- Uses prompt refinement for action-oriented tasks
-- Decides between direct Q&A and tool-enabled workflows
-- Supports file editing, shell command execution, and semantic code search
-- Indexes code into ChromaDB for RAG-style search
-- Loads external MCP tools from `mcp_servers.json`
-- Maintains session memory and logs agent events to `codi.log`
+1. Open PowerShell or Command Prompt in the project folder.
+2. Create and activate a Python virtual environment.
 
-## 🧩 Core capabilities
-
-- `read_file(path)` — read any file content
-- `write_file(path, content)` — write file content and create directories
-- `run_command(command)` — execute shell commands safely
-- `search_codebase(query)` — semantic search over indexed code
-- `list_files(dir_path)` — list files recursively
-- `/index <path>` — index a repository into `chroma_db`
-- MCP plugin support for additional toolsets
-- `/logs` — live telemetry viewer
-
-## 📥 Installation
-
-1. Create and activate a virtual environment.
-
-   Windows PowerShell:
+   PowerShell:
    ```powershell
    python -m venv .venv
    .\.venv\Scripts\Activate.ps1
    ```
 
-   macOS / Linux:
-   ```bash
+   Command Prompt:
+   ```cmd
    python -m venv .venv
-   source .venv/bin/activate
+   .\.venv\Scriptsctivate.bat
    ```
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
+3. Install the package and dependencies:
+   ```powershell
+   pip install -e .
    ```
 
-3. Copy `.env.example` to `.env` and populate your API keys.
-
+4. Optionally copy environment settings and add API keys:
    ```powershell
    copy .env.example .env
    ```
 
+## 🧩 Run Codi from any directory
+
+After installing this package into your active environment, you can run Codi from any working directory by calling:
+
+```powershell
+codi
+```
+
+or in Command Prompt:
+
+```cmd
+codi
+```
+
+This works in any directory as long as the virtual environment is active and the `codi` entry point is installed.
+
+## ✅ What Codi can do
+
+- Start an interactive AI coding assistant
+- Read and write files
+- Execute shell commands safely
+- Search the repository using semantic embeddings
+- Index a code folder into `chroma_db/`
+- Load MCP plugin tools from `mcp_servers.json`
+- Maintain session memory and command history
+
+## 📌 Main Commands
+
+- `/index <path>` — index a folder for semantic search
+- `/mcp` — show configured MCP servers
+- `/mcp on <name>` — enable an MCP server
+- `/mcp off <name>` — disable an MCP server
+- `/logs` — view runtime logs
+- `/clear` — clear session memory
+- `/history` — display memory history
+- `/help` — show help text
+- `/quit` — exit Codi
+
 ## ⚙️ Configuration
 
-### `config.py`
+Settings are stored in `config.py` and optionally in `.env`.
 
-- `MODE` controls the LLM route:
-  - `local` — use Ollama via `langchain_ollama`
-  - `cloud` — use a remote cloud provider
-  - `remote` — forward requests to a remote LLM server
-- `CLOUD_PROVIDER` selects between `groq`, `openai`, `anthropic`, and `gemini`
-- Model names are configured separately for refiner and coder roles
+Key configuration options:
+- `MODE` — `local`, `cloud`, or `remote`
+- `CLOUD_PROVIDER` — `groq`, `openai`, `anthropic`, or `gemini`
+- API keys via `.env` or environment variables
 
-### API keys
-
-Codi loads API keys in this order:
-1. environment variables
-2. `config.json` if present
-
-Supported env vars:
+Supported environment variables:
 - `CODI_GEMINI_API_KEY`
 - `CODI_GROQ_API_KEY`
 - `CODI_OPENAI_API_KEY`
 - `CODI_ANTHROPIC_API_KEY`
 
-Use `.env` to keep credentials local.
+## 🧠 Project Structure
 
-## 💡 Usage
+- `main.py` — CLI entry point and command loop
+- `agent.py` — agent workflow and tool orchestration
+- `llm_factory.py` — local/cloud/remote model selection
+- `refiner.py` — prompt refinement logic
+- `tools.py` — built-in tools and MCP tool loading
+- `indexer.py` — ChromaDB index management
+- `memory.py` — session memory persistence
+- `logger.py` — event logging
+- `log_viewer.py` — live log viewer
+- `mcp_client.py` / `mcp_manager.py` — MCP connection management
 
-Start the CLI:
-```bash
-python main.py
+## 🔧 Install globally in a virtual env
+
+To make `codi` available everywhere while using the same virtual environment, activate the env and install the package:
+
+```powershell
+pip install -e .
 ```
 
-### Commands
+Then run from any folder:
 
-- `/index <path>` — index a directory for semantic search
-- `/mcp` — list MCP servers and their enabled state
-- `/mcp on <name>` — enable a server in `mcp_servers.json`
-- `/mcp off <name>` — disable a server
-- `/logs` — open live telemetry
-- `/clear` — clear session memory
-- `/history` — show current memory
-- `/help` — show help text
-- `/quit` — exit
-
-### Task input
-
-Codi automatically routes simple questions to a direct response path and action tasks through the tool-enabled agent workflow.
-
-Example:
-```text
->> create a CLI command that writes a Python module and updates README.md
+```powershell
+codi
 ```
 
-## 🧠 Architecture
+## 📚 Notes and Tips
 
-- `main.py` — CLI, command loop, prompt refinement, agent invocation
-- `agent.py` — LangGraph workflow, direct vs agent routing, verification and synthesis
-- `llm_factory.py` — local/cloud/remote LLM selection
-- `refiner.py` — conditional task refinement
-- `tools.py` — native tools and MCP tool loading
-- `indexer.py` — ChromaDB indexing and persistence
-- `memory.py` — session memory tracking and summary compression
-- `logger.py` — structured event logging
-- `log_viewer.py` — live terminal dashboard
-- `mcp_client.py` / `mcp_manager.py` — MCP server connections
+- If `codi` is not recognized, ensure your virtual environment is activated.
+- Use `/index .` to index the current repository.
+- Keep `.env` out of version control.
+- `.gitignore` already excludes `.env`, `.agent_history`, `codi.log`, `chroma_db/`, and `__pycache__/`.
 
-## 🔌 MCP Plugins
+## 📦 Package Entry Point
 
-`mcp_servers.json` defines external MCP server integrations.
+This project exposes the `codi` console script via `pyproject.toml`:
 
-- only enabled servers are loaded
-- local mode filters MCP toolsets to keep prompt context small
-- cloud mode loads all enabled MCP tools
+```toml
+[project.scripts]
+codi = "main:main"
+```
 
-Use `/mcp on <name>` and `/mcp off <name>` to toggle servers at runtime.
-
-## 🛡️ Security and repo hygiene
-
-This repo includes local state and should not expose secrets publicly.
-
-Do not commit:
-- `.env`
-- `.agent_history`
-- `codi.log`
-- `chroma_db/`
-- `__pycache__/`
-
-A `.gitignore` is included to exclude these files.
-
-## 🧪 Notes
-
-- `refiner.py` rewrites longer action-oriented prompts only
-- `tools.py` has a command sandbox guard for dangerous shell patterns
-- `indexer.py` skips `.git`, `node_modules`, `.venv`, and `chroma_db`
-- `memory.py` compresses old conversations into a summary
-
+That means `codi` launches the same CLI as `python main.py`.
