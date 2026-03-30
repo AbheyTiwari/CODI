@@ -13,88 +13,143 @@ import platform
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).parent.resolve()
+ROOT    = Path(__file__).parent.resolve()
 ENV_FILE = ROOT / ".env"
 MCP_FILE = ROOT / "mcp_servers.json"
 
-# ── Colors ────────────────────────────────────────────────────────
-G = lambda s: f"\033[92m{s}\033[0m"
-Y = lambda s: f"\033[93m{s}\033[0m"
-R = lambda s: f"\033[91m{s}\033[0m"
-B = lambda s: f"\033[1m{s}\033[0m"
+IS_WIN = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+IS_LIN = platform.system() == "Linux"
+HOME   = Path.home()
 
-def ok(msg):   print(f"  {G('✓')} {msg}")
-def warn(msg): print(f"  {Y('⚠')} {msg}")
-def err(msg):  print(f"  {R('✗')} {msg}")
-def info(msg): print(f"  {B('→')} {msg}")
-def head(msg): print(f"\n  {B(msg)}")
+# ── Bootstrap Rich (install it if missing, we need it for the UI) ─────────────
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich import box
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "rich", "-q"])
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich import box
 
-IS_WIN  = platform.system() == "Windows"
-IS_MAC  = platform.system() == "Darwin"
-IS_LIN  = platform.system() == "Linux"
-HOME    = Path.home()
+console = Console()
 
-print()
-print(B("  ╔══════════════════════════════╗"))
-print(B("  ║     CODI Setup Assistant     ║"))
-print(B("  ╚══════════════════════════════╝"))
-print(f"\n  OS     : {platform.system()} {platform.release()}")
-print(f"  Python : {sys.version.split()[0]}")
-print(f"  Root   : {ROOT}")
+# ── Theme ─────────────────────────────────────────────────────────────────────
+A  = "bright_cyan"      # accent
+DIM = "dim cyan"
 
-# ─────────────────────────────────────────────────────────────────
+def ok(msg):
+    console.print(Text(f"  ✓  {msg}", style="bright_green"))
+
+def warn(msg):
+    console.print(Text(f"  ⚠  {msg}", style="yellow"))
+
+def err(msg):
+    console.print(Text(f"  ✗  {msg}", style="red"))
+
+def info(msg):
+    console.print(Text(f"  →  {msg}", style="dim"))
+
+def step(n, total, title):
+    console.print()
+    console.print(Rule(
+        Text(f" {n}/{total}  {title} ", style=f"bold {A}"),
+        style=DIM,
+    ))
+    console.print()
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+BANNER = """\
+  ██████╗ ██████╗ ██████╗ ██╗
+ ██╔════╝██╔═══██╗██╔══██╗██║
+ ██║     ██║   ██║██║  ██║██║
+ ██║     ██║   ██║██║  ██║██║
+ ╚██████╗╚██████╔╝██████╔╝██║
+  ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝"""
+
+console.print()
+for line in BANNER.splitlines():
+    console.print(Text(line, style=f"bold {A}"), justify="center")
+console.print()
+console.print(Rule(style=DIM))
+
+# System info row
+sysinfo = Text()
+sysinfo.append(f"  {platform.system()} {platform.release()}", style="dim")
+sysinfo.append("  ·  ", style="dim")
+sysinfo.append(f"Python {sys.version.split()[0]}", style="dim")
+sysinfo.append("  ·  ", style="dim")
+sysinfo.append(str(ROOT), style="dim")
+console.print(sysinfo)
+console.print(Rule(style=DIM))
+console.print()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Resolve tool paths
-# ─────────────────────────────────────────────────────────────────
-head("[1/5] Resolving tool paths")
+# ─────────────────────────────────────────────────────────────────────────────
+step(1, 5, "Resolving tool paths")
 
-NPX = shutil.which("npx") or shutil.which("npx.cmd")
-UVX = shutil.which("uvx")
-UV  = shutil.which("uv")
+NPX    = shutil.which("npx") or shutil.which("npx.cmd")
+UVX    = shutil.which("uvx")
+UV     = shutil.which("uv")
 OLLAMA = shutil.which("ollama")
 
-if NPX:
-    ok(f"npx   → {NPX}")
-else:
-    warn("npx not found — npm MCP servers disabled")
-    warn("Install Node.js: https://nodejs.org")
+table = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+table.add_column(style=A, no_wrap=True, width=10)
+table.add_column(style="dim")
+table.add_column()
 
-if UVX:
-    ok(f"uvx   → {UVX}")
-else:
+def _tool_row(name, path, needed_for):
+    if path:
+        table.add_row(name, path, Text("✓", style="bright_green"))
+    else:
+        table.add_row(name, f"not found — {needed_for}", Text("✗", style="red"))
+
+_tool_row("npx",    NPX,    "npm MCP servers")
+_tool_row("uvx",    UVX,    "uvx MCP servers")
+_tool_row("ollama", OLLAMA, "local/hybrid mode")
+
+console.print(table)
+
+if not NPX:
+    warn("Install Node.js to enable npm MCP servers: https://nodejs.org")
+
+if not UVX:
     if UV:
-        info("uv found — trying to install uvx via pip install uv")
+        info("uv found — installing uvx via pip")
     else:
         info("uvx not found — installing via pip install uv")
-    subprocess.run([sys.executable, "-m", "pip", "install", "uv", "-q"],
-                   capture_output=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "uv", "-q"], capture_output=True)
     UVX = shutil.which("uvx")
     if UVX:
-        ok(f"uvx   → {UVX}")
+        ok(f"uvx installed → {UVX}")
     else:
-        warn("uvx still not found — uvx MCP servers disabled")
-        warn("Fix: pip install uv  then restart terminal")
+        warn("uvx still not found. Fix: pip install uv  then restart terminal")
 
-if OLLAMA:
-    ok(f"ollama → {OLLAMA}")
-else:
-    warn("ollama not found — local/hybrid mode needs it")
-    warn("Install: https://ollama.com")
+if not OLLAMA:
+    warn("Ollama not found. Install for local/hybrid mode: https://ollama.com")
 
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Fix mcp_servers.json
-# ─────────────────────────────────────────────────────────────────
-head("[2/5] Configuring MCP servers")
+# ─────────────────────────────────────────────────────────────────────────────
+step(2, 5, "Configuring MCP servers")
 
 PLACEHOLDER = "__CODI_ROOT__"
 
 if not MCP_FILE.exists():
     warn("mcp_servers.json not found — skipping")
 else:
-    raw = MCP_FILE.read_text(encoding="utf-8")
+    raw     = MCP_FILE.read_text(encoding="utf-8")
     changes = 0
-
-    # Replace __CODI_ROOT__ placeholder with actual path
     actual_root = str(ROOT).replace("\\", "/")
+
     if PLACEHOLDER in raw:
         raw = raw.replace(PLACEHOLDER, actual_root)
         changes += 1
@@ -103,55 +158,48 @@ else:
     data = json.loads(raw)
 
     for name, cfg in data.items():
-        # Fix any remaining Windows paths on non-Windows
-        args = cfg.get("args", [])
+        args     = cfg.get("args", [])
         new_args = []
         for arg in args:
             if not IS_WIN and ("C:\\" in str(arg) or "C:/" in str(arg)):
-                # Replace Windows path with project root
                 new_args.append(actual_root)
                 changes += 1
-                warn(f"Replaced Windows path in {name} args: {arg}")
+                warn(f"Replaced Windows path in {name}")
             elif not IS_WIN and "/home/kali" in str(arg) and str(ROOT) not in str(arg):
                 new_args.append(actual_root)
                 changes += 1
-                warn(f"Replaced kali path in {name} args: {arg}")
+                warn(f"Replaced kali path in {name}")
             else:
                 new_args.append(arg)
         cfg["args"] = new_args
 
-        # Disable servers whose commands aren't available
         if cfg.get("enabled") and cfg.get("type") not in ("sse", "http"):
             cmd = cfg.get("command", "")
             if cmd == "uvx" and not UVX:
                 cfg["enabled"] = False
                 warn(f"Disabled {name} (uvx unavailable)")
                 changes += 1
-            elif cmd in ("npx",) and not NPX:
+            elif cmd == "npx" and not NPX:
                 cfg["enabled"] = False
                 warn(f"Disabled {name} (npx unavailable)")
                 changes += 1
 
-        # sqlite npm package was removed — always disable
         if name == "sqlite" and cfg.get("enabled"):
             cfg["enabled"] = False
             warn("Disabled sqlite (@modelcontextprotocol/server-sqlite removed from npm)")
             changes += 1
 
-    MCP_FILE.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
+    MCP_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if changes:
-        ok(f"mcp_servers.json updated ({changes} changes)")
+        ok(f"mcp_servers.json updated ({changes} change{'s' if changes != 1 else ''})")
     else:
         ok("mcp_servers.json already correct")
 
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — Create / clean .env
-# ─────────────────────────────────────────────────────────────────
-head("[3/5] Setting up .env")
+# ─────────────────────────────────────────────────────────────────────────────
+step(3, 5, "Setting up .env")
 
 CLEAN_ENV = """\
 # CODI environment variables
@@ -163,9 +211,8 @@ CODI_ANTHROPIC_API_KEY=
 CODI_GEMINI_API_KEY=
 CODI_OPENAI_API_KEY=
 
-# Air LLM - phone inference over Wi-Fi
-# Get app: https://play.google.com/store/apps/details?id=com.airlm.app
-# Set to your phone's LAN IP shown in the app, e.g. http://192.168.1.45:8080
+# Air LLM - local Wi-Fi inference (see github.com/lyogavin/airllm)
+# Set to the LAN IP of the device running the AirLLM server
 CODI_AIR_LLM_URL=
 
 # MCP Servers
@@ -180,30 +227,25 @@ HF_TOKEN=
 """
 
 if ENV_FILE.exists():
-    raw = ENV_FILE.read_text(encoding="utf-8")
-    # Check for Unicode characters that break python-dotenv
+    raw      = ENV_FILE.read_text(encoding="utf-8")
+    has_fancy = "\u2500" in raw or "\u2014" in raw or "──" in raw
     bad_chars = any(ord(c) > 127 for c in raw if c not in "'\"\n\r\t ")
-    has_fancy  = "\u2500" in raw or "\u2014" in raw or "──" in raw
     if has_fancy or bad_chars:
-        # Strip comment lines with bad chars, keep KEY=value lines
         clean = []
         for line in raw.splitlines():
             stripped = line.strip()
             if stripped.startswith("#"):
-                # Only keep ASCII-clean comment lines
                 if all(ord(c) < 128 for c in stripped):
                     clean.append(line)
-                # else: drop fancy comment line
             else:
                 clean.append(line)
         ENV_FILE.write_text("\n".join(clean) + "\n", encoding="utf-8")
-        ok(".env cleaned (removed Unicode characters that broke python-dotenv)")
+        ok(".env cleaned (removed non-ASCII characters)")
     else:
         ok(".env exists and looks clean")
 
-    # Ensure all expected keys exist (don't overwrite existing values)
     existing = ENV_FILE.read_text(encoding="utf-8")
-    added = []
+    added    = []
     for line in CLEAN_ENV.splitlines():
         if "=" in line and not line.startswith("#"):
             key = line.split("=")[0].strip()
@@ -212,25 +254,23 @@ if ENV_FILE.exists():
                     f.write(f"\n{line}\n")
                 added.append(key)
     if added:
-        ok(f"Added missing keys to .env: {', '.join(added)}")
-
+        ok(f"Added missing keys: {', '.join(added)}")
 else:
     ENV_FILE.write_text(CLEAN_ENV, encoding="utf-8")
     ok(".env template created — fill in your API keys")
 
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — Install Python dependencies
-# ─────────────────────────────────────────────────────────────────
-head("[4/5] Installing Python dependencies")
+# ─────────────────────────────────────────────────────────────────────────────
+step(4, 5, "Installing Python dependencies")
 
-# Install CPU torch first to prevent 366MB CUDA download
 torch_ok = False
 try:
     import torch
     torch_ok = True
     ok(f"torch {torch.__version__} already installed")
 except ImportError:
-    info("Installing PyTorch CPU (prevents auto-downloading 366MB CUDA build)")
+    info("Installing PyTorch CPU (avoids pulling 366 MB CUDA build)")
     r = subprocess.run(
         [sys.executable, "-m", "pip", "install", "torch",
          "--index-url", "https://download.pytorch.org/whl/cpu", "-q"],
@@ -239,12 +279,13 @@ except ImportError:
     if torch_ok:
         ok("torch (CPU) installed")
     else:
-        warn("torch install failed — sentence-transformers may pull CUDA")
+        warn("torch install failed — sentence-transformers may pull CUDA build")
 
 req = ROOT / "requirements.txt"
 if req.exists():
-    info("Installing requirements.txt")
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req), "-q"])
+    with console.status(Text("  installing requirements.txt...", style="dim"),
+                        spinner="dots", spinner_style=A):
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req), "-q"])
     if r.returncode == 0:
         ok("All requirements installed")
     else:
@@ -252,10 +293,10 @@ if req.exists():
 else:
     warn("requirements.txt not found — skipping")
 
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 — Create launcher
-# ─────────────────────────────────────────────────────────────────
-head("[5/5] Creating launcher")
+# ─────────────────────────────────────────────────────────────────────────────
+step(5, 5, "Creating launcher")
 
 PYTHON = Path(sys.executable)
 
@@ -265,52 +306,70 @@ if IS_WIN:
         f'@echo off\n"{PYTHON}" "{ROOT / "main.py"}" %*\n',
         encoding="utf-8"
     )
-    ok(f"Created codi.bat")
-    info(f"Add {ROOT} to PATH to run 'codi' from anywhere")
-    info(f"Or run: {ROOT}\\codi.bat")
-
+    ok("Created codi.bat")
+    info(f"Add {ROOT} to PATH to use 'codi' from anywhere")
 else:
-    # Shell script
     sh = ROOT / "codi.sh"
     sh.write_text(f'#!/bin/bash\n"{PYTHON}" "{ROOT / "main.py"}" "$@"\n')
     sh.chmod(0o755)
     ok("Created codi.sh")
 
-    # Add alias to shell rc
     shell = os.environ.get("SHELL", "")
-    rc = HOME / (".zshrc" if "zsh" in shell else ".bashrc")
+    rc    = HOME / (".zshrc" if "zsh" in shell else ".bashrc")
     alias = f'alias codi="python {ROOT / "main.py"}"\n'
 
     if rc.exists():
         content = rc.read_text(encoding="utf-8")
         if "alias codi=" not in content:
             rc.write_text(content + "\n# CODI\n" + alias, encoding="utf-8")
-            ok(f"Added 'codi' alias to {rc.name}")
-            info(f"Run: source ~/{rc.name}  (or open new terminal)")
+            ok(f"Added 'codi' alias to ~/{rc.name}")
+            info(f"Run:  source ~/{rc.name}  (or open a new terminal)")
         else:
-            ok(f"'codi' alias already in {rc.name}")
+            ok(f"'codi' alias already in ~/{rc.name}")
     else:
         warn(f"Could not find {rc} — add alias manually:")
-        print(f"      {alias.strip()}")
+        info(alias.strip())
 
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Done
-# ─────────────────────────────────────────────────────────────────
-print()
-print(B("  ╔══════════════════════════════╗"))
-print(B("  ║       Setup Complete!        ║"))
-print(B("  ╚══════════════════════════════╝"))
-print()
-print(f"  Start CODI:")
-print(f"    {G('python main.py')}     (from this directory)")
-if not IS_WIN:
-    print(f"    {G('codi')}              (from anywhere, after sourcing shell rc)")
-print()
-print(f"  Edit {Y('config.py')} to set MODE and models.")
-print(f"  Edit {Y('.env')} to add API keys.")
-print()
+# ─────────────────────────────────────────────────────────────────────────────
+console.print()
+console.print(Rule(style=DIM))
+console.print()
 
-if not OLLAMA and not (ROOT / ".env").stat().st_size > 100:
-    warn("Neither Ollama nor API keys detected.")
-    warn("Set MODE='cloud' in config.py and add a CODI_GROQ_API_KEY to .env")
-    print()
+# Next steps table
+next_steps = Table(box=box.SIMPLE, show_header=False, padding=(0, 2), expand=False)
+next_steps.add_column(style=A, no_wrap=True)
+next_steps.add_column(style="dim")
+
+if IS_WIN:
+    next_steps.add_row("codi.bat",      "launch from this directory")
+    next_steps.add_row("codi",          "from anywhere (after adding to PATH)")
+else:
+    next_steps.add_row("python main.py","from this directory")
+    next_steps.add_row("codi",          f"from anywhere (after: source ~/{rc.name})")
+
+next_steps.add_row("", "")
+next_steps.add_row("config.py",    "set MODE, models, API providers")
+next_steps.add_row(".env",         "add API keys")
+
+console.print(Panel(
+    next_steps,
+    title=Text(" setup complete ", style=f"bold {A}"),
+    border_style=DIM,
+    padding=(0, 1),
+))
+console.print()
+
+if not OLLAMA and ENV_FILE.stat().st_size < 200:
+    console.print(Panel(
+        Text(
+            "  Neither Ollama nor API keys detected.\n"
+            "  Set MODE='cloud' in config.py and add CODI_GROQ_API_KEY to .env\n"
+            "  Get a free Groq key at: console.groq.com",
+            style="yellow"
+        ),
+        border_style="yellow",
+        padding=(0, 1),
+    ))
+    console.print()
