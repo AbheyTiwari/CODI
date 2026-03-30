@@ -497,3 +497,20 @@
 {"ts": "2026-03-29T20:29:35.048941", "event": "mcp_load", "server": "playwright", "tools": 22}
 {"ts": "2026-03-29T20:29:35.050733", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
 {"ts": "2026-03-29T20:29:48.052321", "event": "agent_created", "tools": 90}
+{"ts": "2026-03-30T11:03:06.732961", "event": "mcp_server_crash", "server": "fetch", "error": "[Errno 2] No such file or directory: 'uvx'"}
+{"ts": "2026-03-30T11:03:06.733617", "event": "mcp_server_crash", "server": "git", "error": "[Errno 2] No such file or directory: 'uvx'"}
+{"ts": "2026-03-30T11:03:08.444281", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-03-30T11:03:17.865515", "event": "mcp_server_crash", "server": "filesystem", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-03-30T11:03:17.866084", "event": "mcp_load_error", "server": "filesystem", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-03-30T11:03:17.873406", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-03-30T11:03:17.873748", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-03-30T11:03:19.108146", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-03-30T11:03:21.064060", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-03-30T11:03:21.064403", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-03-30T11:03:21.064656", "event": "mcp_load_error", "server": "fetch", "error": "[Errno 2] No such file or directory: 'uvx'"}
+{"ts": "2026-03-30T11:03:21.064876", "event": "mcp_load_error", "server": "git", "error": "[Errno 2] No such file or directory: 'uvx'"}
+{"ts": "2026-03-30T11:03:21.065060", "event": "mcp_load", "server": "playwright", "tools": 22}
+{"ts": "2026-03-30T11:03:21.065271", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-03-30T11:03:21.192861", "event": "agent_created", "tools": 63}
+{"ts": "2026-03-30T11:04:36.286373", "event": "agent_start", "input": "hi", "mode": "hybrid"}
+{"ts": "2026-03-30T11:04:36.287745", "event": "direct_response", "input": "hi"}
