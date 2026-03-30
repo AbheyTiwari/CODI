@@ -23,6 +23,27 @@
   --gborder: rgba(122,184,122,0.2);
   --border:  rgba(255,255,255,0.06);
   --border2: rgba(255,255,255,0.1);
+  --orbital-opacity: 0.22;
+  --orbital-stroke: white;
+}
+[data-theme="light"] {
+  --ink:     #f8f8f6;
+  --ink2:    #f0f0ed;
+  --ink3:    #e8e8e4;
+  --surface: #d8d8d4;
+  --muted:   #b0b0aa;
+  --mid:     #888880;
+  --soft:    #555550;
+  --bright:  #222220;
+  --white:   #111110;
+  --green:   #3a7d44;
+  --green2:  #2a5c34;
+  --gdim:    rgba(58,125,68,0.07);
+  --gborder: rgba(58,125,68,0.25);
+  --border:  rgba(0,0,0,0.08);
+  --border2: rgba(0,0,0,0.15);
+  --orbital-opacity: 0.18;
+  --orbital-stroke: #1a1a1a;
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
@@ -32,6 +53,7 @@ body{
   font-family:'DM Mono',monospace;
   overflow-x:hidden;
   -webkit-font-smoothing:antialiased;
+  transition:background 0.3s ease, color 0.3s ease;
 }
 
 /* ── ORBITAL BACKGROUND ── */
@@ -44,8 +66,18 @@ body{
   top:50%;left:50%;
   transform:translate(-50%,-50%);
   width:max(100vw,100vh);
-  opacity:0.07;
+  opacity:var(--orbital-opacity);
+  transition:opacity 0.4s ease;
 }
+
+/* ── THEME TOGGLE ── */
+.theme-toggle{
+  background:none;border:1px solid var(--border2);
+  color:var(--soft);cursor:pointer;
+  width:34px;height:34px;display:flex;align-items:center;justify-content:center;
+  font-size:0.9rem;transition:all 0.2s;flex-shrink:0;
+}
+.theme-toggle:hover{color:var(--white);border-color:rgba(255,255,255,0.3)}
 /* grain */
 body::before{
   content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
@@ -60,7 +92,9 @@ nav{
   padding:1.2rem 3rem;
   background:rgba(8,8,8,0.9);backdrop-filter:blur(20px);
   border-bottom:1px solid var(--border);
+  transition:background 0.3s ease, border-color 0.3s ease;
 }
+[data-theme="light"] nav{background:rgba(248,248,246,0.92)}
 .nav-logo{
   font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;
   color:var(--white);text-decoration:none;letter-spacing:0.05em;
@@ -422,7 +456,23 @@ footer{
 .foot-links a:hover{color:var(--white)}
 .foot-copy{font-size:0.57rem;color:var(--muted)}
 
-/* ── ANIMS ── */
+/* ── OS INSTALL TABS ── */
+.os-tabs{display:flex;gap:0;margin-bottom:0;border:1px solid var(--border2);border-bottom:none;width:fit-content}
+.os-tab{
+  font-family:'Syne',sans-serif;font-size:0.6rem;font-weight:700;
+  letter-spacing:0.12em;text-transform:uppercase;
+  padding:0.55rem 1.2rem;cursor:pointer;border:none;
+  background:var(--ink3);color:var(--mid);
+  border-right:1px solid var(--border2);transition:all 0.15s;
+}
+.os-tab:last-child{border-right:none}
+.os-tab.active{background:var(--green);color:var(--ink)}
+.os-tab:hover:not(.active){color:var(--bright);background:var(--surface)}
+.os-panel{display:none}.os-panel.active{display:block}
+
+/* ── LIGHT MODE GRAIN FIX ── */
+[data-theme="light"] body::before{opacity:0.25}
+
 @keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
 .reveal{opacity:0;transform:translateY(16px);transition:opacity 0.5s ease,transform 0.5s ease}
 .reveal.visible{opacity:1;transform:translateY(0)}
@@ -448,76 +498,76 @@ footer{
 
 <!-- ORBITAL BACKGROUND -->
 <div class="orbital-bg">
-  <svg viewBox="0 0 1000 1100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <svg viewBox="0 0 1000 1100" fill="none" xmlns="http://www.w3.org/2000/svg" id="orbitalSvg">
     <g transform="translate(500,560)">
-      <ellipse cx="0" cy="0" rx="430" ry="115" stroke="white" stroke-width="0.6" opacity="0.9" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="380" ry="100" stroke="white" stroke-width="0.5" opacity="0.8" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="328" ry="86" stroke="white" stroke-width="0.7" opacity="0.9" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="280" ry="74" stroke="white" stroke-width="1.2" opacity="1" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="235" ry="62" stroke="white" stroke-width="0.5" opacity="0.7" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="192" ry="51" stroke="white" stroke-width="0.8" opacity="0.85" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="152" ry="40" stroke="white" stroke-width="0.5" opacity="0.65" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="115" ry="30" stroke="white" stroke-width="0.6" opacity="0.7" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="82" ry="22" stroke="white" stroke-width="0.4" opacity="0.5" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="52" ry="14" stroke="white" stroke-width="0.4" opacity="0.5" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="0" rx="22" ry="6" stroke="white" stroke-width="1" opacity="0.9" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="-18" rx="18" ry="5" stroke="white" stroke-width="0.8" opacity="0.8" transform="rotate(-18)"/>
-      <ellipse cx="0" cy="-32" rx="14" ry="4" stroke="white" stroke-width="0.6" opacity="0.7" transform="rotate(-18)"/>
-      <line x1="-22" y1="0" x2="-18" y2="-18" stroke="white" stroke-width="0.6" opacity="0.7"/>
-      <line x1="22" y1="0" x2="18" y2="-18" stroke="white" stroke-width="0.6" opacity="0.7"/>
-      <line x1="-18" y1="-18" x2="-14" y2="-32" stroke="white" stroke-width="0.5" opacity="0.6"/>
-      <line x1="18" y1="-18" x2="14" y2="-32" stroke="white" stroke-width="0.5" opacity="0.6"/>
-      <line x1="0" y1="-32" x2="0" y2="-520" stroke="white" stroke-width="1.2" opacity="0.95"/>
-      <line x1="-4" y1="-80" x2="4" y2="-80" stroke="white" stroke-width="0.8"/>
-      <line x1="-3" y1="-130" x2="3" y2="-130" stroke="white" stroke-width="0.6"/>
-      <line x1="-4" y1="-190" x2="4" y2="-190" stroke="white" stroke-width="0.8"/>
-      <line x1="-3" y1="-250" x2="3" y2="-250" stroke="white" stroke-width="0.6"/>
-      <line x1="-4" y1="-320" x2="4" y2="-320" stroke="white" stroke-width="0.8"/>
-      <line x1="-3" y1="-390" x2="3" y2="-390" stroke="white" stroke-width="0.6"/>
-      <line x1="-4" y1="-460" x2="4" y2="-460" stroke="white" stroke-width="0.8"/>
-      <circle cx="0" cy="-520" r="3" fill="none" stroke="white" stroke-width="0.8"/>
-      <circle cx="0" cy="-520" r="1" fill="white"/>
-      <line x1="0" y1="-523" x2="0" y2="-545" stroke="white" stroke-width="0.7" opacity="0.6"/>
-      <line x1="-2" y1="-545" x2="2" y2="-545" stroke="white" stroke-width="0.5" opacity="0.5"/>
-      <line x1="0" y1="0" x2="0" y2="120" stroke="white" stroke-width="0.8" opacity="0.5"/>
-      <line x1="-3" y1="60" x2="3" y2="60" stroke="white" stroke-width="0.5" opacity="0.5"/>
-      <line x1="-2" y1="100" x2="2" y2="100" stroke="white" stroke-width="0.4" opacity="0.4"/>
+      <ellipse cx="0" cy="0" rx="430" ry="115" stroke="currentColor" stroke-width="1.4" opacity="0.9" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="380" ry="100" stroke="currentColor" stroke-width="1.1" opacity="0.82" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="328" ry="86" stroke="currentColor" stroke-width="1.5" opacity="0.9" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="280" ry="74" stroke="currentColor" stroke-width="2.2" opacity="1" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="235" ry="62" stroke="currentColor" stroke-width="1.2" opacity="0.72" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="192" ry="51" stroke="currentColor" stroke-width="1.6" opacity="0.88" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="152" ry="40" stroke="currentColor" stroke-width="1.1" opacity="0.68" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="115" ry="30" stroke="currentColor" stroke-width="1.3" opacity="0.75" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="82" ry="22" stroke="currentColor" stroke-width="1.0" opacity="0.55" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="52" ry="14" stroke="currentColor" stroke-width="0.9" opacity="0.55" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="0" rx="22" ry="6" stroke="currentColor" stroke-width="2.0" opacity="0.95" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="-18" rx="18" ry="5" stroke="currentColor" stroke-width="1.6" opacity="0.85" transform="rotate(-18)"/>
+      <ellipse cx="0" cy="-32" rx="14" ry="4" stroke="currentColor" stroke-width="1.2" opacity="0.75" transform="rotate(-18)"/>
+      <line x1="-22" y1="0" x2="-18" y2="-18" stroke="currentColor" stroke-width="1.2" opacity="0.75"/>
+      <line x1="22" y1="0" x2="18" y2="-18" stroke="currentColor" stroke-width="1.2" opacity="0.75"/>
+      <line x1="-18" y1="-18" x2="-14" y2="-32" stroke="currentColor" stroke-width="1.0" opacity="0.65"/>
+      <line x1="18" y1="-18" x2="14" y2="-32" stroke="currentColor" stroke-width="1.0" opacity="0.65"/>
+      <line x1="0" y1="-32" x2="0" y2="-520" stroke="currentColor" stroke-width="2.0" opacity="1"/>
+      <line x1="-6" y1="-80" x2="6" y2="-80" stroke="currentColor" stroke-width="1.4"/>
+      <line x1="-5" y1="-130" x2="5" y2="-130" stroke="currentColor" stroke-width="1.1"/>
+      <line x1="-6" y1="-190" x2="6" y2="-190" stroke="currentColor" stroke-width="1.4"/>
+      <line x1="-5" y1="-250" x2="5" y2="-250" stroke="currentColor" stroke-width="1.1"/>
+      <line x1="-6" y1="-320" x2="6" y2="-320" stroke="currentColor" stroke-width="1.4"/>
+      <line x1="-5" y1="-390" x2="5" y2="-390" stroke="currentColor" stroke-width="1.1"/>
+      <line x1="-6" y1="-460" x2="6" y2="-460" stroke="currentColor" stroke-width="1.4"/>
+      <circle cx="0" cy="-520" r="4" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <circle cx="0" cy="-520" r="1.8" fill="currentColor"/>
+      <line x1="0" y1="-524" x2="0" y2="-548" stroke="currentColor" stroke-width="1.2" opacity="0.65"/>
+      <line x1="-3" y1="-548" x2="3" y2="-548" stroke="currentColor" stroke-width="1.0" opacity="0.55"/>
+      <line x1="0" y1="0" x2="0" y2="120" stroke="currentColor" stroke-width="1.5" opacity="0.55"/>
+      <line x1="-4" y1="60" x2="4" y2="60" stroke="currentColor" stroke-width="1.0" opacity="0.55"/>
+      <line x1="-3" y1="100" x2="3" y2="100" stroke="currentColor" stroke-width="0.9" opacity="0.45"/>
       <g transform="rotate(-18) translate(-415, 0) rotate(18)">
-        <circle cx="0" cy="0" r="11" fill="none" stroke="white" stroke-width="0.8" opacity="0.9"/>
-        <circle cx="0" cy="0" r="6" fill="rgba(255,255,255,0.15)" stroke="white" stroke-width="0.5"/>
-        <circle cx="0" cy="0" r="2.5" fill="white"/>
-        <ellipse cx="0" cy="0" rx="16" ry="5" stroke="white" stroke-width="0.4" opacity="0.4"/>
+        <circle cx="0" cy="0" r="14" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.95"/>
+        <circle cx="0" cy="0" r="8" fill="rgba(255,255,255,0.12)" stroke="currentColor" stroke-width="1.0"/>
+        <circle cx="0" cy="0" r="3.5" fill="currentColor"/>
+        <ellipse cx="0" cy="0" rx="20" ry="6" stroke="currentColor" stroke-width="0.8" opacity="0.45"/>
       </g>
       <g transform="rotate(-18) translate(305, 0) rotate(18)">
-        <circle cx="0" cy="0" r="8" fill="none" stroke="white" stroke-width="0.7" opacity="0.85"/>
-        <circle cx="0" cy="0" r="4" fill="rgba(255,255,255,0.1)" stroke="white" stroke-width="0.4"/>
-        <circle cx="0" cy="0" r="1.8" fill="white"/>
-        <ellipse cx="0" cy="0" rx="12" ry="4" stroke="white" stroke-width="0.35" opacity="0.35"/>
+        <circle cx="0" cy="0" r="11" fill="none" stroke="currentColor" stroke-width="1.3" opacity="0.9"/>
+        <circle cx="0" cy="0" r="5.5" fill="rgba(255,255,255,0.08)" stroke="currentColor" stroke-width="0.8"/>
+        <circle cx="0" cy="0" r="2.5" fill="currentColor"/>
+        <ellipse cx="0" cy="0" rx="15" ry="5" stroke="currentColor" stroke-width="0.7" opacity="0.38"/>
       </g>
       <g transform="rotate(-18) translate(168, -46) rotate(18)">
-        <circle cx="0" cy="0" r="5" fill="none" stroke="white" stroke-width="0.6" opacity="0.8"/>
-        <circle cx="0" cy="0" r="2" fill="white" opacity="0.9"/>
+        <circle cx="0" cy="0" r="7" fill="none" stroke="currentColor" stroke-width="1.1" opacity="0.85"/>
+        <circle cx="0" cy="0" r="2.8" fill="currentColor" opacity="0.95"/>
       </g>
       <g transform="rotate(-18) translate(-210, 56) rotate(18)">
-        <circle cx="0" cy="0" r="4" fill="none" stroke="white" stroke-width="0.5" opacity="0.7"/>
-        <circle cx="0" cy="0" r="1.5" fill="white" opacity="0.8"/>
+        <circle cx="0" cy="0" r="5.5" fill="none" stroke="currentColor" stroke-width="1.0" opacity="0.75"/>
+        <circle cx="0" cy="0" r="2.2" fill="currentColor" opacity="0.85"/>
       </g>
-      <line x1="220" y1="-52" x2="360" y2="-140" stroke="white" stroke-width="0.4" opacity="0.5"/>
-      <line x1="360" y1="-140" x2="430" y2="-140" stroke="white" stroke-width="0.4" opacity="0.5"/>
-      <circle cx="220" cy="-52" r="1.5" fill="white" opacity="0.6"/>
-      <line x1="300" y1="-70" x2="430" y2="-105" stroke="white" stroke-width="0.35" opacity="0.45"/>
-      <line x1="430" y1="-105" x2="490" y2="-105" stroke="white" stroke-width="0.35" opacity="0.45"/>
-      <line x1="360" y1="-88" x2="430" y2="-70" stroke="white" stroke-width="0.3" opacity="0.4"/>
-      <line x1="430" y1="-70" x2="490" y2="-70" stroke="white" stroke-width="0.3" opacity="0.4"/>
-      <line x1="-340" y1="-82" x2="-440" y2="-140" stroke="white" stroke-width="0.35" opacity="0.4"/>
-      <line x1="-440" y1="-140" x2="-490" y2="-140" stroke="white" stroke-width="0.35" opacity="0.4"/>
-      <circle cx="-460" cy="-180" r="1.2" fill="white" opacity="0.5"/>
-      <circle cx="460" cy="-160" r="1.2" fill="white" opacity="0.5"/>
-      <circle cx="200" cy="-300" r="1" fill="white" opacity="0.4"/>
-      <circle cx="-180" cy="-280" r="1" fill="white" opacity="0.4"/>
-      <circle cx="380" cy="180" r="1.1" fill="white" opacity="0.45"/>
-      <circle cx="-360" cy="160" r="1" fill="white" opacity="0.4"/>
-      <ellipse cx="0" cy="0" rx="450" ry="60" stroke="white" stroke-width="0.3" opacity="0.25" transform="rotate(5)"/>
+      <line x1="220" y1="-52" x2="360" y2="-140" stroke="currentColor" stroke-width="0.9" opacity="0.55"/>
+      <line x1="360" y1="-140" x2="430" y2="-140" stroke="currentColor" stroke-width="0.9" opacity="0.55"/>
+      <circle cx="220" cy="-52" r="2.5" fill="currentColor" opacity="0.65"/>
+      <line x1="300" y1="-70" x2="430" y2="-105" stroke="currentColor" stroke-width="0.75" opacity="0.5"/>
+      <line x1="430" y1="-105" x2="490" y2="-105" stroke="currentColor" stroke-width="0.75" opacity="0.5"/>
+      <line x1="360" y1="-88" x2="430" y2="-70" stroke="currentColor" stroke-width="0.65" opacity="0.45"/>
+      <line x1="430" y1="-70" x2="490" y2="-70" stroke="currentColor" stroke-width="0.65" opacity="0.45"/>
+      <line x1="-340" y1="-82" x2="-440" y2="-140" stroke="currentColor" stroke-width="0.75" opacity="0.45"/>
+      <line x1="-440" y1="-140" x2="-490" y2="-140" stroke="currentColor" stroke-width="0.75" opacity="0.45"/>
+      <circle cx="-460" cy="-180" r="2.0" fill="currentColor" opacity="0.55"/>
+      <circle cx="460" cy="-160" r="2.0" fill="currentColor" opacity="0.55"/>
+      <circle cx="200" cy="-300" r="1.8" fill="currentColor" opacity="0.45"/>
+      <circle cx="-180" cy="-280" r="1.8" fill="currentColor" opacity="0.45"/>
+      <circle cx="380" cy="180" r="1.9" fill="currentColor" opacity="0.5"/>
+      <circle cx="-360" cy="160" r="1.8" fill="currentColor" opacity="0.45"/>
+      <ellipse cx="0" cy="0" rx="450" ry="60" stroke="currentColor" stroke-width="0.7" opacity="0.28" transform="rotate(5)"/>
     </g>
   </svg>
 </div>
@@ -532,6 +582,7 @@ footer{
     <li><a href="#install">Install</a></li>
   </ul>
   <a href="https://github.com/AbheyTiwari/CODI" target="_blank" class="nav-btn">GitHub ↗</a>
+  <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme" title="Toggle light/dark mode">☀</button>
 </nav>
 
 <!-- HERO -->
@@ -710,17 +761,76 @@ footer{
 
     <div class="install-cols">
 
-      <!-- LEFT: step-by-step -->
+      <!-- LEFT: step-by-step with OS tabs -->
       <div>
 
         <div class="reveal">
-          <div class="step-lbl">01 — Clone the repo</div>
+          <div class="step-lbl">01 — Prerequisites by OS</div>
+          <div class="os-tabs">
+            <button class="os-tab active" onclick="switchOS('windows',this)">⊞ Windows</button>
+            <button class="os-tab" onclick="switchOS('mac',this)">⌘ macOS</button>
+            <button class="os-tab" onclick="switchOS('linux',this)">🐧 Linux</button>
+          </div>
+
+          <!-- WINDOWS -->
+          <div class="os-panel active" id="os-windows">
+            <div class="note-box">
+              Requires <strong>Python 3.10+</strong>, <strong>Node.js 18+</strong>, and <strong>Git</strong>.
+              Install via <a href="https://www.python.org/downloads/" target="_blank" style="color:var(--green)">python.org</a>,
+              <a href="https://nodejs.org" target="_blank" style="color:var(--green)">nodejs.org</a>,
+              and <a href="https://git-scm.com" target="_blank" style="color:var(--green)">git-scm.com</a> — or use <code>winget</code>:
+            </div>
+            <div class="code-box"><pre><span class="cm"># Run in PowerShell (as Administrator)</span>
+<span class="kw">winget install</span> Python.Python.3.12
+<span class="kw">winget install</span> OpenJS.NodeJS.LTS
+<span class="kw">winget install</span> Git.Git
+
+<span class="cm"># Optional: Ollama for local/offline mode</span>
+<span class="kw">winget install</span> Ollama.Ollama</pre></div>
+          </div>
+
+          <!-- MACOS -->
+          <div class="os-panel" id="os-mac">
+            <div class="note-box">
+              Requires <strong>Python 3.10+</strong>, <strong>Node.js 18+</strong>, and <strong>Git</strong> (Git ships with Xcode CLT).
+              Use <a href="https://brew.sh" target="_blank" style="color:var(--green)">Homebrew</a>:
+            </div>
+            <div class="code-box"><pre><span class="cm"># Install Homebrew if not already installed</span>
+/bin/bash -c <span class="str">"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"</span>
+
+<span class="kw">brew install</span> python@3.12 node git
+
+<span class="cm"># Optional: Ollama for local/offline mode</span>
+<span class="kw">brew install</span> ollama</pre></div>
+          </div>
+
+          <!-- LINUX -->
+          <div class="os-panel" id="os-linux">
+            <div class="note-box">
+              Requires <strong>Python 3.10+</strong>, <strong>pip</strong>, <strong>Node.js 18+</strong>, and <strong>Git</strong>.
+              Commands below are for Debian/Ubuntu — adjust for your distro:
+            </div>
+            <div class="code-box"><pre><span class="cm"># Debian / Ubuntu</span>
+<span class="kw">sudo apt update</span>
+<span class="kw">sudo apt install</span> python3.12 python3.12-venv python3-pip git curl
+
+<span class="cm"># Node.js 20.x via NodeSource</span>
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+<span class="kw">sudo apt install</span> -y nodejs
+
+<span class="cm"># Optional: Ollama (any distro, installs via script)</span>
+curl -fsSL https://ollama.com/install.sh | sh</pre></div>
+          </div>
+        </div>
+
+        <div class="reveal">
+          <div class="step-lbl">02 — Clone the repo</div>
           <div class="code-box"><pre><span class="kw">git clone</span> https://github.com/AbheyTiwari/CODI
 <span class="kw">cd</span> CODI/coding-agent</pre></div>
         </div>
 
         <div class="reveal">
-          <div class="step-lbl">02 — Create a virtual environment</div>
+          <div class="step-lbl">03 — Create a virtual environment</div>
           <div class="code-box"><pre><span class="cm"># Windows (PowerShell)</span>
 <span class="kw">python -m venv</span> codi
 .\codi\Scripts\Activate.ps1
@@ -731,12 +841,12 @@ footer{
         </div>
 
         <div class="reveal">
-          <div class="step-lbl">03 — Install dependencies</div>
+          <div class="step-lbl">04 — Install dependencies</div>
           <div class="code-box"><pre><span class="kw">pip install</span> -r requirements.txt</pre></div>
         </div>
 
         <div class="reveal">
-          <div class="step-lbl">04 — Register the global <code style="color:var(--green)">codi</code> command</div>
+          <div class="step-lbl">05 — Register the global <code style="color:var(--green)">codi</code> command</div>
           <div class="code-box"><pre><span class="cm"># Run once from inside coding-agent/</span>
 <span class="kw">pip install</span> -e .</pre></div>
           <div class="note-box">
@@ -745,7 +855,7 @@ footer{
         </div>
 
         <div class="reveal">
-          <div class="step-lbl">05 — Add your API key (optional for cloud/hybrid)</div>
+          <div class="step-lbl">06 — Add your API key (optional for cloud/hybrid)</div>
           <div class="code-box"><pre><span class="cm"># Create a .env file in coding-agent/</span>
 <span class="kw">CODI_GROQ_API_KEY</span>=<span class="str">gsk_your_key_here</span>
 
@@ -756,9 +866,9 @@ footer{
         </div>
 
         <div class="reveal">
-          <div class="step-lbl">06 — Navigate to any project and launch</div>
+          <div class="step-lbl">07 — Navigate to any project and launch</div>
           <div class="code-box"><pre><span class="cm"># Works in any folder on your system</span>
-<span class="kw">cd</span> C:\Users\you\projects\my-react-app
+<span class="kw">cd</span> /path/to/your/project
 <span class="kw">codi</span>
 
 <span class="cm"># CODI auto-indexes the folder and starts</span></pre></div>
@@ -1041,6 +1151,37 @@ function runDemo() {
 document.getElementById('demoInput').addEventListener('keydown', e => {
   if(e.key === 'Enter') runDemo();
 });
+
+// ── THEME TOGGLE ──────────────────────────────────────────────────────────────
+const toggleBtn = document.getElementById('themeToggle');
+const root      = document.documentElement;
+const saved     = localStorage.getItem('codi-theme') || 'dark';
+
+function applyTheme(theme) {
+  root.setAttribute('data-theme', theme);
+  // Update orbital SVG color
+  const svg = document.getElementById('orbitalSvg');
+  if (svg) {
+    svg.style.color = theme === 'light' ? '#1a1a1a' : 'white';
+  }
+  toggleBtn.textContent = theme === 'light' ? '☾' : '☀';
+  toggleBtn.title = theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode';
+  localStorage.setItem('codi-theme', theme);
+}
+
+applyTheme(saved);
+toggleBtn.addEventListener('click', () => {
+  const current = root.getAttribute('data-theme') || 'dark';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+});
+
+// ── OS TAB SWITCHER ───────────────────────────────────────────────────────────
+function switchOS(os, btn) {
+  document.querySelectorAll('.os-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.os-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('os-' + os).classList.add('active');
+  btn.classList.add('active');
+}
 </script>
 </body>
 </html>
