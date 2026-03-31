@@ -9,7 +9,6 @@
 #  "air"     — Use Air LLM server on your phone over local Wi-Fi.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-import os
 MODE = "hybrid"          # local | hybrid | cloud | air
 
 # ── Cloud provider (used when MODE="cloud" or hybrid escalates) ───────────────
@@ -34,7 +33,7 @@ HYBRID_ESCALATE_ON     = [
 #  4. Set AIR_LLM_URL below to that address
 #  5. Set MODE = "air"  (or it auto-activates as hybrid fallback if ollama dies)
 #
-AIR_LLM_URL = os.environ.get("CODI_AIR_LLM_URL", "http://192.168.1.XXX:8080")  # replace with phone's LAN IP
+AIR_LLM_URL           = "http://192.168.1.XXX:8080"  # replace with phone's LAN IP
 AIR_LLM_REFINER_MODEL = "phi-3-mini"                 # model loaded in Air LLM
 AIR_LLM_CODER_MODEL   = "phi-3-mini"
 AIR_LLM_TIMEOUT       = 180                          # phones are slower — be patient

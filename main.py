@@ -3,7 +3,6 @@ import os
 import time
 import hashlib
 import threading
-import itertools
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +22,7 @@ load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
@@ -115,7 +115,7 @@ def print_help():
     for cmd, desc in [
         ("/index [path]",   "re-index directory (default: current project)"),
         ("/mode",           "show current mode"),
-        ("/mode <name>",    "switch mode: local | hybrid | cloud | air"),
+        ("/mode <name>", "switch mode: local | hybrid | cloud | air"),
         ("/mcp",            "list MCP servers"),
         ("/mcp on <name>",  "enable MCP server (restart to apply)"),
         ("/mcp off <name>", "disable MCP server (restart to apply)"),
@@ -131,55 +131,38 @@ def print_help():
                         border_style=t["dim"], padding=(0,1)))
     console.print()
 
-# ── Thinking spinner ──────────────────────────────────────────────────────────
-# Replaces the broken LiveRenderer. Runs a simple spinner on a daemon thread
-# that writes to stderr so it doesn't conflict with prompt_toolkit or Rich's
-# output buffering. Completely safe — stops cleanly before any output is printed.
+# ── Live renderer ─────────────────────────────────────────────────────────────
+class LiveRenderer:
+    def __init__(self, task: str):
+        self.task  = task[:80]
+        self.lines = []
+        self._live = None
+        self._lock = threading.Lock()
 
-class ThinkingSpinner:
-    """
-    A plain stderr spinner that doesn't touch Rich's console or prompt_toolkit.
-    Start before the agent call, stop before printing output.
-    """
-    FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    def _panel(self):
+        t = _t()
+        body = Text()
+        body.append(f"  {self.task}\n\n", style="bold")
+        for line in self.lines[-10:]:
+            body.append(f"  ·  {line.strip()}\n", style="dim")
+        return Panel(body, title=Text(f" {t['label']} · working ", style=f"bold {t['accent']}"),
+                     border_style=t["dim"], padding=(0,1))
 
-    def __init__(self, label: str):
-        self.label   = label[:60]
-        self._stop   = threading.Event()
-        self._thread = threading.Thread(target=self._spin, daemon=True)
-
-    def _spin(self):
-        t       = _t()
-        # ANSI colour for the accent — map rich style names to codes
-        codes   = {
-            "bright_green":   "\033[92m",
-            "bright_cyan":    "\033[96m",
-            "bright_magenta": "\033[95m",
-            "bright_yellow":  "\033[93m",
-        }
-        ansi    = codes.get(t["accent"], "\033[96m")
-        reset   = "\033[0m"
-        dim     = "\033[2m"
-        label   = t["label"]
-
-        for frame in itertools.cycle(self.FRAMES):
-            if self._stop.is_set():
-                break
-            line = f"\r  {ansi}{frame}  {label}{reset}{dim}  {self.label}{reset}  "
-            sys.stderr.write(line)
-            sys.stderr.flush()
-            time.sleep(0.08)
-
-        # Clear the spinner line
-        sys.stderr.write("\r" + " " * 80 + "\r")
-        sys.stderr.flush()
+    def push(self, line: str):
+        with self._lock:
+            self.lines.append(line)
+            if self._live:
+                self._live.update(self._panel())
 
     def start(self):
-        self._thread.start()
+        self._live = Live(self._panel(), console=console,
+                          refresh_per_second=8, transient=True)
+        self._live.start()
 
     def stop(self):
-        self._stop.set()
-        self._thread.join(timeout=1)
+        if self._live:
+            self._live.stop()
+            self._live = None
 
 # ── Response renderer ─────────────────────────────────────────────────────────
 def render_response(output: str, tool_outputs: list = None):
@@ -262,7 +245,9 @@ def main():
         if not user_input:
             continue
 
-        # Guard: only block obviously pasted terminal output
+        # ── Guard: only block obviously pasted terminal output ────────────────
+        # Note: bare URLs are NOT blocked — users should be able to say
+        # "check this repo https://github.com/..." in their message
         if (
             user_input.startswith(">>")
             or user_input.startswith("Graph execution failed")
@@ -365,31 +350,28 @@ def main():
                 console.print(Text(f"  → {refined}", style="dim"))
 
             session_memory.add("user", refined)
-
-            # Use a plain stderr spinner — safe alongside prompt_toolkit
-            spinner = ThinkingSpinner(refined)
-            spinner.start()
+            renderer = LiveRenderer(refined)
+            renderer.start()
 
             try:
                 log("agent_start", {"input": refined[:200], "mode": config.MODE})
                 history_str = get_trimmed_history()
                 token_est   = estimate_tokens(refined + history_str)
 
+                if token_est > 3000 and config.MODE in ("local", "air"):
+                    renderer.push(f"⚠ context ~{token_est} tokens — consider /clear")
+
                 response     = agent_executor.invoke({"input": refined, "history": history_str})
                 output       = response.get("output", "No output returned.")
                 tool_outputs = response.get("tool_outputs", [])
 
-                spinner.stop()
-
-                if token_est > 3000 and config.MODE in ("local", "air"):
-                    console.print(Text(f"  ⚠  context ~{token_est} tokens — consider /clear", style="yellow"))
-
                 log("agent_end", {"output": output[:200], "mode": config.MODE})
+                renderer.stop()
                 render_response(output, tool_outputs)
                 session_memory.add("assistant", output)
 
             except Exception as e:
-                spinner.stop()
+                renderer.stop()
                 err = str(e)
                 log("agent_error", {"error": err, "mode": config.MODE})
                 if "413" in err or "Request too large" in err:

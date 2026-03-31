@@ -6,42 +6,61 @@
     "args": [
       "-y",
       "@modelcontextprotocol/server-filesystem",
-      "__CODI_ROOT__"
+      "C:\\Users\\Abhey Dev\\Desktop\\codi"
     ]
   },
   "memory": {
     "enabled": true,
     "description": "Persistent cross-session knowledge graph memory",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-memory"]
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-memory"
+    ]
   },
   "sequential-thinking": {
     "enabled": true,
     "description": "Forces step-by-step structured reasoning",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-sequential-thinking"
+    ]
   },
   "brave-search": {
     "enabled": false,
-    "description": "Web search — get free key at brave.com/search/api (2000 req/month free)",
+    "description": "Web search \u2014 get free key at brave.com/search/api (2000 req/month free)",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-brave-search"],
-    "env": {"BRAVE_API_KEY": "${BRAVE_API_KEY}"}
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-brave-search"
+    ],
+    "env": {
+      "BRAVE_API_KEY": ""
+    }
   },
   "github": {
     "enabled": true,
     "description": "Read/write GitHub repos, issues, PRs",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-github"],
-    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-github"
+    ],
+    "env": {
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    }
   },
   "gitlab": {
     "enabled": false,
     "description": "GitLab repos and CI/CD",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-gitlab"],
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-gitlab"
+    ],
     "env": {
-      "GITLAB_PERSONAL_ACCESS_TOKEN": "${GITLAB_PERSONAL_ACCESS_TOKEN}",
+      "GITLAB_PERSONAL_ACCESS_TOKEN": "your-gitlab-token",
       "GITLAB_API_URL": "https://gitlab.com/api/v4"
     }
   },
@@ -49,43 +68,66 @@
     "enabled": false,
     "description": "Query any PostgreSQL database",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://username:password@localhost:5432/mydb"]
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-postgres",
+      "postgresql://username:password@localhost:5432/mydb"
+    ]
   },
   "sqlite": {
-    "enabled": false,
-    "description": "SQLite — disabled (npm package removed). Use run_command with sqlite3 instead.",
+    "enabled": true,
+    "description": "Query local SQLite databases",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "__CODI_ROOT__/codi.db"]
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-sqlite",
+      "--db-path",
+      "C:/Users/Abhey Dev/Desktop/codi/coding-agent/codi.db"
+    ]
   },
   "puppeteer": {
     "enabled": false,
     "description": "Control a real browser, scrape pages, take screenshots",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-puppeteer"
+    ]
   },
   "fetch": {
     "enabled": true,
     "description": "Fetch any URL and return its content",
     "command": "uvx",
-    "args": ["mcp-server-fetch"]
+    "args": [
+      "mcp-server-fetch"
+    ]
   },
   "git": {
     "enabled": true,
-    "description": "Full git operations on local repos",
+    "description": "Full git operations on local repos \u2014 pointed at coding-agent directory",
     "command": "uvx",
-    "args": ["mcp-server-git", "--repository", "__CODI_ROOT__"]
+    "args": [
+      "mcp-server-git",
+      "--repository",
+      "C:/Users/Abhey Dev/Desktop/codi/coding-agent"
+    ]
   },
   "python-sandbox": {
     "enabled": false,
     "description": "Execute Python code in a safe sandbox",
     "command": "uvx",
-    "args": ["mcp-server-python-sandbox"]
+    "args": [
+      "mcp-server-python-sandbox"
+    ]
   },
   "mysql": {
     "enabled": false,
     "description": "MySQL support",
     "command": "npx",
-    "args": ["-y", "@benborla29/mcp-server-mysql"],
+    "args": [
+      "-y",
+      "@benborla29/mcp-server-mysql"
+    ],
     "env": {
       "MYSQL_HOST": "127.0.0.1",
       "MYSQL_PORT": "3306",
@@ -98,53 +140,80 @@
     "enabled": false,
     "description": "Redis key inspection and commands",
     "command": "uvx",
-    "args": ["mcp-server-redis", "--url", "redis://localhost:6379"]
+    "args": [
+      "mcp-server-redis",
+      "--url",
+      "redis://localhost:6379"
+    ]
   },
   "openapi": {
     "enabled": false,
     "description": "Call any API from its OpenAPI spec",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-openapi", "--spec", "https://yourapi.com/openapi.json"]
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-openapi",
+      "--spec",
+      "https://yourapi.com/openapi.json"
+    ]
   },
   "docker": {
     "enabled": false,
     "description": "Manage containers, images, logs, exec into containers",
     "command": "uvx",
-    "args": ["mcp-server-docker"]
+    "args": [
+      "mcp-server-docker"
+    ]
   },
   "kubernetes": {
     "enabled": false,
     "description": "kubectl without typing kubectl",
     "command": "uvx",
-    "args": ["mcp-server-kubernetes"]
+    "args": [
+      "mcp-server-kubernetes"
+    ]
   },
   "sentry": {
     "enabled": false,
     "description": "Read errors and stack traces from Sentry",
     "command": "uvx",
-    "args": ["mcp-server-sentry", "--auth-token", "${SENTRY_AUTH_TOKEN}"]
+    "args": [
+      "mcp-server-sentry",
+      "--auth-token",
+      "your-sentry-token"
+    ]
   },
   "prometheus": {
     "enabled": false,
     "description": "Query metrics",
     "command": "uvx",
-    "args": ["mcp-server-prometheus"]
+    "args": [
+      "mcp-server-prometheus"
+    ]
   },
   "playwright": {
     "enabled": true,
     "description": "Browser automation via Playwright (better than puppeteer)",
     "command": "npx",
-    "args": ["-y", "@playwright/mcp"]
+    "args": [
+      "-y",
+      "@playwright/mcp"
+    ]
   },
   "searxng": {
     "enabled": false,
-    "description": "Free self-hosted web search — searx.be is unreliable, use brave-search instead",
+    "description": "Free self-hosted web search \u2014 searx.be is unreliable, use brave-search instead",
     "command": "npx",
-    "args": ["-y", "mcp-searxng", "--url", "https://searx.be"]
+    "args": [
+      "-y",
+      "mcp-searxng",
+      "--url",
+      "https://searx.be"
+    ]
   },
   "stitch": {
     "enabled": true,
-    "description": "Google Stitch — UI/UX code via HTTP MCP",
+    "description": "Google Stitch \u2014 UI/UX code via HTTP MCP",
     "type": "http",
     "url": "https://stitch.googleapis.com/mcp",
     "headers": {
