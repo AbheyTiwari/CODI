@@ -93,7 +93,7 @@ Supported environment variables:
 - `memory.py` — session memory persistence
 - `logger.py` — event logging
 - `log_viewer.py` — live log viewer
-- `mcp_client.py` / `mcp_manager.py` — MCP connection management
+- `mcp_manager.py` — MCP server connection management
 
 ## 🔧 Install globally in a virtual env
 

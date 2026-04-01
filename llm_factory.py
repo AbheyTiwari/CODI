@@ -13,21 +13,36 @@ from config_loader import get_api_key
 
 
 # ── Ollama health check ───────────────────────────────────────────────────────
+_health_cache = {}  # {"ollama": (timestamp, bool), "air": (timestamp, bool)}
+_CACHE_TTL = 30     # seconds
+
 def _ollama_is_running() -> bool:
+    import time
+    cached = _health_cache.get("ollama")
+    if cached and (time.time() - cached[0]) < _CACHE_TTL:
+        return cached[1]
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
-        return r.status_code == 200
+        r = requests.get("http://localhost:11434/api/tags", timeout=2)
+        result = r.status_code == 200
     except Exception:
-        return False
+        result = False
+    _health_cache["ollama"] = (time.time(), result)
+    return result
 
 
 # ── Air LLM health check ──────────────────────────────────────────────────────
 def _air_llm_is_running() -> bool:
+    import time
+    cached = _health_cache.get("air")
+    if cached and (time.time() - cached[0]) < _CACHE_TTL:
+        return cached[1]
     try:
-        r = requests.get(AIR_LLM_URL, timeout=5)
-        return r.status_code < 500
+        r = requests.get(AIR_LLM_URL, timeout=3)
+        result = r.status_code < 500
     except Exception:
-        return False
+        result = False
+    _health_cache["air"] = (time.time(), result)
+    return result
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -58,6 +73,7 @@ def _resolve(role: str):
 
     if MODE == "hybrid":
         # Try local first; fall back to Air LLM, then cloud
+        # Health checks are cached for 30s so refiner+coder don't both wait
         if _ollama_is_running():
             return _local_llm(role)
         if _air_llm_is_running():

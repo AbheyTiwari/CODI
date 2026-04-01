@@ -101,9 +101,18 @@ class MCPManager:
         # Resolve command to full path so Windows subprocess can find npx/uvx
         command = _resolve_command(cfg["command"])
 
+        # Resolve ${ENV_VAR} placeholders in args (e.g. ${CODI_WORKING_DIR})
+        import re
+        raw_args = cfg.get("args", [])
+        resolved_args = []
+        for arg in raw_args:
+            def _replacer(match, _env=merged_env):
+                return _env.get(match.group(1), match.group(0))
+            resolved_args.append(re.sub(r'\$\{(\w+)\}', _replacer, str(arg)))
+
         params = StdioServerParameters(
             command=command,
-            args=cfg.get("args", []),
+            args=resolved_args,
             env=merged_env
         )
         async with stdio_client(params) as (read, write):

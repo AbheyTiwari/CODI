@@ -21,7 +21,9 @@ def get_vectorstore():
     try:
         embeddings = get_embeddings()
         return Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
-    except Exception:
+    except Exception as e:
+        print(f"  [Indexer] Vector DB may be corrupted: {e}")
+        print(f"  [Indexer] Try: /index . to rebuild")
         return None
 
 def file_hash(path: str) -> str:

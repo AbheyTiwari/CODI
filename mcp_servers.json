@@ -6,7 +6,7 @@
     "args": [
       "-y",
       "@modelcontextprotocol/server-filesystem",
-      "C:\\Users\\Abhey Dev\\Desktop\\codi"
+      "${CODI_WORKING_DIR}"
     ]
   },
   "memory": {
@@ -40,8 +40,8 @@
     }
   },
   "github": {
-    "enabled": true,
-    "description": "Read/write GitHub repos, issues, PRs",
+    "enabled": false,
+    "description": "Read/write GitHub repos, issues, PRs — set GITHUB_PERSONAL_ACCESS_TOKEN in .env first",
     "command": "npx",
     "args": [
       "-y",
@@ -75,14 +75,14 @@
     ]
   },
   "sqlite": {
-    "enabled": true,
-    "description": "Query local SQLite databases",
+    "enabled": false,
+    "description": "Query local SQLite databases — set db-path in args first",
     "command": "npx",
     "args": [
       "-y",
       "@modelcontextprotocol/server-sqlite",
       "--db-path",
-      "C:/Users/Abhey Dev/Desktop/codi/coding-agent/codi.db"
+      "${CODI_REPO_ROOT}/codi.db"
     ]
   },
   "puppeteer": {
@@ -109,7 +109,7 @@
     "args": [
       "mcp-server-git",
       "--repository",
-      "C:/Users/Abhey Dev/Desktop/codi/coding-agent"
+      "${CODI_REPO_ROOT}"
     ]
   },
   "python-sandbox": {
@@ -212,8 +212,8 @@
     ]
   },
   "stitch": {
-    "enabled": true,
-    "description": "Google Stitch \u2014 UI/UX code via HTTP MCP",
+    "enabled": false,
+    "description": "Google Stitch — set STITCH_API_KEY in .env first",
     "type": "http",
     "url": "https://stitch.googleapis.com/mcp",
     "headers": {

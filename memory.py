@@ -1,9 +1,9 @@
 from typing import List, Tuple
-from llm_factory import get_refiner_llm
 from langchain_core.messages import HumanMessage, SystemMessage
+from logger import log
 
 class SessionMemory:
-    def __init__(self, max_turns: int = 15):
+    def __init__(self, max_turns: int = 8):
         self.max_turns = max_turns
         self._history: List[Tuple[str, str]] = []
         self._summary: str = ""
@@ -26,14 +26,18 @@ class SessionMemory:
             f"Provide a concise running summary of the conversation so far."
         )
         try:
+            from llm_factory import get_refiner_llm
             llm = get_refiner_llm()
             resp = llm.invoke([
                 SystemMessage(content="Compress conversation history into a dense summary. Keep facts, constraints, and current state."),
                 HumanMessage(content=prompt)
             ])
             self._summary = resp.content
-        except Exception:
-            pass  # if compression fails, drop oldest without summarizing
+        except Exception as e:
+            # Fallback: keep a raw truncated version instead of dropping silently
+            log("memory_compression_failed", {"error": str(e)[:200]})
+            fallback = "\n".join(f"{r}: {m[:100]}" for r, m in old_messages)
+            self._summary = (self._summary + "\n" + fallback).strip()[-2000:]
 
     def as_text(self) -> str:
         parts = []

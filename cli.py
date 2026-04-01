@@ -34,14 +34,14 @@ def main():
     chroma_dir = os.path.join(_REPO_ROOT, "chroma_db", path_hash)
     os.environ["CODI_CHROMA_DIR"] = chroma_dir
 
-    # 4. Load .env from the repo root (where the user keeps their API keys)
+    # 4. Set repo root for MCP path resolution (${CODI_REPO_ROOT} in mcp_servers.json)
+    os.environ["CODI_REPO_ROOT"] = _REPO_ROOT
+
+    # 5. Load .env from the repo root (where the user keeps their API keys)
     from dotenv import load_dotenv
     load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 
-    # 5. Auto-index the working directory (incremental — only changed files re-index)
-    _auto_index(cwd, chroma_dir)
-
-    # 6. Launch the CLI
+    # 6. Launch the CLI (auto-indexing happens inside main.py)
     from main import main as _main
     _main()
 

@@ -2,7 +2,8 @@ import sys
 import os
 import time
 import hashlib
-import threading
+import json
+import requests
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -11,6 +12,7 @@ if _REPO_ROOT not in sys.path:
 
 _LAUNCH_DIR = os.getcwd()
 os.environ.setdefault("CODI_WORKING_DIR", _LAUNCH_DIR)
+os.environ.setdefault("CODI_REPO_ROOT", _REPO_ROOT)
 
 _path_hash  = hashlib.md5(_LAUNCH_DIR.encode()).hexdigest()[:10]
 _chroma_dir = os.path.join(_REPO_ROOT, "chroma_db", _path_hash)
@@ -42,11 +44,12 @@ import config
 
 console = Console()
 
+# ── Theme: unified light green ────────────────────────────────────────────────
 THEME = {
-    "local":  {"accent": "bright_green",   "label": "LOCAL",  "dim": "green"},
-    "hybrid": {"accent": "bright_cyan",    "label": "HYBRID", "dim": "cyan"},
-    "cloud":  {"accent": "bright_magenta", "label": "CLOUD",  "dim": "magenta"},
-    "air":    {"accent": "bright_yellow",  "label": "AIR",    "dim": "yellow"},
+    "local":  {"accent": "#77dd77", "label": "LOCAL",  "dim": "#3a6e3a"},
+    "hybrid": {"accent": "#77dd77", "label": "HYBRID", "dim": "#3a6e3a"},
+    "cloud":  {"accent": "#77dd77", "label": "CLOUD",  "dim": "#3a6e3a"},
+    "air":    {"accent": "#77dd77", "label": "AIR",    "dim": "#3a6e3a"},
 }
 
 def _t():
@@ -67,22 +70,41 @@ def print_banner():
     for line in BANNER.splitlines():
         console.print(Text(line, style=f"bold {t['accent']}"), justify="center")
     console.print()
-    console.print(Rule(style=t["dim"]))
-    provider = "ollama" if config.MODE == "local" else config.CLOUD_PROVIDER
-    status = Text()
-    status.append(f" {t['label']} ", style=f"bold reverse {t['accent']}")
-    status.append(f"  {provider}  ·  {_LAUNCH_DIR}", style="dim")
-    console.print(status)
-    console.print(Rule(style=t["dim"]))
-    console.print()
 
-def startup_sequence():
+# ── Status (hidden behind /status command) ────────────────────────────────────
+def print_status():
     t = _t()
-    for label in ["Vector DB", "Cognitive Refiner", "MCP Servers", "Agent Graph"]:
-        with console.status(Text(f"  loading {label}...", style="dim"),
-                            spinner="dots", spinner_style=t["accent"]):
-            time.sleep(0.2)
-        console.print(Text(f"  ✓  {label}", style=t["accent"]))
+    console.print()
+    # Vector DB
+    if os.path.isdir(_chroma_dir) and os.listdir(_chroma_dir):
+        console.print(Text(f"  ✓  Vector DB", style=t["accent"]))
+    else:
+        console.print(Text(f"  ○  Vector DB — not indexed", style="dim"))
+    # Model backend
+    if config.MODE in ("local", "hybrid"):
+        try:
+            r = requests.get("http://localhost:11434/api/tags", timeout=2)
+            if r.status_code == 200:
+                console.print(Text(f"  ✓  Ollama", style=t["accent"]))
+            else:
+                console.print(Text(f"  ○  Ollama — not responding", style="yellow"))
+        except Exception:
+            console.print(Text(f"  ✗  Ollama — offline", style="yellow"))
+    else:
+        console.print(Text(f"  ✓  Cloud ({config.CLOUD_PROVIDER})", style=t["accent"]))
+    # MCP
+    mcp_path = os.path.join(_REPO_ROOT, "mcp_servers.json")
+    if os.path.isfile(mcp_path):
+        try:
+            cfg = json.load(open(mcp_path))
+            enabled = sum(1 for v in cfg.values() if v.get("enabled"))
+            console.print(Text(f"  ✓  MCP — {enabled} servers enabled", style=t["accent"]))
+        except Exception:
+            console.print(Text(f"  ○  MCP — parse error", style="yellow"))
+    else:
+        console.print(Text(f"  ○  MCP — not found", style="dim"))
+    # Mode
+    console.print(Text(f"  ✓  Mode — {config.MODE}", style=t["accent"]))
     console.print()
 
 # ── Auto-index ────────────────────────────────────────────────────────────────
@@ -94,17 +116,11 @@ def _auto_index():
         dirs[:] = [d for d in dirs if d not in skip and not d.startswith('.')]
         count += len(files)
         if count > 5000:
-            console.print(Text("  ⚠  >5000 files — skipping auto-index. Run /index . manually.", style="yellow"))
             return
-    t = _t()
-    with console.status(Text(f"  indexing {os.path.basename(_LAUNCH_DIR)}/...", style="dim"),
-                        spinner="dots", spinner_style=t["accent"]):
-        try:
-            index_codebase(_LAUNCH_DIR, db_path=_chroma_dir)
-        except Exception as e:
-            console.print(Text(f"  ⚠  index warning: {e}", style="yellow"))
-    console.print(Text(f"  ✓  indexed {os.path.basename(_LAUNCH_DIR)}/", style=t["accent"]))
-    console.print()
+    try:
+        index_codebase(_LAUNCH_DIR, db_path=_chroma_dir)
+    except Exception:
+        pass
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 def print_help():
@@ -113,21 +129,19 @@ def print_help():
     table.add_column(style=t["accent"], no_wrap=True, min_width=20)
     table.add_column(style="dim")
     for cmd, desc in [
-        ("/index [path]",   "re-index directory (default: current project)"),
-        ("/mode",           "show current mode"),
-        ("/mode <name>", "switch mode: local | hybrid | cloud | air"),
+        ("/index [path]",   "re-index directory"),
+        ("/mode",           "show / switch mode"),
+        ("/status",         "system status"),
         ("/mcp",            "list MCP servers"),
-        ("/mcp on <name>",  "enable MCP server (restart to apply)"),
-        ("/mcp off <name>", "disable MCP server (restart to apply)"),
-        ("/tools",          "list all loaded tools"),
-        ("/logs",           "live telemetry dashboard"),
+        ("/tools",          "list loaded tools"),
+        ("/logs",           "telemetry dashboard"),
         ("/clear",          "wipe session memory"),
-        ("/history",        "print conversation history"),
-        ("/help",           "show this message"),
+        ("/history",        "conversation history"),
+        ("/help",           "show this"),
         ("/quit",           "exit"),
     ]:
         table.add_row(cmd, desc)
-    console.print(Panel(table, title=Text("commands", style=t["accent"]),
+    console.print(Panel(table, title=Text(" commands ", style=t["accent"]),
                         border_style=t["dim"], padding=(0,1)))
     console.print()
 
@@ -137,7 +151,6 @@ class LiveRenderer:
         self.task  = task[:80]
         self.lines = []
         self._live = None
-        self._lock = threading.Lock()
 
     def _panel(self):
         t = _t()
@@ -149,10 +162,9 @@ class LiveRenderer:
                      border_style=t["dim"], padding=(0,1))
 
     def push(self, line: str):
-        with self._lock:
-            self.lines.append(line)
-            if self._live:
-                self._live.update(self._panel())
+        self.lines.append(line)
+        if self._live:
+            self._live.update(self._panel())
 
     def start(self):
         self._live = Live(self._panel(), console=console,
@@ -191,15 +203,15 @@ def _set_mode(new_mode: str):
     log("mode_switch", {"mode": new_mode})
 
 def _mcp_toggle(name: str, enabled: bool):
-    import json
+    import json as _json
     path = os.path.join(_REPO_ROOT, "mcp_servers.json")
     try:
-        cfg = json.load(open(path))
+        cfg = _json.load(open(path))
         if name not in cfg:
             console.print(Text(f"  '{name}' not found", style="red"))
             return
         cfg[name]["enabled"] = enabled
-        json.dump(cfg, open(path, "w"), indent=2)
+        _json.dump(cfg, open(path, "w"), indent=2)
         verb = "enabled" if enabled else "disabled"
         console.print(Text(f"  ✓  {verb} {name} — restart to apply", style=_t()["accent"]))
     except Exception as e:
@@ -212,19 +224,22 @@ def get_trimmed_history() -> str:
     )["history"]
 
 def _pt_style():
-    colours = {"local":"#00ff88","hybrid":"#00ccff","cloud":"#cc66ff","air":"#ffaa00"}
-    c = colours.get(config.MODE, "#00ccff")
-    return PTStyle.from_dict({"prompt": f"fg:{c} bold", "": "fg:#cccccc"})
+    return PTStyle.from_dict({"prompt": "fg:#77dd77 bold", "": "fg:#cccccc"})
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print_banner()
-    startup_sequence()
-    _auto_index()
 
-    with console.status(Text("  initialising agent...", style="dim"), spinner="dots"):
+    with console.status(Text("  loading...", style=_t()["dim"]),
+                        spinner="dots", spinner_style=_t()["accent"]):
+        _auto_index()
         agent_executor = create_agent()
-    console.print(Text(f"  ✓  agent ready\n", style=_t()["accent"]))
+
+    # Cache tool list once at init
+    from tools import get_all_tools
+    _cached_tools = get_all_tools()
+
+    console.print(Text("  ready\n", style=_t()["accent"]))
     print_help()
 
     session = PromptSession(
@@ -246,8 +261,6 @@ def main():
             continue
 
         # ── Guard: only block obviously pasted terminal output ────────────────
-        # Note: bare URLs are NOT blocked — users should be able to say
-        # "check this repo https://github.com/..." in their message
         if (
             user_input.startswith(">>")
             or user_input.startswith("Graph execution failed")
@@ -266,6 +279,9 @@ def main():
 
         elif cmd == "/help":
             print_help()
+
+        elif cmd == "/status":
+            print_status()
 
         elif cmd == "/clear":
             session_memory.clear()
@@ -305,7 +321,6 @@ def main():
             _set_mode(user_input.split(maxsplit=1)[1].strip().lower())
 
         elif cmd == "/mcp":
-            import json
             try:
                 cfg = json.load(open(os.path.join(_REPO_ROOT, "mcp_servers.json")))
                 table = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
@@ -328,20 +343,18 @@ def main():
             _mcp_toggle(user_input.split(maxsplit=2)[2], False)
 
         elif cmd == "/tools":
-            from tools import get_all_tools
-            all_t = get_all_tools()
             table = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
             table.add_column(style=t["accent"], no_wrap=True)
             table.add_column(style="dim")
-            for tool in all_t:
+            for tool in _cached_tools:
                 table.add_row(tool.name, (tool.description or "")[:70])
             console.print(Panel(table,
-                                title=Text(f"tools  {len(all_t)}", style=t["accent"]),
+                                title=Text(f"tools  {len(_cached_tools)}", style=t["accent"]),
                                 border_style=t["dim"]))
 
         elif cmd == "/logs":
             import subprocess
-            subprocess.run(["python", os.path.join(_REPO_ROOT, "log_viewer.py")])
+            subprocess.run([sys.executable, os.path.join(_REPO_ROOT, "log_viewer.py")])
 
         # ── Natural language ──────────────────────────────────────────────────
         else:

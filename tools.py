@@ -7,7 +7,7 @@ from langchain_core.tools import tool, StructuredTool
 from pydantic import BaseModel
 from indexer import get_vectorstore
 from logger import log
-from context_trimmer import trim_tool_output
+from context_trimmer import trim_tool_output, estimate_tokens
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -76,15 +76,19 @@ run_command = StructuredTool.from_function(
 
 @tool
 def read_file(path: str) -> str:
-    """Read a file. Relative paths resolve from the user's project directory."""
+    """Read a file. Relative paths resolve from the user's project directory. If file is large, content will be trimmed — re-read with line ranges if needed."""
     if not os.path.isabs(path):
         path = os.path.join(_working_dir(), path)
     log("tool_call", {"tool": "read_file", "input": path})
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
+        total_tokens = estimate_tokens(content)
         trimmed = trim_tool_output(content, max_tokens=800)
-        log("tool_result", {"tool": "read_file", "path": path, "length": len(content), "status": "ok"})
+        was_trimmed = len(trimmed) < len(content)
+        log("tool_result", {"tool": "read_file", "path": path, "length": len(content), "trimmed": was_trimmed, "status": "ok"})
+        if was_trimmed:
+            trimmed += f"\n\n⚠ FILE TRUNCATED: Showing ~800 tokens of ~{total_tokens} total. To see specific sections, read the file in smaller parts."
         return trimmed
     except Exception as e:
         return f"Error reading file: {e}"

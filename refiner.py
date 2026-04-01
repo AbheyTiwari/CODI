@@ -15,8 +15,8 @@ def refine_prompt(user_input: str) -> str:
     """
     text = user_input.strip()
 
-    # Skip refining if too short
-    if len(text) < 50:
+    # Skip refining if too short AND no action keywords
+    if len(text) < 50 and not any(trigger in text.lower() for trigger in REFINE_TRIGGERS):
         return text
 
     # Skip refining if no action keywords — it's probably a question

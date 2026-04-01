@@ -1,4 +1,5 @@
 import os
+import re
 from typing import TypedDict, Annotated, Sequence
 import operator
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -27,7 +28,9 @@ ACTION_TRIGGERS = (
 
 def is_simple_input(text: str) -> bool:
     t = text.lower().strip()
-    if any(w in t for w in ACTION_TRIGGERS):
+    # Use word-boundary matching to avoid false triggers
+    # e.g. "list" should match "list files" but not "listening"
+    if any(re.search(r'\b' + re.escape(w.strip()) + r'\b', t) for w in ACTION_TRIGGERS):
         return False
     if len(t) < 80:
         return True
@@ -72,10 +75,11 @@ def create_agent():
     # ── Direct Q&A (no tools) ─────────────────────────────────────────────────
     def direct_node(state: AgentState):
         log("direct_response", {"input": state["input"][:100]})
-        response = refiner_llm.invoke([
-            SystemMessage(content=_system_prompt()),
-            HumanMessage(content=state["input"]),
-        ])
+        messages = [SystemMessage(content=_system_prompt())]
+        if state.get("history"):
+            messages.append(SystemMessage(content=f"Conversation history:\n{state['history']}"))
+        messages.append(HumanMessage(content=state["input"]))
+        response = refiner_llm.invoke(messages)
         return {"messages": [AIMessage(content=response.content)], "status": "complete"}
 
     # ── Plan ──────────────────────────────────────────────────────────────────
@@ -97,13 +101,17 @@ def create_agent():
     # ── Execute ───────────────────────────────────────────────────────────────
     def execute_node(state: AgentState):
         sys_msg = SystemMessage(content=_system_prompt())
+        messages = [sys_msg]
+        # Inject conversation history so the agent has context
+        if state.get("history"):
+            messages.append(SystemMessage(content=f"Conversation history:\n{state['history']}"))
         recent  = list(state.get("messages", []))[-6:]
         user_msg = HumanMessage(content=(
             f"Task: {state['input']}\n"
             f"Project dir: {os.environ.get('CODI_WORKING_DIR', os.getcwd())}\n"
             f"Execute using tools NOW. Do not explain."
         ))
-        messages = [sys_msg] + recent + [user_msg]
+        messages = messages + recent + [user_msg]
 
         try:
             response = llm_with_tools.invoke(messages)
@@ -161,33 +169,43 @@ def create_agent():
         if state.get("status") == "complete":
             return {"status": "complete"}
 
-        if not state.get("tool_outputs"):
+        outputs = state.get("tool_outputs", [])
+        iteration = state.get("iterations", 0)
+
+        # No tools called yet — nudge the agent
+        if not outputs:
+            if iteration > 1:
+                # Agent stuck — give up gracefully
+                return {"status": "complete"}
             return {
                 "status": "incomplete",
-                "iterations": state["iterations"] + 1,
+                "iterations": iteration + 1,
                 "messages": [SystemMessage(content=(
                     "You have not called any tools yet. "
                     "You MUST use tools to complete this task. Call them now."
                 ))]
             }
 
-        recent_outputs = "\n".join(state['tool_outputs'][-3:])
-        prompt = (
-            f"Task: {state['input']}\n"
-            f"Tool outputs so far:\n{recent_outputs}\n"
-            f"Is the task fully complete? Reply YES or NO only."
+        # Structural check: look at recent tool outputs for errors
+        recent = outputs[-3:]
+        has_errors = any(
+            "ERROR:" in o or "BLOCKED:" in o or "WRITE REJECTED:" in o
+            for o in recent
         )
-        response   = refiner_llm.invoke([HumanMessage(content=prompt)])
-        is_complete = response.content.strip().upper().startswith("YES")
-        log("verify_node", {"iteration": state["iterations"], "is_complete": is_complete})
 
-        if is_complete:
-            return {"status": "complete"}
-        return {
-            "status": "incomplete",
-            "iterations": state["iterations"] + 1,
-            "messages": [SystemMessage(content="Not done yet. Continue using tools.")]
-        }
+        if has_errors and iteration < 6:
+            # Let agent retry on errors
+            error_summary = recent[-1][:200]
+            log("verify_node", {"iteration": iteration, "is_complete": False, "method": "structural"})
+            return {
+                "status": "incomplete",
+                "iterations": iteration + 1,
+                "messages": [SystemMessage(content=f"Tool error occurred. Review and retry: {error_summary}")]
+            }
+
+        # Tools ran successfully (or we've exhausted retries) → complete
+        log("verify_node", {"iteration": iteration, "is_complete": True, "method": "structural"})
+        return {"status": "complete"}
 
     # ── Synthesize ────────────────────────────────────────────────────────────
     def synthesize_node(state: AgentState):
