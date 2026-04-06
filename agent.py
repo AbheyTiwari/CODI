@@ -1,4 +1,6 @@
 import os
+import json
+import re
 from typing import TypedDict, Annotated, Sequence
 import operator
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -36,10 +38,6 @@ def is_simple_input(text: str) -> bool:
     return False
 
 def _system_prompt() -> str:
-    """
-    Build a system prompt that tells the agent exactly where it is.
-    This is the fix for "which directory are you in?" giving a nonsense answer.
-    """
     working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
     return (
         f"You are Codi, an offline-first AI coding agent.\n\n"
@@ -54,6 +52,86 @@ def _system_prompt() -> str:
         f"For git operations on the local repo use run_command with git commands.\n"
     )
 
+# ── Tool call text parser ─────────────────────────────────────────────────────
+# When a model outputs raw JSON tool calls as text instead of structured calls,
+# this extracts and executes them anyway.
+
+def _extract_tool_calls_from_text(content: str) -> list[dict]:
+    """
+    Parse raw JSON tool call objects from model text output.
+    Handles unescaped quotes inside string values (e.g. print("Hello")).
+    Returns list of dicts with 'name' and 'arguments' keys.
+    """
+    if not content:
+        return []
+
+    found = []
+
+    # Extract tool name + raw argument blob using named groups
+    # Captures everything between the outer braces of "arguments": {...}
+    pattern = re.compile(
+        r'"name"\s*:\s*"([^"]+)".*?"arguments"\s*:\s*(\{.*?\})',
+        re.DOTALL
+    )
+
+    for m in re.finditer(pattern, content):
+        tool_name = m.group(1)
+        raw_args  = m.group(2)
+
+        # Try standard parse first
+        try:
+            args = json.loads(raw_args)
+            found.append({"name": tool_name, "arguments": args})
+            continue
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: extract key-value pairs manually
+        # Handles: "key": "value with unescaped "quotes" inside"
+        args = {}
+        kv_pattern = re.compile(r'"(\w+)"\s*:\s*"(.*?)"(?=\s*[,}])', re.DOTALL)
+        for kv in re.finditer(kv_pattern, raw_args):
+            args[kv.group(1)] = kv.group(2)
+
+        if args:
+            found.append({"name": tool_name, "arguments": args})
+
+    return found
+
+
+def _execute_raw_tool_calls(tool_calls: list[dict], tools: list) -> tuple[list, list]:
+    """
+    Execute extracted tool calls directly.
+    Returns (tool_messages, output_strings).
+    """
+    tool_messages = []
+    outputs = []
+
+    for i, tc in enumerate(tool_calls):
+        tool_name = tc["name"]
+        args = tc["arguments"]
+        tool_obj = next((t for t in tools if t.name == tool_name), None)
+
+        if tool_obj:
+            try:
+                result = tool_obj.invoke(args)
+                msg = f"{tool_name}: {str(result)[:500]}"
+            except Exception as e:
+                msg = f"{tool_name} error: {e}"
+        else:
+            msg = f"Tool not found: {tool_name}"
+
+        outputs.append(msg)
+        tool_messages.append(ToolMessage(
+            content=msg,
+            name=tool_name,
+            tool_call_id=f"raw_{i}",
+        ))
+
+    return tool_messages, outputs
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 class AgentState(TypedDict):
     input: str
     history: str
@@ -64,10 +142,10 @@ class AgentState(TypedDict):
     iterations: int
 
 def create_agent():
-    tools        = get_all_tools()
-    llm          = get_coder_llm()
+    tools          = get_all_tools()
+    llm            = get_coder_llm()
     llm_with_tools = llm.bind_tools(tools)
-    refiner_llm  = get_refiner_llm()
+    refiner_llm    = get_refiner_llm()
 
     # ── Direct Q&A (no tools) ─────────────────────────────────────────────────
     def direct_node(state: AgentState):
@@ -96,8 +174,8 @@ def create_agent():
 
     # ── Execute ───────────────────────────────────────────────────────────────
     def execute_node(state: AgentState):
-        sys_msg = SystemMessage(content=_system_prompt())
-        recent  = list(state.get("messages", []))[-6:]
+        sys_msg  = SystemMessage(content=_system_prompt())
+        recent   = list(state.get("messages", []))[-6:]
         user_msg = HumanMessage(content=(
             f"Task: {state['input']}\n"
             f"Project dir: {os.environ.get('CODI_WORKING_DIR', os.getcwd())}\n"
@@ -121,8 +199,36 @@ def create_agent():
                 }
             raise
 
-        has_calls = hasattr(response, 'tool_calls') and bool(response.tool_calls)
-        log("execute_node", {"iteration": state["iterations"], "has_tool_calls": has_calls})
+        # ── Check for structured tool calls ───────────────────────────────────
+        has_structured_calls = (
+            hasattr(response, 'tool_calls') and bool(response.tool_calls)
+        )
+
+        # ── Check for raw JSON tool calls in text content ─────────────────────
+        content = response.content if hasattr(response, 'content') else ""
+        raw_tool_calls = _extract_tool_calls_from_text(content) if not has_structured_calls else []
+        print(f"DEBUG raw_tool_calls: {raw_tool_calls}")
+
+        if raw_tool_calls:
+            log("execute_node", {
+                "iteration": state["iterations"],
+                "has_tool_calls": True,
+                "source": "text_parser",
+                "count": len(raw_tool_calls),
+            })
+            # Execute them immediately and return results as tool messages
+            tool_messages, outputs = _execute_raw_tool_calls(raw_tool_calls, tools)
+            return {
+                "messages": [response] + tool_messages,
+                "tool_outputs": outputs,
+                "iterations": state["iterations"] + 1,
+            }
+
+        log("execute_node", {
+            "iteration": state["iterations"],
+            "has_tool_calls": has_structured_calls,
+            "source": "structured",
+        })
         return {"messages": [response]}
 
     # ── Tool execution ────────────────────────────────────────────────────────
@@ -162,6 +268,9 @@ def create_agent():
             return {"status": "complete"}
 
         if not state.get("tool_outputs"):
+            # Only loop back once if no tools ran — avoid infinite spin
+            if state["iterations"] >= 3:
+                return {"status": "complete"}
             return {
                 "status": "incomplete",
                 "iterations": state["iterations"] + 1,
@@ -177,7 +286,7 @@ def create_agent():
             f"Tool outputs so far:\n{recent_outputs}\n"
             f"Is the task fully complete? Reply YES or NO only."
         )
-        response   = refiner_llm.invoke([HumanMessage(content=prompt)])
+        response    = refiner_llm.invoke([HumanMessage(content=prompt)])
         is_complete = response.content.strip().upper().startswith("YES")
         log("verify_node", {"iteration": state["iterations"], "is_complete": is_complete})
 
@@ -217,8 +326,16 @@ def create_agent():
         if state.get("status") == "complete":
             return "verify"
         last = state["messages"][-1]
+
+        # Structured tool calls (proper LangChain format)
         if hasattr(last, 'tool_calls') and last.tool_calls:
             return "tool"
+
+        # If last message is a ToolMessage, raw calls were already executed
+        # in execute_node — go straight to verify
+        if isinstance(last, ToolMessage):
+            return "verify"
+
         return "verify"
 
     def should_loop(state: AgentState):
@@ -228,12 +345,12 @@ def create_agent():
 
     # ── Graph ─────────────────────────────────────────────────────────────────
     workflow = StateGraph(AgentState)
-    workflow.add_node("direct",    direct_node)
-    workflow.add_node("plan",      plan_node)
-    workflow.add_node("execute",   execute_node)
-    workflow.add_node("tool",      tool_node)
-    workflow.add_node("verify",    verify_node)
-    workflow.add_node("synthesize",synthesize_node)
+    workflow.add_node("direct",     direct_node)
+    workflow.add_node("plan",       plan_node)
+    workflow.add_node("execute",    execute_node)
+    workflow.add_node("tool",       tool_node)
+    workflow.add_node("verify",     verify_node)
+    workflow.add_node("synthesize", synthesize_node)
 
     workflow.set_conditional_entry_point(route_input, {"direct": "direct", "plan": "plan"})
     workflow.add_edge("direct", END)
@@ -251,17 +368,17 @@ def create_agent():
 
         def invoke(self, inputs: dict) -> dict:
             state = {
-                "input":       inputs["input"],
-                "history":     inputs.get("history", ""),
-                "plan":        "",
-                "messages":    [],
-                "tool_outputs":[],
-                "status":      "start",
-                "iterations":  0,
+                "input":        inputs["input"],
+                "history":      inputs.get("history", ""),
+                "plan":         "",
+                "messages":     [],
+                "tool_outputs": [],
+                "status":       "start",
+                "iterations":   0,
             }
             try:
-                result = self.graph.invoke(state, {"recursion_limit": 60})
-                msgs   = result.get("messages", [])
+                result       = self.graph.invoke(state, {"recursion_limit": 60})
+                msgs         = result.get("messages", [])
                 tool_outputs = result.get("tool_outputs", [])
                 if msgs and isinstance(msgs[-1], AIMessage):
                     return {"output": msgs[-1].content, "tool_outputs": tool_outputs}

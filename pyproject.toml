@@ -31,10 +31,13 @@ dependencies = [
 ]
 
 [project.scripts]
-codi = "main:main"
+codi = "cli:main"
 
 [tool.setuptools]
-py-modules = ["main"]
+py-modules = ["main", "cli", "agent", "memory", "tools", "indexer", 
+              "llm_factory", "refiner", "logger", "log_viewer", 
+              "config", "config_loader", "context_trimmer", 
+              "mcp_client", "mcp_manager"]
 
 [tool.setuptools.package-dir]
 "" = "."

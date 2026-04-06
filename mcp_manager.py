@@ -103,7 +103,7 @@ class MCPManager:
 
         params = StdioServerParameters(
             command=command,
-            args=cfg.get("args", []),
+            args=[os.path.expandvars(a) for a in cfg.get("args", [])],
             env=merged_env
         )
         async with stdio_client(params) as (read, write):

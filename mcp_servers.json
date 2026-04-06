@@ -6,9 +6,30 @@
     "args": [
       "-y",
       "@modelcontextprotocol/server-filesystem",
-      "C:\\Users\\Abhey Dev\\Desktop\\codi"
+      "/Users/mansimazumdar/CODI"
     ]
-  },
+},
+
+"sqlite": {
+    "enabled": true,
+    "command": "npx",
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-sqlite",
+      "--db-path",
+      "/Users/mansimazumdar/CODI"
+    ]
+},
+
+"git": {
+    "enabled": true,
+    "command": "uvx",
+    "args": [
+      "mcp-server-git",
+      "--repository",
+      "/Users/mansimazumdar/CODI"
+    ]
+},
   "memory": {
     "enabled": true,
     "description": "Persistent cross-session knowledge graph memory",
@@ -74,17 +95,6 @@
       "postgresql://username:password@localhost:5432/mydb"
     ]
   },
-  "sqlite": {
-    "enabled": true,
-    "description": "Query local SQLite databases",
-    "command": "npx",
-    "args": [
-      "-y",
-      "@modelcontextprotocol/server-sqlite",
-      "--db-path",
-      "C:/Users/Abhey Dev/Desktop/codi/coding-agent/codi.db"
-    ]
-  },
   "puppeteer": {
     "enabled": false,
     "description": "Control a real browser, scrape pages, take screenshots",
@@ -100,16 +110,6 @@
     "command": "uvx",
     "args": [
       "mcp-server-fetch"
-    ]
-  },
-  "git": {
-    "enabled": true,
-    "description": "Full git operations on local repos \u2014 pointed at coding-agent directory",
-    "command": "uvx",
-    "args": [
-      "mcp-server-git",
-      "--repository",
-      "C:/Users/Abhey Dev/Desktop/codi/coding-agent"
     ]
   },
   "python-sandbox": {
