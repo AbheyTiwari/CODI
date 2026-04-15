@@ -341,7 +341,7 @@ def main():
 
         elif cmd == "/logs":
             import subprocess
-            subprocess.run(["python", os.path.join(_REPO_ROOT, "log_viewer.py")])
+            subprocess.run([sys.executable, os.path.join(_REPO_ROOT, "log_viewer.py")])
 
         # ── Natural language ──────────────────────────────────────────────────
         else:

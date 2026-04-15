@@ -6,30 +6,30 @@
     "args": [
       "-y",
       "@modelcontextprotocol/server-filesystem",
-      "/Users/mansimazumdar/CODI"
+      "${CODI_WORKING_DIR}"
     ]
-},
+  },
 
-"sqlite": {
+  "sqlite": {
     "enabled": true,
     "command": "npx",
     "args": [
       "-y",
       "@modelcontextprotocol/server-sqlite",
       "--db-path",
-      "/Users/mansimazumdar/CODI"
+      "${CODI_WORKING_DIR}"
     ]
-},
+  },
 
-"git": {
+  "git": {
     "enabled": true,
     "command": "uvx",
     "args": [
       "mcp-server-git",
       "--repository",
-      "/Users/mansimazumdar/CODI"
+      "${CODI_WORKING_DIR}"
     ]
-},
+  },
   "memory": {
     "enabled": true,
     "description": "Persistent cross-session knowledge graph memory",

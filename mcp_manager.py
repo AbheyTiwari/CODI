@@ -112,8 +112,27 @@ class MCPManager:
                 return await load_mcp_tools(session)
 
     async def _load_sse(self, name: str, cfg: dict) -> list:
-        url = cfg["url"]
-        async with sse_client(url) as (read, write):
+        url = cfg.get("url")
+        if not url:
+            raise ValueError(f"{name}: SSE/HTTP type requires a 'url' field in mcp_servers.json")
+
+        # Resolve env vars in headers (e.g. "${STITCH_API_KEY}")
+        raw_headers = cfg.get("headers", {})
+        headers = {}
+        for k, v in raw_headers.items():
+            if isinstance(v, str) and v.startswith("${") and v.endswith("}"):
+                env_key = v[2:-1]
+                headers[k] = os.environ.get(env_key, "")
+            else:
+                headers[k] = v
+
+        # Also merge any env block into headers
+        for k, v in cfg.get("env", {}).items():
+            resolved = os.environ.get(k, str(v))
+            if resolved:
+                headers[k] = resolved
+
+        async with sse_client(url, headers=headers) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 return await load_mcp_tools(session)

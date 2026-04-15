@@ -67,8 +67,6 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
 
     found = []
 
-    # Extract tool name + raw argument blob using named groups
-    # Captures everything between the outer braces of "arguments": {...}
     pattern = re.compile(
         r'"name"\s*:\s*"([^"]+)".*?"arguments"\s*:\s*(\{.*?\})',
         re.DOTALL
@@ -78,7 +76,6 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
         tool_name = m.group(1)
         raw_args  = m.group(2)
 
-        # Try standard parse first
         try:
             args = json.loads(raw_args)
             found.append({"name": tool_name, "arguments": args})
@@ -87,7 +84,6 @@ def _extract_tool_calls_from_text(content: str) -> list[dict]:
             pass
 
         # Fallback: extract key-value pairs manually
-        # Handles: "key": "value with unescaped "quotes" inside"
         args = {}
         kv_pattern = re.compile(r'"(\w+)"\s*:\s*"(.*?)"(?=\s*[,}])', re.DOTALL)
         for kv in re.finditer(kv_pattern, raw_args):
@@ -132,6 +128,9 @@ def _execute_raw_tool_calls(tool_calls: list[dict], tools: list) -> tuple[list, 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Tracks whether the coder LLM supports tools (detected at runtime)
+_llm_supports_tools: bool = True
+
 class AgentState(TypedDict):
     input: str
     history: str
@@ -141,11 +140,17 @@ class AgentState(TypedDict):
     status: str
     iterations: int
 
+
 def create_agent():
+    global _llm_supports_tools
+
     tools          = get_all_tools()
     llm            = get_coder_llm()
     llm_with_tools = llm.bind_tools(tools)
     refiner_llm    = get_refiner_llm()
+
+    # ── Max iteration cap ─────────────────────────────────────────────────────
+    MAX_ITERATIONS = 8
 
     # ── Direct Q&A (no tools) ─────────────────────────────────────────────────
     def direct_node(state: AgentState):
@@ -162,7 +167,9 @@ def create_agent():
         prompt = (
             f"Project directory: {working_dir}\n"
             f"Task: {state['input']}\n"
-            f"Write a concise step-by-step plan (max 4 steps) using available tools."
+            f"Write a concise step-by-step plan (max 4 steps) using available tools.\n"
+            f"Use ONLY the tools and libraries the user asked for. "
+            f"Do not substitute alternatives (e.g. if asked for FastAPI, plan FastAPI — not Flask)."
         )
         response = refiner_llm.invoke([HumanMessage(content=prompt)])
         log("plan_created", {"plan": response.content[:200]})
@@ -174,6 +181,25 @@ def create_agent():
 
     # ── Execute ───────────────────────────────────────────────────────────────
     def execute_node(state: AgentState):
+        global _llm_supports_tools
+
+        # FIX: If we already know the model doesn't support tools,
+        # skip straight to a plain text response rather than looping.
+        if not _llm_supports_tools:
+            log("execute_no_tools_mode", {"iteration": state["iterations"]})
+            plain = refiner_llm.invoke([
+                SystemMessage(content=_system_prompt()),
+                HumanMessage(content=(
+                    f"Task: {state['input']}\n"
+                    f"Write the complete solution as code. "
+                    f"Then show the exact shell commands needed to save and run it."
+                )),
+            ])
+            return {
+                "messages": [AIMessage(content=plain.content)],
+                "status": "complete",
+            }
+
         sys_msg  = SystemMessage(content=_system_prompt())
         recent   = list(state.get("messages", []))[-6:]
         user_msg = HumanMessage(content=(
@@ -187,11 +213,17 @@ def create_agent():
             response = llm_with_tools.invoke(messages)
         except Exception as e:
             err = str(e)
-            if "tool_use_failed" in err or "400" in err:
-                log("execute_fallback", {"error": err[:200]})
+            # Model doesn't support tools at all — mark globally and fall back
+            if "does not support tools" in err or "tool_use_failed" in err or "400" in err:
+                _llm_supports_tools = False
+                log("execute_fallback", {"error": err[:200], "tools_disabled": True})
                 plain = refiner_llm.invoke([
                     SystemMessage(content=_system_prompt()),
-                    HumanMessage(content=state["input"]),
+                    HumanMessage(content=(
+                        f"Task: {state['input']}\n"
+                        f"Write the complete solution as code. "
+                        f"Then show the exact shell commands needed to save and run it."
+                    )),
                 ])
                 return {
                     "messages": [AIMessage(content=plain.content)],
@@ -207,7 +239,6 @@ def create_agent():
         # ── Check for raw JSON tool calls in text content ─────────────────────
         content = response.content if hasattr(response, 'content') else ""
         raw_tool_calls = _extract_tool_calls_from_text(content) if not has_structured_calls else []
-        print(f"DEBUG raw_tool_calls: {raw_tool_calls}")
 
         if raw_tool_calls:
             log("execute_node", {
@@ -216,7 +247,6 @@ def create_agent():
                 "source": "text_parser",
                 "count": len(raw_tool_calls),
             })
-            # Execute them immediately and return results as tool messages
             tool_messages, outputs = _execute_raw_tool_calls(raw_tool_calls, tools)
             return {
                 "messages": [response] + tool_messages,
@@ -267,9 +297,15 @@ def create_agent():
         if state.get("status") == "complete":
             return {"status": "complete"}
 
+        # FIX: Hard cap — if we've hit max iterations, stop regardless
+        if state["iterations"] >= MAX_ITERATIONS:
+            log("verify_node", {"iteration": state["iterations"], "is_complete": True, "reason": "max_iterations"})
+            return {"status": "complete"}
+
         if not state.get("tool_outputs"):
-            # Only loop back once if no tools ran — avoid infinite spin
+            # FIX: If tools never ran after 3 iterations, give up cleanly
             if state["iterations"] >= 3:
+                log("verify_node", {"iteration": state["iterations"], "is_complete": True, "reason": "no_tool_outputs"})
                 return {"status": "complete"}
             return {
                 "status": "incomplete",
@@ -279,6 +315,14 @@ def create_agent():
                     "You MUST use tools to complete this task. Call them now."
                 ))]
             }
+
+        # FIX: Detect stalled progress — if tool_outputs haven't grown
+        # for 2 consecutive verify cycles, stop looping
+        prev_count = state.get("_prev_tool_output_count", 0)
+        curr_count = len(state["tool_outputs"])
+        if curr_count == prev_count and state["iterations"] >= 4:
+            log("verify_node", {"iteration": state["iterations"], "is_complete": True, "reason": "stalled"})
+            return {"status": "complete"}
 
         recent_outputs = "\n".join(state['tool_outputs'][-3:])
         prompt = (
@@ -295,6 +339,7 @@ def create_agent():
         return {
             "status": "incomplete",
             "iterations": state["iterations"] + 1,
+            "_prev_tool_output_count": curr_count,
             "messages": [SystemMessage(content="Not done yet. Continue using tools.")]
         }
 
@@ -339,7 +384,10 @@ def create_agent():
         return "verify"
 
     def should_loop(state: AgentState):
-        if state["status"] == "complete" or state["iterations"] >= 8:
+        if state["status"] == "complete" or state["iterations"] >= MAX_ITERATIONS:
+            return "synthesize"
+        # FIX: No tool outputs after 4 iterations = stuck, stop looping
+        if state["iterations"] >= 4 and not state.get("tool_outputs"):
             return "synthesize"
         return "execute"
 
@@ -368,13 +416,14 @@ def create_agent():
 
         def invoke(self, inputs: dict) -> dict:
             state = {
-                "input":        inputs["input"],
-                "history":      inputs.get("history", ""),
-                "plan":         "",
-                "messages":     [],
-                "tool_outputs": [],
-                "status":       "start",
-                "iterations":   0,
+                "input":                    inputs["input"],
+                "history":                  inputs.get("history", ""),
+                "plan":                     "",
+                "messages":                 [],
+                "tool_outputs":             [],
+                "status":                   "start",
+                "iterations":               0,
+                "_prev_tool_output_count":  0,
             }
             try:
                 result       = self.graph.invoke(state, {"recursion_limit": 60})

@@ -1,0 +1,56 @@
+{"ts": "2026-04-15T13:29:17.681169", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-15T13:29:18.045705", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:29:18.310039", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:29:18.310547", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:29:18.310855", "event": "mcp_load", "server": "git", "tools": 12}
+{"ts": "2026-04-15T13:29:18.311190", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-15T13:29:18.311505", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-15T13:29:18.311804", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-15T13:29:18.312026", "event": "mcp_load", "server": "fetch", "tools": 1}
+{"ts": "2026-04-15T13:29:18.312226", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-15T13:29:18.312452", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:29:18.433221", "event": "agent_created", "tools": 16}
+{"ts": "2026-04-15T13:34:03.964557", "event": "agent_start", "input": "codi a fast API that can great hello", "mode": "local"}
+{"ts": "2026-04-15T13:34:55.668499", "event": "plan_created", "plan": "Step 1: Install Python and necessary libraries on Kali Linux by running the following commands in terminal:\n```python\nsudo apt update\nsudo apt install python3 pip virtualenv\npip install flask uvicorn "}
+{"ts": "2026-04-15T13:35:49.690335", "event": "execute_node", "iteration": 1, "has_tool_calls": true, "source": "text_parser", "count": 1}
+{"ts": "2026-04-15T13:36:03.420485", "event": "verify_node", "iteration": 2, "is_complete": false}
+{"ts": "2026-04-15T13:37:00.560363", "event": "execute_node", "iteration": 3, "has_tool_calls": true, "source": "text_parser", "count": 1}
+{"ts": "2026-04-15T13:37:17.195517", "event": "verify_node", "iteration": 4, "is_complete": false}
+{"ts": "2026-04-15T13:38:37.770869", "event": "execute_node", "iteration": 5, "has_tool_calls": true, "source": "text_parser", "count": 6}
+{"ts": "2026-04-15T13:38:56.857812", "event": "verify_node", "iteration": 6, "is_complete": false}
+{"ts": "2026-04-15T13:39:58.340922", "event": "execute_node", "iteration": 7, "has_tool_calls": true, "source": "text_parser", "count": 1}
+{"ts": "2026-04-15T13:40:18.659019", "event": "verify_node", "iteration": 8, "is_complete": false}
+{"ts": "2026-04-15T13:41:48.862151", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:41:48.935771", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-15T13:41:49.492525", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:41:49.493059", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:41:49.493335", "event": "mcp_load", "server": "git", "tools": 12}
+{"ts": "2026-04-15T13:41:49.493566", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-15T13:41:49.493776", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-15T13:41:49.493982", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-15T13:41:49.494171", "event": "mcp_load", "server": "fetch", "tools": 1}
+{"ts": "2026-04-15T13:41:49.494355", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-15T13:41:49.494601", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:41:49.613351", "event": "agent_created", "tools": 16}
+{"ts": "2026-04-15T13:43:53.465318", "event": "agent_start", "input": "create a python app to print hello wworld", "mode": "local"}
+{"ts": "2026-04-15T13:44:23.512291", "event": "plan_created", "plan": "1. Open the terminal and navigate to your project directory by typing `cd /home/kali/Desktop/CODI/CODI`.\n2. Create a new Python file named \"hello_world.py\" in this directory with the command: `touch h"}
+{"ts": "2026-04-15T13:44:23.533799", "event": "execute_fallback", "error": "registry.ollama.ai/library/phi3:mini does not support tools (status code: 400)"}
+{"ts": "2026-04-15T13:44:37.036789", "event": "agent_end", "output": "```python\n\n# Save this as 'hello_world.py' in /home/kali/Desktop/CODI/CODI directory\n\nprint(\"Hello, World!\")\n\n```\n\nTo run the application: `run_command python3 /home/kali/Desktop/CODI/CODI/hello_world", "mode": "local"}
+{"ts": "2026-04-15T13:46:07.855535", "event": "agent_start", "input": "exit", "mode": "local"}
+{"ts": "2026-04-15T13:46:07.856243", "event": "direct_response", "input": "exit"}
+{"ts": "2026-04-15T13:48:10.452152", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-15T13:48:10.579948", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:48:10.580619", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:48:10.581015", "event": "mcp_load", "server": "git", "tools": 12}
+{"ts": "2026-04-15T13:48:10.581359", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-15T13:48:10.581720", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-15T13:48:10.582051", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-15T13:48:10.582332", "event": "mcp_load", "server": "fetch", "tools": 1}
+{"ts": "2026-04-15T13:48:10.586130", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-15T13:48:11.214921", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:48:11.215365", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-15T13:48:11.331605", "event": "agent_created", "tools": 16}
+{"ts": "2026-04-15T13:50:08.802662", "event": "agent_start", "input": "code a python fast API app with a nice HTML page that says hello", "mode": "local"}
+{"ts": "2026-04-15T13:51:01.318697", "event": "plan_created", "plan": "Step 1: Set up the project directory and install necessary packages by running `mkdir CODI && cd CODI` in your terminal, then create a virtual environment with `python3 -m venv env`, activate it with "}
+{"ts": "2026-04-15T13:51:01.386352", "event": "execute_fallback", "error": "registry.ollama.ai/library/llama3:8b does not support tools (status code: 400)"}
+{"ts": "2026-04-15T13:53:06.355855", "event": "agent_end", "output": "Firstly, ensure you have Python and pip installed to create your project directory:\n\n```bash\nmkdir my_fastapi_app && cd my end=my_fastapi_app/\npython3 -m venv venv\nsource ./venv/bin/activate # On Wind", "mode": "local"}
