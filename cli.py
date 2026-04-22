@@ -14,9 +14,9 @@ import os
 import sys
 
 # ── Find the repo root ────────────────────────────────────────────────────────
-# __file__ is  <repo>/codi_agent/cli.py
-# repo root is  <repo>/
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# __file__ is  <repo>/cli.py  (cli.py is at the repo root, not in a subdirectory)
+# so _REPO_ROOT is just the directory containing this file.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def main():
     # 1. Put the repo on sys.path so all Codi modules import correctly

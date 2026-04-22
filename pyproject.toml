@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codi-agent"
+name = "codi"
 version = "0.1.0"
 description = "Codi — offline-first AI coding agent"
 requires-python = ">=3.10"
@@ -34,10 +34,12 @@ dependencies = [
 codi = "cli:main"
 
 [tool.setuptools]
-py-modules = ["main", "cli", "agent", "memory", "tools", "indexer", 
-              "llm_factory", "refiner", "logger", "log_viewer", 
-              "config", "config_loader", "context_trimmer", 
-              "mcp_client", "mcp_manager"]
+py-modules = [
+    "main", "cli", "agent", "dispatcher", "memory", "indexer",
+    "llm_factory", "logger", "log_viewer",
+    "config", "config_loader", "context_trimmer", "mcp_manager"
+]
 
-[tool.setuptools.package-dir]
-"" = "."
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core", "core.*", "tools", "tools.*", "state", "state.*"]

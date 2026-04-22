@@ -34,11 +34,19 @@ from prompt_toolkit.styles import Style as PTStyle
 
 from memory import session_memory
 from indexer import index_codebase
-from refiner import refine_prompt
+from core.planner import Planner as _Planner
 from agent import create_agent
 from logger import log
 from context_trimmer import trim_context_for_llm, estimate_tokens
 import config
+
+# Replaces the old refiner.py — refine_prompt now lives in Planner
+_planner_instance = None
+def refine_prompt(text: str) -> str:
+    global _planner_instance
+    if _planner_instance is None:
+        _planner_instance = _Planner()
+    return _planner_instance.refine_input(text)
 
 console = Console()
 

@@ -9,7 +9,7 @@
 #  "air"     — Use Air LLM server on your phone over local Wi-Fi.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-MODE = "local"          # local | hybrid | cloud | air
+MODE = "local"     # local | hybrid | cloud | air
 
 # ── Cloud provider (used when MODE="cloud" or hybrid escalates) ───────────────
 # Options: "groq" | "anthropic" | "openai" | "gemini"
@@ -67,8 +67,7 @@ AIR_LLM_TIMEOUT       = 180                          # phones are slower — be 
 #    ollama pull deepseek-r1:8b         (deep reasoning tasks)
 #
 REFINER_MODEL_LOCAL = "phi3:mini"           # fast planner / refiner
-CODER_MODEL_LOCAL   = "llama3:8b"   # main code executor
-
+CODER_MODEL_LOCAL   = "phi3:mini" # main coder — set to same as refiner for low-end machines
 # ── Cloud models ──────────────────────────────────────────────────────────────
 #  Groq (free tier, very fast):
 REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"     # fast, cheap — good for planning
