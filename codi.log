@@ -1,0 +1,184 @@
+{"ts": "2026-04-26T13:14:27.204060", "event": "registry_register", "tool": "create_file", "type": "local"}
+{"ts": "2026-04-26T13:14:27.204645", "event": "registry_register", "tool": "read_file", "type": "local"}
+{"ts": "2026-04-26T13:14:27.205086", "event": "registry_register", "tool": "write_file", "type": "local"}
+{"ts": "2026-04-26T13:14:27.205569", "event": "registry_register", "tool": "edit_file", "type": "local"}
+{"ts": "2026-04-26T13:14:27.206065", "event": "registry_register", "tool": "list_files", "type": "local"}
+{"ts": "2026-04-26T13:14:27.206584", "event": "registry_register", "tool": "create_directory", "type": "local"}
+{"ts": "2026-04-26T13:14:27.207043", "event": "registry_register", "tool": "run_command", "type": "local"}
+{"ts": "2026-04-26T13:14:27.207441", "event": "registry_register", "tool": "search_codebase", "type": "local"}
+{"ts": "2026-04-26T13:14:30.356513", "event": "mcp_server_crash", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:14:30.365893", "event": "mcp_server_crash", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:14:32.278126", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:14:34.187011", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:14:40.422241", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-26T13:14:40.424881", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:14:40.433539", "event": "mcp_load_error", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:14:40.449269", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-26T13:14:40.451969", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-26T13:14:40.454455", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-26T13:14:40.457907", "event": "mcp_load_error", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:14:40.461237", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-26T13:14:40.464691", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:14:40.465834", "event": "registry_register", "tool": "read_file", "type": "mcp"}
+{"ts": "2026-04-26T13:14:40.466596", "event": "registry_register", "tool": "write_file", "type": "mcp"}
+{"ts": "2026-04-26T13:14:40.467536", "event": "registry_register", "tool": "create_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:14:40.469181", "event": "registry_register", "tool": "list_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:14:40.470343", "event": "registry_register", "tool": "create_entities", "type": "mcp"}
+{"ts": "2026-04-26T13:14:40.473114", "event": "registry_register", "tool": "search_nodes", "type": "mcp"}
+{"ts": "2026-04-26T13:14:40.474195", "event": "mcp_tools_loaded", "count": 6, "mode": "local"}
+{"ts": "2026-04-26T13:14:40.477425", "event": "registry_loaded", "local": 8, "mcp": 6, "total": 11}
+{"ts": "2026-04-26T13:14:40.483808", "event": "agent_created", "tools": 11, "mode": "local"}
+{"ts": "2026-04-26T13:16:13.749371", "event": "working_dir_changed", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:16:22.256532", "event": "agent_start", "input": "create portfolio website", "mode": "local"}
+{"ts": "2026-04-26T13:16:22.257116", "event": "agent_start", "input": "create portfolio website"}
+{"ts": "2026-04-26T13:16:22.257544", "event": "planner_route", "input": "create portfolio website", "needs_execution": true}
+{"ts": "2026-04-26T13:16:22.259123", "event": "dispatcher_call", "tool": "list_files", "args": "{}"}
+{"ts": "2026-04-26T13:16:22.259600", "event": "tool_call", "tool": "list_files", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:16:22.260162", "event": "tool_result", "tool": "list_files", "count": 0, "status": "ok"}
+{"ts": "2026-04-26T13:16:22.260508", "event": "dispatcher_call", "tool": "search_codebase", "args": "{'query': 'create portfolio website'}"}
+{"ts": "2026-04-26T13:16:22.261016", "event": "tool_call", "tool": "search_codebase", "query": "create portfolio website"}
+{"ts": "2026-04-26T13:16:22.261734", "event": "dispatcher_ok", "tool": "list_files", "status": "ok", "output_len": 0}
+{"ts": "2026-04-26T13:16:22.347497", "event": "tool_result", "tool": "search_codebase", "chunks": 5, "status": "ok"}
+{"ts": "2026-04-26T13:16:22.348012", "event": "dispatcher_ok", "tool": "search_codebase", "status": "ok", "output_len": 2881}
+{"ts": "2026-04-26T13:16:22.349873", "event": "dispatcher_result", "tools": ["list_files", "search_codebase"], "overall": "success"}
+{"ts": "2026-04-26T13:16:22.350403", "event": "agent_context_ready", "context_len": 633}
+{"ts": "2026-04-26T13:30:49.515613", "event": "registry_register", "tool": "create_file", "type": "local"}
+{"ts": "2026-04-26T13:30:49.516785", "event": "registry_register", "tool": "read_file", "type": "local"}
+{"ts": "2026-04-26T13:30:49.517726", "event": "registry_register", "tool": "write_file", "type": "local"}
+{"ts": "2026-04-26T13:30:49.518656", "event": "registry_register", "tool": "edit_file", "type": "local"}
+{"ts": "2026-04-26T13:30:49.519405", "event": "registry_register", "tool": "list_files", "type": "local"}
+{"ts": "2026-04-26T13:30:49.520179", "event": "registry_register", "tool": "create_directory", "type": "local"}
+{"ts": "2026-04-26T13:30:49.520979", "event": "registry_register", "tool": "run_command", "type": "local"}
+{"ts": "2026-04-26T13:30:49.521891", "event": "registry_register", "tool": "search_codebase", "type": "local"}
+{"ts": "2026-04-26T13:30:52.099717", "event": "mcp_server_crash", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:30:52.107581", "event": "mcp_server_crash", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:30:54.126834", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:30:55.749850", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:31:05.644400", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-26T13:31:05.651929", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:31:05.662919", "event": "mcp_load_error", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:31:06.022715", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-26T13:31:06.628233", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-26T13:31:06.631858", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-26T13:31:06.635710", "event": "mcp_load_error", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:31:07.350127", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-26T13:31:07.353738", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:31:07.354812", "event": "registry_register", "tool": "read_file", "type": "mcp"}
+{"ts": "2026-04-26T13:31:07.355686", "event": "registry_register", "tool": "write_file", "type": "mcp"}
+{"ts": "2026-04-26T13:31:07.356669", "event": "registry_register", "tool": "create_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:31:07.357547", "event": "registry_register", "tool": "list_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:31:07.358377", "event": "registry_register", "tool": "create_entities", "type": "mcp"}
+{"ts": "2026-04-26T13:31:07.359547", "event": "registry_register", "tool": "search_nodes", "type": "mcp"}
+{"ts": "2026-04-26T13:31:07.360314", "event": "mcp_tools_loaded", "count": 6, "mode": "local"}
+{"ts": "2026-04-26T13:31:07.362853", "event": "registry_loaded", "local": 8, "mcp": 6, "total": 11}
+{"ts": "2026-04-26T13:31:07.365726", "event": "agent_created", "tools": 11, "mode": "local"}
+{"ts": "2026-04-26T13:31:19.904206", "event": "working_dir_changed", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:31:35.152348", "event": "tool_call", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\simple.html", "length": 1027}
+{"ts": "2026-04-26T13:31:35.673024", "event": "tool_result", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\simple.html", "status": "ok"}
+{"ts": "2026-04-26T13:31:35.674812", "event": "tool_call", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\styles.css", "length": 165}
+{"ts": "2026-04-26T13:31:35.709460", "event": "tool_result", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\styles.css", "status": "ok"}
+{"ts": "2026-04-26T13:31:35.717380", "event": "agent_start", "input": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfolio website in html", "mode": "local"}
+{"ts": "2026-04-26T13:31:35.718267", "event": "agent_start", "input": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfo"}
+{"ts": "2026-04-26T13:31:35.719068", "event": "planner_route", "input": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to ", "needs_execution": true}
+{"ts": "2026-04-26T13:31:35.722758", "event": "dispatcher_call", "tool": "list_files", "args": "{}"}
+{"ts": "2026-04-26T13:31:35.724519", "event": "tool_call", "tool": "list_files", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:31:35.724794", "event": "dispatcher_call", "tool": "search_codebase", "args": "{'query': '[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfolio website in html'}"}
+{"ts": "2026-04-26T13:31:35.726419", "event": "tool_call", "tool": "search_codebase", "query": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfolio website in html"}
+{"ts": "2026-04-26T13:31:35.726748", "event": "tool_result", "tool": "list_files", "count": 2, "status": "ok"}
+{"ts": "2026-04-26T13:31:35.727991", "event": "dispatcher_ok", "tool": "list_files", "status": "ok", "output_len": 76}
+{"ts": "2026-04-26T13:31:35.915625", "event": "tool_result", "tool": "search_codebase", "chunks": 5, "status": "ok"}
+{"ts": "2026-04-26T13:31:35.916675", "event": "dispatcher_ok", "tool": "search_codebase", "status": "ok", "output_len": 2881}
+{"ts": "2026-04-26T13:31:35.920559", "event": "dispatcher_result", "tools": ["list_files", "search_codebase"], "overall": "success"}
+{"ts": "2026-04-26T13:31:35.921863", "event": "agent_context_ready", "context_len": 709}
+{"ts": "2026-04-26T13:39:31.725489", "event": "registry_register", "tool": "create_file", "type": "local"}
+{"ts": "2026-04-26T13:39:31.726281", "event": "registry_register", "tool": "read_file", "type": "local"}
+{"ts": "2026-04-26T13:39:31.726981", "event": "registry_register", "tool": "write_file", "type": "local"}
+{"ts": "2026-04-26T13:39:31.727806", "event": "registry_register", "tool": "edit_file", "type": "local"}
+{"ts": "2026-04-26T13:39:31.728517", "event": "registry_register", "tool": "list_files", "type": "local"}
+{"ts": "2026-04-26T13:39:31.729582", "event": "registry_register", "tool": "create_directory", "type": "local"}
+{"ts": "2026-04-26T13:39:31.730560", "event": "registry_register", "tool": "run_command", "type": "local"}
+{"ts": "2026-04-26T13:39:31.731848", "event": "registry_register", "tool": "search_codebase", "type": "local"}
+{"ts": "2026-04-26T13:39:34.453109", "event": "mcp_server_crash", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:39:34.461765", "event": "mcp_server_crash", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:39:36.113883", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:39:38.637737", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:39:44.107809", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-26T13:39:44.112777", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:39:44.117760", "event": "mcp_load_error", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:39:44.721677", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-26T13:39:44.728693", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-26T13:39:44.736071", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-26T13:39:44.739799", "event": "mcp_load_error", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:39:47.901569", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-26T13:39:47.913576", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:39:47.915032", "event": "registry_register", "tool": "read_file", "type": "mcp"}
+{"ts": "2026-04-26T13:39:47.916236", "event": "registry_register", "tool": "write_file", "type": "mcp"}
+{"ts": "2026-04-26T13:39:47.917192", "event": "registry_register", "tool": "create_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:39:47.918453", "event": "registry_register", "tool": "list_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:39:47.919625", "event": "registry_register", "tool": "create_entities", "type": "mcp"}
+{"ts": "2026-04-26T13:39:47.920705", "event": "registry_register", "tool": "search_nodes", "type": "mcp"}
+{"ts": "2026-04-26T13:39:47.921785", "event": "mcp_tools_loaded", "count": 6, "mode": "local"}
+{"ts": "2026-04-26T13:39:47.931500", "event": "registry_loaded", "local": 8, "mcp": 6, "total": 11}
+{"ts": "2026-04-26T13:39:47.947194", "event": "agent_created", "tools": 11, "mode": "local"}
+{"ts": "2026-04-26T13:39:58.730278", "event": "working_dir_changed", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:40:08.553901", "event": "agent_start", "input": "create portfolio website", "mode": "local"}
+{"ts": "2026-04-26T13:40:08.555096", "event": "agent_start", "input": "create portfolio website"}
+{"ts": "2026-04-26T13:40:08.555918", "event": "planner_route", "input": "create portfolio website", "needs_execution": true}
+{"ts": "2026-04-26T13:40:08.558692", "event": "dispatcher_call", "tool": "list_files", "args": "{}"}
+{"ts": "2026-04-26T13:40:08.560153", "event": "tool_call", "tool": "list_files", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:40:08.560461", "event": "dispatcher_call", "tool": "search_codebase", "args": "{'query': 'create portfolio website'}"}
+{"ts": "2026-04-26T13:40:08.561714", "event": "tool_result", "tool": "list_files", "count": 0, "status": "ok"}
+{"ts": "2026-04-26T13:40:08.561841", "event": "tool_call", "tool": "search_codebase", "query": "create portfolio website"}
+{"ts": "2026-04-26T13:40:08.563094", "event": "dispatcher_ok", "tool": "list_files", "status": "ok", "output_len": 0}
+{"ts": "2026-04-26T13:40:08.707147", "event": "tool_result", "tool": "search_codebase", "chunks": 5, "status": "ok"}
+{"ts": "2026-04-26T13:40:08.707975", "event": "dispatcher_ok", "tool": "search_codebase", "status": "ok", "output_len": 2881}
+{"ts": "2026-04-26T13:40:08.710958", "event": "dispatcher_result", "tools": ["list_files", "search_codebase"], "overall": "success"}
+{"ts": "2026-04-26T13:40:08.711964", "event": "agent_context_ready", "context_len": 633}
+{"ts": "2026-04-26T13:41:59.494564", "event": "registry_register", "tool": "create_file", "type": "local"}
+{"ts": "2026-04-26T13:41:59.496090", "event": "registry_register", "tool": "read_file", "type": "local"}
+{"ts": "2026-04-26T13:41:59.497150", "event": "registry_register", "tool": "write_file", "type": "local"}
+{"ts": "2026-04-26T13:41:59.502514", "event": "registry_register", "tool": "edit_file", "type": "local"}
+{"ts": "2026-04-26T13:41:59.503783", "event": "registry_register", "tool": "list_files", "type": "local"}
+{"ts": "2026-04-26T13:41:59.505486", "event": "registry_register", "tool": "create_directory", "type": "local"}
+{"ts": "2026-04-26T13:41:59.506656", "event": "registry_register", "tool": "run_command", "type": "local"}
+{"ts": "2026-04-26T13:41:59.507814", "event": "registry_register", "tool": "search_codebase", "type": "local"}
+{"ts": "2026-04-26T13:42:07.213797", "event": "mcp_server_crash", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:42:07.230692", "event": "mcp_server_crash", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:42:09.274779", "event": "mcp_server_crash", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:42:13.519208", "event": "mcp_server_crash", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:42:28.028668", "event": "mcp_load", "server": "filesystem", "tools": 14}
+{"ts": "2026-04-26T13:42:28.044508", "event": "mcp_load_error", "server": "sqlite", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:42:28.049992", "event": "mcp_load_error", "server": "git", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:42:31.497083", "event": "mcp_load", "server": "memory", "tools": 9}
+{"ts": "2026-04-26T13:42:32.164572", "event": "mcp_load", "server": "sequential-thinking", "tools": 1}
+{"ts": "2026-04-26T13:42:32.173208", "event": "mcp_load", "server": "github", "tools": 26}
+{"ts": "2026-04-26T13:42:32.179960", "event": "mcp_load_error", "server": "fetch", "error": "[WinError 2] The system cannot find the file specified"}
+{"ts": "2026-04-26T13:42:32.959272", "event": "mcp_load", "server": "playwright", "tools": 21}
+{"ts": "2026-04-26T13:42:32.963703", "event": "mcp_load_error", "server": "stitch", "error": "unhandled errors in a TaskGroup (1 sub-exception)"}
+{"ts": "2026-04-26T13:42:32.964901", "event": "registry_register", "tool": "read_file", "type": "mcp"}
+{"ts": "2026-04-26T13:42:32.966003", "event": "registry_register", "tool": "write_file", "type": "mcp"}
+{"ts": "2026-04-26T13:42:32.967000", "event": "registry_register", "tool": "create_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:42:32.967784", "event": "registry_register", "tool": "list_directory", "type": "mcp"}
+{"ts": "2026-04-26T13:42:32.968887", "event": "registry_register", "tool": "create_entities", "type": "mcp"}
+{"ts": "2026-04-26T13:42:32.970203", "event": "registry_register", "tool": "search_nodes", "type": "mcp"}
+{"ts": "2026-04-26T13:42:32.971256", "event": "mcp_tools_loaded", "count": 6, "mode": "local"}
+{"ts": "2026-04-26T13:42:32.975660", "event": "registry_loaded", "local": 8, "mcp": 6, "total": 11}
+{"ts": "2026-04-26T13:42:32.978707", "event": "agent_created", "tools": 11, "mode": "local"}
+{"ts": "2026-04-26T13:42:46.593128", "event": "working_dir_changed", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:43:01.903723", "event": "tool_call", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\simple.html", "length": 1027}
+{"ts": "2026-04-26T13:43:06.009703", "event": "tool_result", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\simple.html", "status": "ok"}
+{"ts": "2026-04-26T13:43:06.011215", "event": "tool_call", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\styles.css", "length": 165}
+{"ts": "2026-04-26T13:43:09.141393", "event": "tool_result", "tool": "write_file", "path": "D:\\Abhey\\codi\\CODI\\shubham\\styles.css", "status": "ok"}
+{"ts": "2026-04-26T13:43:09.147933", "event": "agent_start", "input": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfolio website in html", "mode": "local"}
+{"ts": "2026-04-26T13:43:09.149185", "event": "agent_start", "input": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfo"}
+{"ts": "2026-04-26T13:43:09.150144", "event": "planner_route", "input": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to ", "needs_execution": true}
+{"ts": "2026-04-26T13:43:09.155543", "event": "dispatcher_call", "tool": "list_files", "args": "{}"}
+{"ts": "2026-04-26T13:43:09.157030", "event": "tool_call", "tool": "list_files", "path": "D:\\Abhey\\codi\\CODI\\shubham"}
+{"ts": "2026-04-26T13:43:09.158151", "event": "dispatcher_call", "tool": "search_codebase", "args": "{'query': '[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfolio website in html'}"}
+{"ts": "2026-04-26T13:43:09.159006", "event": "tool_result", "tool": "list_files", "count": 2, "status": "ok"}
+{"ts": "2026-04-26T13:43:09.159866", "event": "dispatcher_ok", "tool": "list_files", "status": "ok", "output_len": 76}
+{"ts": "2026-04-26T13:43:09.160334", "event": "tool_call", "tool": "search_codebase", "query": "[BOILERPLATE CREATED: simple.html, styles.css] Now edit these existing files to add the requested content: create portfolio website in html"}
+{"ts": "2026-04-26T13:43:09.318222", "event": "tool_result", "tool": "search_codebase", "chunks": 5, "status": "ok"}
+{"ts": "2026-04-26T13:43:09.319421", "event": "dispatcher_ok", "tool": "search_codebase", "status": "ok", "output_len": 2881}
+{"ts": "2026-04-26T13:43:09.325385", "event": "dispatcher_result", "tools": ["list_files", "search_codebase"], "overall": "success"}
+{"ts": "2026-04-26T13:43:09.326519", "event": "agent_context_ready", "context_len": 709}

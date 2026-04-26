@@ -120,11 +120,13 @@ class Dispatcher:
 
         try:
             output = handler(args)
-            log("dispatcher_ok", {"tool": name, "output_len": len(str(output))})
+            output_text = str(output)
+            status = "error" if output_text.startswith(("ERROR", "WRITE REJECTED", "BLOCKED")) else "ok"
+            log("dispatcher_ok", {"tool": name, "status": status, "output_len": len(output_text)})
             return {
                 "tool":   name,
-                "status": "ok",
-                "output": str(output),
+                "status": status,
+                "output": output_text,
             }
         except Exception as e:
             log("dispatcher_error", {"tool": name, "error": str(e)})

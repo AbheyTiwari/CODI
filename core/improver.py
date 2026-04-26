@@ -12,6 +12,7 @@
 # It never calls tools directly. It outputs JSON or plain text.
 # ─────────────────────────────────────────────────────────────────────────────
 
+import json
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -52,19 +53,48 @@ Respond ONLY with JSON in this exact format:
   ]
 }}
 Maximum 5 steps. Be concrete. Name the actual tools you will use.
+
+IMPORTANT PLANNING RULES:
+1. If the task mentions [BOILERPLATE CREATED: ...], the boilerplate files ALREADY EXIST.
+   DO NOT plan to create them again. Instead, plan EDIT steps to enrich them with content.
+   Example: If "[BOILERPLATE CREATED: index.html, styles.css]" is in the task,
+     Step 1: "Edit index.html to add portfolio sections: hero, projects, skills, contact"
+     Step 2: "Edit styles.css to add styling for portfolio sections"
+   NOT: "Create index.html" — it already exists!
+
+2. For HTML/CSS/JS file creation tasks where NO boilerplate was created yet, use a TWO-STEP approach:
+   - Step 1: Create a minimal boilerplate file (e.g., basic HTML structure with empty body)
+   - Step 2: Edit the file to add the actual content, sections, and features
+
+3. For each step, include SPECIFIC details about:
+   - What content/features should be in the file
+   - How it differs from similar files
+   - Key sections, components, or functionalities required
+   
+Example for portfolio (when no boilerplate exists): 
+  Step 1: "Create portfolio.html with basic HTML5 boilerplate structure"
+  Step 2: "Edit portfolio.html to add portfolio sections: header, projects showcase, skills, contact form"
+NOT just: "Create portfolio.html"
 """
 
 _NEXT_STEP_PROMPT = """\
 Task: {task}
 Plan: {plan}
+
+Full plan steps:
+{plan_steps}
+
 Completed steps so far: {done_steps}
 Tool results so far:
 {tool_results}
 
 What is the next step to execute?
+Choose the first uncompleted plan step from "Full plan steps" above.
+Do not skip file creation/editing steps before viewing or validating files.
+IMPORTANT: Copy the exact step text from "Full plan steps" (with all specific content/feature details) as your response.
 Respond ONLY with JSON:
 {{
-  "step": "description of what to do next",
+  "step": "exact step text from 'Full plan steps' above (with all specific details)",
   "done": false
 }}
 
@@ -97,6 +127,17 @@ Summarize what was done in 2-3 sentences. Be direct and specific.
 Name the files created or changed. Do not add caveats or suggestions.
 Respond with plain text (not JSON). This is the final user-facing output.
 """
+
+
+def _as_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=True)
+    except TypeError:
+        return str(value)
 
 
 class Improver:
@@ -160,9 +201,14 @@ class Improver:
         state.record_llm("improver_plan_raw", raw)
 
         parsed = Dispatcher.parse_llm_json(raw)
-        if parsed and "steps" in parsed:
-            state.plan       = parsed.get("plan", "")
-            state.plan_steps = parsed.get("steps", [])
+        if isinstance(parsed, dict) and "steps" in parsed:
+            state.plan = _as_text(parsed.get("plan", ""))
+            raw_steps = parsed.get("steps", [])
+            if isinstance(raw_steps, list):
+                state.plan_steps = [_as_text(step) for step in raw_steps if _as_text(step)]
+            else:
+                step = _as_text(raw_steps)
+                state.plan_steps = [step] if step else []
             log("improver_plan", {"steps": len(state.plan_steps), "plan": state.plan})
             return parsed
 
@@ -179,10 +225,11 @@ class Improver:
         Given current state, return {"step": str, "done": bool}.
         """
         from dispatcher import Dispatcher
-        done_count = state.iteration
+        done_count = max(0, state.iteration - 1)
         prompt = _NEXT_STEP_PROMPT.format(
             task=state.user_input,
             plan=state.plan,
+            plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
             done_steps=f"{done_count} of {len(state.plan_steps)}",
             tool_results="\n".join(state.recent_tool_outputs(5)),
         )
@@ -190,11 +237,16 @@ class Improver:
         state.record_llm("improver_next_step", raw)
 
         parsed = Dispatcher.parse_llm_json(raw)
+        if isinstance(parsed, dict):
+            return {
+                "step": _as_text(parsed.get("step", "")),
+                "done": bool(parsed.get("done", False)),
+            }
         if parsed:
-            return parsed
+            return {"step": _as_text(parsed), "done": False}
 
         # If JSON parse fails, assume not done
-        return {"step": raw, "done": False}
+        return {"step": _as_text(raw), "done": False}
 
     # ── Phase 4: Improvement after validation failure ─────────────────────────
 
@@ -212,9 +264,11 @@ class Improver:
         state.record_llm("improver_improve", raw)
 
         parsed = Dispatcher.parse_llm_json(raw)
+        if isinstance(parsed, dict):
+            return _as_text(parsed.get("correction", raw))
         if parsed:
-            return parsed.get("correction", raw)
-        return raw
+            return _as_text(parsed)
+        return _as_text(raw)
 
     # ── Phase 5: Final output ─────────────────────────────────────────────────
 

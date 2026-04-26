@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simple</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: Arial, sans-serif;
+      background: #f4f6f8;
+      color: #1f2937;
+    }
+
+    main {
+      width: min(680px, calc(100% - 32px));
+      padding: 32px;
+      border: 1px solid #d8dee6;
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    button {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 6px;
+      background: #2563eb;
+      color: white;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Simple</h1>
+    <p>This is a simple starter HTML file created by Codi.</p>
+    <button id="actionButton">Click me</button>
+  </main>
+
+  <script>
+    document.getElementById('actionButton').addEventListener('click', () => {
+      alert('Hello from Codi!');
+    });
+  </script>
+</body>
+</html>

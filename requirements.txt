@@ -18,3 +18,5 @@ prompt_toolkit
 mcp
 python-dotenv
 pydantic
+numpy
+pybind11>=2.6.0
