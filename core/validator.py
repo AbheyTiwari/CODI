@@ -78,10 +78,17 @@ class Validator:
         Returns an error string if something is deterministically wrong.
         Returns empty string if all checks pass.
         """
-        for result in state.tool_results:
-            # Syntax rejection from write_file
+        for result in reversed(state.tool_results):
+            if result.tool in ("create_file", "write_file", "edit_file") and result.status == "ok":
+                return ""
+            # Executor failures mean no requested write/read action happened.
+            if result.tool in ("coder", "dispatcher") and result.status == "error":
+                return result.output[:200]
+            # Syntax rejection from write/edit tools.
             if "WRITE REJECTED" in result.output and "SyntaxError" in result.output:
                 return f"Syntax error in written file: {result.output[:200]}"
+            if result.tool in ("create_file", "write_file", "edit_file") and result.output.startswith("ERROR"):
+                return result.output[:200]
             # Tool not found
             if result.output.startswith("Tool not found:"):
                 return result.output

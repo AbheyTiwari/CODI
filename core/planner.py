@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_factory import get_refiner_llm
 from logger import log
+from core.quick_actions import is_direct_file_request
 from state.temp_db import RunState
 
 
@@ -83,6 +84,9 @@ class Planner:
         Short or non-action inputs are returned as-is.
         """
         text = raw_input.strip()
+        if is_direct_file_request(text):
+            return text
+
         if len(text) < 50:
             return text
 

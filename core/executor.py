@@ -28,6 +28,23 @@ RULES:
 - Use ONLY tools from the provided list.
 - Working directory: {working_dir}
 - Do not invent tool names.
+- The top-level action must be "tool_call" or "noop". Never output custom actions.
+- For write_file with multi-line files such as HTML, CSS, or JS, prefer:
+  {{"path": "index.html", "content_lines": ["<!doctype html>", "<html>", "..."]}}
+- Use create_file or write_file for new files. For targeted changes, use edit_file:
+  {{"path": "file.txt", "old": "existing text", "new": "replacement"}}
+  or {{"path": "file.txt", "append": "text to add"}}
+- When creating HTML files, READ THE STEP DESCRIPTION CAREFULLY.
+  Create content that EXACTLY MATCHES the requirements in the step.
+  DO NOT use generic boilerplate for different types of files.
+  Example: If step says "Create portfolio with projects showcase and skills",
+           Create diverse sections (projects, skills, experience) — NOT just a generic template.
+  Example: If step says "Create simple starter page", create a basic template.
+  Different files must have meaningfully different content.
+- Do not put raw file content outside the JSON action bundle.
+- Do not open a browser unless the user explicitly asks you to. Creating a file is enough for create/write tasks.
+- IMPORTANT: If the step says to create a boilerplate or basic structure, use write_file with minimal content.
+- IMPORTANT: If the step says to edit or add content to an existing file, use edit_file with old/new or append.
 
 Output format:
 {{
@@ -53,7 +70,33 @@ Available tools:
 Previous tool results (for context):
 {context}
 
+CRITICAL: This step contains SPECIFIC CONTENT REQUIREMENTS.
+- Read the step description carefully and identify what makes this output unique.
+- DO NOT reuse content from previous files.
+- Create content that EXACTLY MATCHES the step requirements.
+- If the step says to create a portfolio, include portfolio-specific content.
+- If the step says to create a simple page, create simple content.
+- Look at previous results if similar files were created — make this one different.
+- IMPORTANT: If this step says to EDIT or ADD content to an existing file, use edit_file with old/new or append.
+- IMPORTANT: If this step says to CREATE a boilerplate or basic structure, use write_file with minimal content.
+
 Output the JSON action bundle now.
+"""
+
+_REPAIR_PROMPT = """\
+Your previous response was not valid JSON, so no tool could run.
+
+Original step:
+{step}
+
+Available tools:
+{tools}
+
+Invalid response:
+{raw}
+
+Return the corrected JSON action bundle only.
+If using write_file for multi-line content, put the file body in content_lines as a JSON array of strings.
 """
 
 
@@ -68,6 +111,23 @@ class Executor:
             working_dir=os.environ.get("CODI_WORKING_DIR", os.getcwd())
         ))
 
+    def _repair_action_bundle(self, step: str, raw: str, state: RunState) -> dict | None:
+        prompt = _REPAIR_PROMPT.format(
+            step=step,
+            tools=self.registry.summary(),
+            raw=raw[:4000],
+        )
+        try:
+            resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
+            repaired = resp.content.strip()
+        except Exception as e:
+            log("executor_repair_error", {"step": step[:100], "error": str(e)})
+            return None
+
+        state.record_llm("coder_repair", repaired)
+        log("executor_repair_raw", {"step": step[:80], "raw": repaired[:300]})
+        return Dispatcher.parse_llm_json(repaired)
+
     def execute_step(self, step: str, state: RunState) -> dict:
         """
         Given a step description, ask the Coder LLM to produce an action bundle,
@@ -76,7 +136,7 @@ class Executor:
         prompt = _STEP_PROMPT.format(
             step=step,
             tools=self.registry.summary(),
-            context="\n".join(state.recent_tool_outputs(3)) or "(none yet)",
+            context="\n".join(state.recent_tool_outputs(8)) or "(none yet)",
         )
 
         # ── Ask Coder LLM for JSON action bundle ──────────────────────────────
@@ -84,11 +144,13 @@ class Executor:
             resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
             raw  = resp.content.strip()
         except Exception as e:
+            error = f"Coder LLM error: {e}"
             log("executor_llm_error", {"step": step[:100], "error": str(e)})
+            state.add_tool_result("coder", "error", error)
             return {
                 "status": "error",
-                "results": [],
-                "error": f"Coder LLM error: {e}",
+                "results": [{"tool": "coder", "status": "error", "output": error}],
+                "error": error,
             }
 
         state.record_llm("coder", raw)
@@ -96,21 +158,28 @@ class Executor:
 
         # ── Parse JSON ────────────────────────────────────────────────────────
         action_bundle = Dispatcher.parse_llm_json(raw)
+        if action_bundle is None:
+            action_bundle = self._repair_action_bundle(step, raw, state)
 
         if action_bundle is None:
+            error = f"Coder output was not valid JSON: {raw[:200]}"
             log("executor_parse_fail", {"raw": raw[:200]})
-            # Try to salvage: if the raw text mentions a known tool, build noop
+            state.add_tool_result("coder", "error", error)
             return {
                 "status":  "error",
-                "results": [],
-                "error":   f"Coder output was not valid JSON: {raw[:200]}",
+                "results": [{"tool": "coder", "status": "error", "output": error}],
+                "error":   error,
             }
 
         # ── Dispatch ──────────────────────────────────────────────────────────
         dispatch_result = self.dispatcher.dispatch(action_bundle)
 
         # ── Store results in state ─────────────────────────────────────────────
-        for r in dispatch_result.get("results", []):
+        results = dispatch_result.get("results", [])
+        if not results and dispatch_result.get("status") == "error":
+            state.add_tool_result("dispatcher", "error", dispatch_result.get("error", "Dispatcher returned no results."))
+
+        for r in results:
             state.add_tool_result(r["tool"], r["status"], r["output"])
 
         return dispatch_result
