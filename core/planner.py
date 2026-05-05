@@ -1,7 +1,7 @@
 # core/planner.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Decides whether a task needs full execution or a direct answer.
-# Builds the plan via the Improver.
+# Decides whether a task needs full agent execution or a direct Q&A answer.
+# Input refinement lives here too (called from main.py before agent.invoke).
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_factory import get_refiner_llm
 from logger import log
+from core.quick_actions import is_direct_file_request
 from state.temp_db import RunState
 
 
@@ -32,6 +33,10 @@ ACTION_TRIGGERS = (
 
 
 def is_simple_input(text: str) -> bool:
+    """
+    True when the input is clearly a Q&A question that needs no tool execution.
+    Returns False (i.e. needs execution) if any action trigger word is found.
+    """
     t = text.lower().strip()
     if any(w in t for w in ACTION_TRIGGERS):
         return False
@@ -61,10 +66,7 @@ class Planner:
         return result
 
     def direct_answer(self, state: RunState) -> str:
-        """
-        For simple Q&A that doesn't need tools.
-        Returns a plain text answer.
-        """
+        """For simple Q&A that doesn't need tools. Returns plain text answer."""
         try:
             resp = self.llm.invoke([
                 SystemMessage(content=self._system_prompt()),
@@ -79,10 +81,15 @@ class Planner:
 
     def refine_input(self, raw_input: str) -> str:
         """
-        Optionally refine/clarify the user input before planning.
-        Short or non-action inputs are returned as-is.
+        Optionally rewrite the user input as a crisp 1-2 sentence instruction.
+        Short inputs, questions, and direct file requests are returned unchanged.
         """
         text = raw_input.strip()
+
+        # Never refine direct file requests — they're already precise
+        if is_direct_file_request(text):
+            return text
+
         if len(text) < 50:
             return text
 
@@ -99,9 +106,9 @@ class Planner:
             f"Task: {text}\nInstruction:"
         )
         try:
-            resp = self.llm.invoke([HumanMessage(content=prompt)])
+            resp    = self.llm.invoke([HumanMessage(content=prompt)])
             refined = resp.content.strip()
-            # Discard if the refiner bloated the prompt
+            # Discard if refiner bloated the prompt or returned garbage
             if len(refined) > len(text) * 2 or len(refined) < 10:
                 return text
             return refined

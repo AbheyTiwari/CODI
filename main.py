@@ -3,6 +3,7 @@ import os
 import time
 import hashlib
 import threading
+import re
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +41,6 @@ from logger import log
 from context_trimmer import trim_context_for_llm, estimate_tokens
 import config
 
-# Replaces the old refiner.py — refine_prompt now lives in Planner
 _planner_instance = None
 def refine_prompt(text: str) -> str:
     global _planner_instance
@@ -89,30 +89,78 @@ def startup_sequence():
     for label in ["Vector DB", "Cognitive Refiner", "MCP Servers", "Agent Graph"]:
         with console.status(Text(f"  loading {label}...", style="dim"),
                             spinner="dots", spinner_style=t["accent"]):
-            time.sleep(0.2)
+            time.sleep(0.05)
         console.print(Text(f"  ✓  {label}", style=t["accent"]))
     console.print()
 
 # ── Auto-index ────────────────────────────────────────────────────────────────
-def _auto_index():
+def _auto_index(target_dir: str = None):
+    """Index target_dir (defaults to current CODI_WORKING_DIR)."""
+    index_dir = target_dir or os.environ.get("CODI_WORKING_DIR", _LAUNCH_DIR)
+    chroma    = os.environ.get("CODI_CHROMA_DIR", _chroma_dir)
+
     skip = {'.git','node_modules','__pycache__','venv','dist',
             'build','.idea','chroma_db','.mypy_cache','.pytest_cache'}
     count = 0
-    for root, dirs, files in os.walk(_LAUNCH_DIR):
+    for root, dirs, files in os.walk(index_dir):
         dirs[:] = [d for d in dirs if d not in skip and not d.startswith('.')]
         count += len(files)
         if count > 5000:
             console.print(Text("  ⚠  >5000 files — skipping auto-index. Run /index . manually.", style="yellow"))
             return
     t = _t()
-    with console.status(Text(f"  indexing {os.path.basename(_LAUNCH_DIR)}/...", style="dim"),
+    with console.status(Text(f"  indexing {os.path.basename(index_dir)}/...", style="dim"),
                         spinner="dots", spinner_style=t["accent"]):
         try:
-            index_codebase(_LAUNCH_DIR, db_path=_chroma_dir)
+            index_codebase(index_dir, db_path=chroma)
         except Exception as e:
             console.print(Text(f"  ⚠  index warning: {e}", style="yellow"))
-    console.print(Text(f"  ✓  indexed {os.path.basename(_LAUNCH_DIR)}/", style=t["accent"]))
+    console.print(Text(f"  ✓  indexed {os.path.basename(index_dir)}/", style=t["accent"]))
     console.print()
+
+def _auto_index_background(target_dir: str = None):
+    thread = threading.Thread(target=_auto_index, args=(target_dir,), daemon=True)
+    thread.start()
+    return thread
+
+# ── Fast path: simple commands bypass agent loop ──────────────────────────────
+_READ_FILE_RE = re.compile(
+    r"(?:read|show|open|display|cat|view)\s+(?:me\s+)?(?:the\s+)?(?:file\s+)?['\"`]?(.+?\.\w+)['\"`]?",
+    re.IGNORECASE
+)
+_LIST_FILES_RE = re.compile(
+    r"(?:list|show|ls|dir)\s+(?:all\s+)?(?:files|directories|folders)?(?:\s+in\s+)?(.+)?",
+    re.IGNORECASE
+)
+_COMPOUND_ACTION_RE = re.compile(
+    r"\b(?:and|then|also)\b.+\b(?:update|edit|change|modify|fix|improve|make|create|write|build|add|refactor)\b",
+    re.IGNORECASE
+)
+
+def _try_fast_path(user_input: str) -> str | None:
+    from tools.local.file_tools import read_file, list_files
+
+    if _COMPOUND_ACTION_RE.search(user_input):
+        return None
+
+    read_match = _READ_FILE_RE.search(user_input)
+    if read_match:
+        path = read_match.group(1).strip()
+        return read_file({"path": path})
+
+    list_match = _LIST_FILES_RE.search(user_input)
+    if list_match and (
+        "files" in user_input.lower() or
+        "ls" in user_input.lower() or
+        "dir" in user_input.lower() or
+        "list" in user_input.lower()
+    ):
+        dir_path = (list_match.group(1) or ".").strip()
+        if not dir_path or dir_path == ".":
+            return list_files({"path": "."})
+        return list_files({"path": dir_path})
+
+    return None
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 def print_help():
@@ -121,14 +169,16 @@ def print_help():
     table.add_column(style=t["accent"], no_wrap=True, min_width=20)
     table.add_column(style="dim")
     for cmd, desc in [
-        ("/index [path]",   "re-index directory (default: current project)"),
+        ("/index [path]",   "index a directory and set it as working dir"),
         ("/mode",           "show current mode"),
-        ("/mode <name>", "switch mode: local | hybrid | cloud | air"),
+        ("/mode <name>",    "switch mode: local | hybrid | cloud | air"),
         ("/mcp",            "list MCP servers"),
         ("/mcp on <name>",  "enable MCP server (restart to apply)"),
         ("/mcp off <name>", "disable MCP server (restart to apply)"),
         ("/tools",          "list all loaded tools"),
         ("/logs",           "live telemetry dashboard"),
+        ("cd <path>",       "change Codi's project directory"),
+        ("pwd",             "show Codi's current project directory"),
         ("/clear",          "wipe session memory"),
         ("/history",        "print conversation history"),
         ("/help",           "show this message"),
@@ -213,6 +263,40 @@ def _mcp_toggle(name: str, enabled: bool):
     except Exception as e:
         console.print(Text(f"  error: {e}", style="red"))
 
+def _resolve_user_path(raw_path: str) -> str:
+    current = os.environ.get("CODI_WORKING_DIR", _LAUNCH_DIR)
+    raw_path = (raw_path or "~").strip().strip('"').strip("'")
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(current, expanded)
+    target = os.path.abspath(expanded)
+    if not os.path.isdir(target) and raw_path.startswith(("~/", "~\\")):
+        local_target = os.path.abspath(os.path.join(current, raw_path[2:]))
+        if os.path.isdir(local_target):
+            return local_target
+    return target
+
+def _change_working_dir(raw_path: str):
+    """cd command — changes working dir AND re-indexes."""
+    global _LAUNCH_DIR, _path_hash, _chroma_dir
+    target = _resolve_user_path(raw_path)
+    if not os.path.isdir(target):
+        console.print(Text(f"  directory not found: {target}", style="red"))
+        return
+    _set_working_dir(target)
+    _auto_index(target)
+
+def _set_working_dir(target: str):
+    """Central function — always call this when changing the active project dir."""
+    global _LAUNCH_DIR, _path_hash, _chroma_dir
+    _LAUNCH_DIR  = target
+    _path_hash   = hashlib.md5(target.encode()).hexdigest()[:10]
+    _chroma_dir  = os.path.join(_REPO_ROOT, "chroma_db", _path_hash)
+    os.environ["CODI_WORKING_DIR"] = target
+    os.environ["CODI_CHROMA_DIR"]  = _chroma_dir
+    log("working_dir_changed", {"path": target})
+    console.print(Text(f"  cwd → {target}", style=_t()["accent"]))
+
 def get_trimmed_history() -> str:
     full = session_memory.as_text()
     return trim_context_for_llm(
@@ -224,11 +308,12 @@ def _pt_style():
     c = colours.get(config.MODE, "#00ccff")
     return PTStyle.from_dict({"prompt": f"fg:{c} bold", "": "fg:#cccccc"})
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print_banner()
     startup_sequence()
-    _auto_index()
+    _auto_index_background()
 
     with console.status(Text("  initialising agent...", style="dim"), spinner="dots"):
         agent_executor = create_agent()
@@ -253,9 +338,7 @@ def main():
         if not user_input:
             continue
 
-        # ── Guard: only block obviously pasted terminal output ────────────────
-        # Note: bare URLs are NOT blocked — users should be able to say
-        # "check this repo https://github.com/..." in their message
+        # Guard against obviously pasted terminal output
         if (
             user_input.startswith(">>")
             or user_input.startswith("Graph execution failed")
@@ -275,6 +358,13 @@ def main():
         elif cmd == "/help":
             print_help()
 
+        elif cmd in ("pwd", "/pwd"):
+            console.print(Text(f"  {os.environ.get('CODI_WORKING_DIR', _LAUNCH_DIR)}", style=t["accent"]))
+
+        elif cmd == "cd" or cmd.startswith("cd ") or cmd == "/cd" or cmd.startswith("/cd "):
+            parts = user_input.split(maxsplit=1)
+            _change_working_dir(parts[1] if len(parts) > 1 else "~")
+
         elif cmd == "/clear":
             session_memory.clear()
             console.print(Text("  ✓  session memory cleared", style=t["accent"]))
@@ -285,11 +375,25 @@ def main():
                                 border_style=t["dim"]))
 
         elif cmd.startswith("/index"):
-            parts = user_input.split(maxsplit=1)
-            path  = os.path.abspath(parts[1].strip() if len(parts) > 1 else _LAUNCH_DIR)
-            with console.status(Text(f"  indexing {path}...", style="dim"), spinner="dots"):
-                index_codebase(path)
-            console.print(Text(f"  ✓  indexed {path}", style=t["accent"]))
+            # /index [path]
+            # Sets the given path as the new working directory AND indexes it.
+            # If no path given, re-indexes the current working directory.
+            parts     = user_input.split(maxsplit=1)
+            raw_path  = parts[1].strip() if len(parts) > 1 else None
+            if raw_path:
+                target = os.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
+            else:
+                target = os.environ.get("CODI_WORKING_DIR", _LAUNCH_DIR)
+
+            if not os.path.isdir(target):
+                console.print(Text(f"  directory not found: {target}", style="red"))
+            else:
+                # Always update working dir when /index is given a path
+                if raw_path:
+                    _set_working_dir(target)
+                with console.status(Text(f"  indexing {target}...", style="dim"), spinner="dots"):
+                    index_codebase(target, db_path=os.environ["CODI_CHROMA_DIR"])
+                console.print(Text(f"  ✓  indexed {target}", style=t["accent"]))
 
         elif cmd == "/mode":
             rows = [
@@ -353,9 +457,21 @@ def main():
 
         # ── Natural language ──────────────────────────────────────────────────
         else:
-            refined = refine_prompt(user_input)
-            if refined != user_input:
-                console.print(Text(f"  → {refined}", style="dim"))
+            # Fast path for simple read/list commands — no LLM needed
+            fast_result = _try_fast_path(user_input)
+            if fast_result is not None:
+                console.print(Panel(Markdown(fast_result), border_style=t["dim"], padding=(0,2)))
+                session_memory.add("user", user_input)
+                session_memory.add("assistant", fast_result)
+                continue
+
+            # Only refine action-oriented longer inputs — skip for short/simple
+            if len(user_input) > 60:
+                refined = refine_prompt(user_input)
+                if refined != user_input:
+                    console.print(Text(f"  → {refined}", style="dim"))
+            else:
+                refined = user_input
 
             session_memory.add("user", refined)
             renderer = LiveRenderer(refined)

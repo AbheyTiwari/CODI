@@ -11,7 +11,8 @@
   },
 
   "sqlite": {
-    "enabled": true,
+    "enabled": false,
+    "description": "SQLite database queries (disabled: package not found on npm)",
     "command": "npx",
     "args": [
       "-y",
@@ -22,7 +23,8 @@
   },
 
   "git": {
-    "enabled": true,
+    "enabled": false,
+    "description": "Git operations (disabled: requires a valid git repository)",
     "command": "uvx",
     "args": [
       "mcp-server-git",
@@ -212,8 +214,8 @@
     ]
   },
   "stitch": {
-    "enabled": true,
-    "description": "Google Stitch \u2014 UI/UX code via HTTP MCP",
+    "enabled": false,
+    "description": "Google Stitch — UI/UX code via HTTP MCP (disabled: needs STITCH_API_KEY)",
     "type": "http",
     "url": "https://stitch.googleapis.com/mcp",
     "headers": {

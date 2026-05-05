@@ -13,9 +13,12 @@
 #   output = improver.summarize(state)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import traceback
+
 from core.executor  import Executor
 from core.improver  import Improver
 from core.planner   import Planner
+from core.quick_actions import try_fast_file_task
 from core.validator import Validator
 from logger         import log
 from state.temp_db  import RunState
@@ -48,7 +51,7 @@ class CodiAgent:
         try:
             output = self._run(state)
         except Exception as e:
-            log("agent_crash", {"error": str(e)})
+            log("agent_crash", {"error": str(e), "traceback": traceback.format_exc()[:4000]})
             output = f"Agent error: {e}"
 
         log("agent_end", {"output": output[:120], "iterations": state.iteration})
@@ -67,6 +70,12 @@ class CodiAgent:
             log("agent_direct", {"input": state.user_input[:80]})
             state.status = "complete"
             return self.planner.direct_answer(state)
+
+        fast_output = try_fast_file_task(state.user_input, self.registry, state)
+        if fast_output:
+            log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
+            state.status = "complete"
+            return fast_output
 
         # ── Phase 1: Read context ──────────────────────────────────────────────
         context = self.improver.read_context(state)
@@ -90,8 +99,10 @@ class CodiAgent:
 
             # Improver decides what to do next
             next_decision = self.improver.next_step(state)
-            step = next_decision.get("step", "")
-            done = next_decision.get("done", False)
+            if not isinstance(next_decision, dict):
+                next_decision = {"step": str(next_decision), "done": False}
+            step = str(next_decision.get("step", "") or "")
+            done = bool(next_decision.get("done", False))
 
             if done or not step:
                 log("agent_improver_done", {"iteration": state.iteration})
@@ -112,7 +123,7 @@ class CodiAgent:
 
             # Validation failed — ask Improver to correct
             if not state.validation_passed and state.iteration < state.max_iterations:
-                correction = self.improver.improve(state)
+                correction = str(self.improver.improve(state))
                 log("agent_correction", {"correction": correction[:100]})
                 # Inject correction as next step context
                 state.plan = f"{state.plan}\n[CORRECTION]: {correction}"

@@ -3,6 +3,7 @@ import sys
 import subprocess
 import ast
 import traceback
+import hashlib
 from langchain_core.tools import tool, StructuredTool
 from pydantic import BaseModel
 from indexer import get_vectorstore
@@ -10,6 +11,18 @@ from logger import log
 from context_trimmer import trim_tool_output
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# ── Search cache for repeated queries (in-memory, session-scoped)
+_search_cache = {}
+_search_cache_stats = {"hits": 0, "misses": 0}
+
+# ── File read cache (path -> (mtime, size, content)) ─────────────────────────
+_file_read_cache = {}
+_file_read_cache_hits = 0
+
+# ── Directory listing cache (path -> (mtime, listing)) ───────────────────────
+_dir_list_cache = {}
+_dir_list_cache_hits = 0
 
 class WriteFileInput(BaseModel):
     path: str
@@ -77,13 +90,35 @@ run_command = StructuredTool.from_function(
 @tool
 def read_file(path: str) -> str:
     """Read a file. Relative paths resolve from the user's project directory."""
+    global _file_read_cache, _file_read_cache_hits
     if not os.path.isabs(path):
         path = os.path.join(_working_dir(), path)
+    
+    # Check cache using mtime + size for invalidation
+    try:
+        stat = os.stat(path)
+        cache_key = (path, stat.st_mtime, stat.st_size)
+        if cache_key in _file_read_cache:
+            _file_read_cache_hits += 1
+            log("tool_cache_hit", {"tool": "read_file", "path": path, "hits": _file_read_cache_hits})
+            return _file_read_cache[cache_key]
+    except Exception:
+        pass
+    
     log("tool_call", {"tool": "read_file", "input": path})
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
         trimmed = trim_tool_output(content, max_tokens=800)
+        
+        # Store in cache
+        try:
+            stat = os.stat(path)
+            cache_key = (path, stat.st_mtime, stat.st_size)
+            _file_read_cache[cache_key] = trimmed
+        except Exception:
+            pass
+        
         log("tool_result", {"tool": "read_file", "path": path, "length": len(content), "status": "ok"})
         return trimmed
     except Exception as e:
@@ -122,11 +157,24 @@ def list_files(dir_path: str = ".") -> str:
     Defaults to the user's current project directory if no path given.
     Pass '.' or leave empty to list the project root.
     """
+    global _dir_list_cache, _dir_list_cache_hits
+    
     # Resolve relative paths from working dir, not the repo root
     if dir_path in (".", "", None):
         dir_path = _working_dir()
     elif not os.path.isabs(dir_path):
         dir_path = os.path.join(_working_dir(), dir_path)
+
+    # Check cache using directory mtime for invalidation
+    try:
+        dir_mtime = os.stat(dir_path).st_mtime
+        cache_key = (dir_path, dir_mtime)
+        if cache_key in _dir_list_cache:
+            _dir_list_cache_hits += 1
+            log("tool_cache_hit", {"tool": "list_files", "path": dir_path, "hits": _dir_list_cache_hits})
+            return _dir_list_cache[cache_key]
+    except Exception:
+        pass
 
     log("tool_call", {"tool": "list_files", "input": dir_path})
     skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', 'dist', 'build', 'chroma_db'}
@@ -138,6 +186,15 @@ def list_files(dir_path: str = ".") -> str:
                 file_list.append(os.path.join(root, file))
         result = "\n".join(file_list)
         trimmed = trim_tool_output(result, max_tokens=400)
+        
+        # Store in cache
+        try:
+            dir_mtime = os.stat(dir_path).st_mtime
+            cache_key = (dir_path, dir_mtime)
+            _dir_list_cache[cache_key] = trimmed
+        except Exception:
+            pass
+        
         log("tool_result", {"tool": "list_files", "count": len(file_list), "status": "ok"})
         return trimmed
     except Exception as e:
@@ -147,21 +204,49 @@ def list_files(dir_path: str = ".") -> str:
 def search_codebase(query: str) -> str:
     """Semantic search across the indexed project. Returns top 5 relevant code chunks."""
     log("tool_call", {"tool": "search_codebase", "input": query})
+    global _search_cache, _search_cache_stats
+    
     try:
+        # Check cache first
+        cache_key = hashlib.md5(query.encode()).hexdigest()
+        if cache_key in _search_cache:
+            _search_cache_stats["hits"] += 1
+            log("tool_cache_hit", {"tool": "search_codebase", "hits": _search_cache_stats["hits"]})
+            return _search_cache[cache_key]
+        
+        _search_cache_stats["misses"] += 1
+        
         vectorstore = get_vectorstore()
         if vectorstore is None:
             return "Codebase not indexed yet. Run /index first."
+        
+        # Use similarity_search_with_score for better control and metrics
         docs = vectorstore.similarity_search(query, k=5)
         if not docs:
             return "No matching code chunks found."
+        
         results = []
         for i, doc in enumerate(docs):
             source = doc.metadata.get("source", "unknown")
             chunk  = trim_tool_output(doc.page_content, max_tokens=200)
             results.append(f"--- Chunk {i+1} from {source} ---\n{chunk}\n")
-        log("tool_result", {"tool": "search_codebase", "chunks": len(docs), "status": "ok"})
-        return "\n".join(results)
+        
+        result_text = "\n".join(results)
+        
+        # Cache the result (limit cache size to 100 queries)
+        if len(_search_cache) < 100:
+            _search_cache[cache_key] = result_text
+        
+        log("tool_result", {
+            "tool": "search_codebase",
+            "chunks": len(docs),
+            "cache_hits": _search_cache_stats["hits"],
+            "cache_misses": _search_cache_stats["misses"],
+            "status": "ok"
+        })
+        return result_text
     except Exception as e:
+        log("tool_error", {"tool": "search_codebase", "error": str(e)})
         return f"Error searching codebase: {e}"
 
 

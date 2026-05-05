@@ -1,36 +1,32 @@
 # core/validator.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Explicit validation of execution results.
-# Checks are deterministic where possible (file exists, syntax valid).
-# Falls back to LLM judgment for semantic validation.
+# Validates execution results.
+# Deterministic checks run first (no LLM cost).
+# LLM semantic check only runs if deterministic checks pass.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import ast
 import os
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 
+from dispatcher import Dispatcher
 from llm_factory import get_refiner_llm
 from logger import log
 from state.temp_db import RunState
 
 
+# Validate prompt — tight JSON-only output expected.
 _VALIDATE_PROMPT = """\
 Task: {task}
 Tool results:
 {tool_results}
 
 Is the task fully complete and correct based on these results?
-Respond ONLY with JSON:
-{{
-  "passed": true,
-  "notes": ""
-}}
+Respond ONLY with JSON — no fences, no prose:
+{{"passed":true,"notes":""}}
 OR:
-{{
-  "passed": false,
-  "notes": "specific reason why it failed or what's missing"
-}}
-"""
+{{"passed":false,"notes":"specific reason it failed or what is missing"}}
+
+JSON only:"""
 
 
 class Validator:
@@ -40,67 +36,101 @@ class Validator:
     def validate(self, state: RunState) -> bool:
         """
         Run all checks. Returns True if task is considered complete.
-        Sets state.validation_passed and state.validation_notes.
+        Always sets state.validation_passed and state.validation_notes.
         """
-        # ── Hard stops — don't even ask the LLM ──────────────────────────────
+
+        # ── Hard cap ──────────────────────────────────────────────────────────
         if state.exceeds_max():
-            state.validation_passed = True
-            state.validation_notes  = "Max iterations reached."
+            self._pass(state, "Max iterations reached.")
             log("validator", {"passed": True, "reason": "max_iterations"})
             return True
 
+        # ── noop / done signal from Dispatcher means Executor decided it's done
+        last = state.tool_results[-1] if state.tool_results else None
+        if last and last.tool == "dispatcher" and last.output in ("noop", "done"):
+            self._pass(state, "Executor signalled completion.")
+            log("validator", {"passed": True, "reason": "noop_signal"})
+            return True
+
+        # ── No tools ran at all ───────────────────────────────────────────────
         if not state.tool_results:
-            state.validation_passed = False
-            state.validation_notes  = "No tools were executed."
+            self._fail(state, "No tools were executed.")
             log("validator", {"passed": False, "reason": "no_tool_results"})
             return False
 
         # ── Deterministic checks ──────────────────────────────────────────────
-        deterministic_fail = self._deterministic_checks(state)
-        if deterministic_fail:
-            state.validation_passed = False
-            state.validation_notes  = deterministic_fail
-            log("validator", {"passed": False, "reason": deterministic_fail})
+        fail_reason = self._deterministic_checks(state)
+        if fail_reason:
+            self._fail(state, fail_reason)
+            log("validator", {"passed": False, "reason": fail_reason[:120]})
             return False
 
         # ── Stall detection ───────────────────────────────────────────────────
         if self._is_stalled(state):
-            state.validation_passed = True
-            state.validation_notes  = "No progress detected — stopping."
+            self._pass(state, "No progress in last 4 iterations — stopping.")
             log("validator", {"passed": True, "reason": "stalled"})
             return True
 
         # ── LLM semantic check ────────────────────────────────────────────────
         return self._llm_check(state)
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _pass(self, state: RunState, notes: str):
+        state.validation_passed = True
+        state.validation_notes  = notes
+
+    def _fail(self, state: RunState, notes: str):
+        state.validation_passed = False
+        state.validation_notes  = notes
+
     def _deterministic_checks(self, state: RunState) -> str:
         """
-        Returns an error string if something is deterministically wrong.
-        Returns empty string if all checks pass.
+        Walk tool results newest-first.
+        Returns an error string on the first definitive failure.
+        Returns "" if the most recent write/create succeeded.
         """
-        for result in state.tool_results:
-            # Syntax rejection from write_file
-            if "WRITE REJECTED" in result.output and "SyntaxError" in result.output:
-                return f"Syntax error in written file: {result.output[:200]}"
-            # Tool not found
-            if result.output.startswith("Tool not found:"):
-                return result.output
+        for result in reversed(state.tool_results):
+            tool   = result.tool
+            status = result.status
+            output = result.output
+
+            # A successful file write is the clearest success signal
+            if tool in ("create_file", "write_file", "edit_file") and status == "ok":
+                return ""
+
+            # Executor / dispatcher errors — tool never ran
+            if tool in ("coder", "dispatcher") and status == "error":
+                # If it's just a parse/json fail, not a hard error, let it retry
+                if "not valid JSON" in output:
+                    return output[:200]
+                return output[:200]
+
+            # Syntax rejection from write/edit
+            if "WRITE REJECTED" in output and "SyntaxError" in output:
+                return f"Syntax error in written file: {output[:200]}"
+            if "WARNING: SyntaxError" in output:
+                return f"Syntax warning: {output[:200]}"
+
+            # Tool itself returned an error string
+            if tool in ("create_file", "write_file", "edit_file") and output.startswith("ERROR"):
+                return output[:200]
+
+            # Tool not found — schema mismatch, no point retrying without correction
+            if output.startswith("Tool not found:"):
+                return output[:200]
 
         return ""
 
     def _is_stalled(self, state: RunState) -> bool:
-        """True if no new tools have run in the last 2 iterations."""
+        """True if the last 4 consecutive results are all errors."""
         if state.iteration < 4:
             return False
-        # Count unique tool calls — if the last 4 results are all errors, stalled
         recent = state.tool_results[-4:]
-        if all(r.status == "error" for r in recent):
-            return True
-        return False
+        return all(r.status == "error" for r in recent)
 
     def _llm_check(self, state: RunState) -> bool:
-        """Ask the LLM if the task is complete."""
-        from dispatcher import Dispatcher
+        """Ask the LLM if the task is semantically complete."""
         prompt = _VALIDATE_PROMPT.format(
             task=state.user_input,
             tool_results="\n".join(state.recent_tool_outputs(5)),
@@ -108,9 +138,9 @@ class Validator:
         try:
             resp   = self.llm.invoke([HumanMessage(content=prompt)])
             parsed = Dispatcher.parse_llm_json(resp.content)
-            if parsed:
+            if isinstance(parsed, dict):
                 passed = bool(parsed.get("passed", False))
-                notes  = parsed.get("notes", "")
+                notes  = str(parsed.get("notes", ""))
                 state.validation_passed = passed
                 state.validation_notes  = notes
                 log("validator", {"passed": passed, "notes": notes[:100]})
@@ -118,7 +148,6 @@ class Validator:
         except Exception as e:
             log("validator_error", {"error": str(e)})
 
-        # Default: if we can't validate, assume done to avoid infinite loops
-        state.validation_passed = True
-        state.validation_notes  = "Validation check failed — assuming complete."
+        # Can't validate → assume done to prevent infinite loop
+        self._pass(state, "Validation check failed — assuming complete.")
         return True

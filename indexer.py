@@ -4,6 +4,7 @@ import hashlib
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from quantized_embeddings import QuantizedEmbeddings
 
 # ── ChromaDB location ─────────────────────────────────────────────────────────
 # When launched via `codi` CLI, CODI_CHROMA_DIR is set per-project by cli.py.
@@ -11,8 +12,27 @@ from langchain_huggingface import HuggingFaceEmbeddings
 _REPO_CHROMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 CHROMA_PERSIST_DIR = os.environ.get("CODI_CHROMA_DIR", _REPO_CHROMA)
 
+# ── Global embeddings singleton (cache) ────────────────────────────────────────
+_embeddings_instance = None
+_use_quantization = os.environ.get("CODI_USE_QUANTIZATION", "true").lower() == "true"
+
 def get_embeddings():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    """
+    Get or create embeddings instance (singleton pattern).
+    Uses quantized embeddings by default for 4x compression and faster search.
+    Disable with: CODI_USE_QUANTIZATION=false
+    """
+    global _embeddings_instance
+    if _embeddings_instance is None:
+        try:
+            _embeddings_instance = QuantizedEmbeddings(
+                model_name="all-MiniLM-L6-v2",
+                use_quantization=_use_quantization
+            )
+        except ImportError:
+            # Fall back to regular embeddings if turboquant not available
+            _embeddings_instance = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return _embeddings_instance
 
 def get_vectorstore():
     chroma_dir = os.environ.get("CODI_CHROMA_DIR", CHROMA_PERSIST_DIR)
@@ -72,6 +92,10 @@ def index_codebase(root_path: str, db_path: str = None):
     new_cache = {}
     updated = 0
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    
+    # Batch processing for faster indexing
+    batch_docs = []
+    batch_size = 32
 
     for fpath, content in walk_codebase(root_path):
         try:
@@ -94,8 +118,18 @@ def index_codebase(root_path: str, db_path: str = None):
                 splits,
                 metadatas=[{"source": fpath}] * len(splits)
             )
-            vectorstore.add_documents(docs)
-        updated += 1
+            batch_docs.extend(docs)
+            
+            # Add documents in batches for better performance
+            if len(batch_docs) >= batch_size:
+                vectorstore.add_documents(batch_docs)
+                batch_docs = []
+            
+            updated += 1
+
+    # Add remaining documents
+    if batch_docs:
+        vectorstore.add_documents(batch_docs)
 
     json.dump(new_cache, open(cache_path, "w"))
     print(f"  Indexed {updated} changed / {len(new_cache)} total files.")
