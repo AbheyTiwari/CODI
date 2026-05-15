@@ -440,13 +440,13 @@ def main():
             _mcp_toggle(user_input.split(maxsplit=2)[2], False)
 
         elif cmd == "/tools":
-            from tools import get_all_tools
-            all_t = get_all_tools()
+            all_t = agent_executor.registry.list_all()
             table = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
             table.add_column(style=t["accent"], no_wrap=True)
+            table.add_column(style="dim", no_wrap=True, width=6)
             table.add_column(style="dim")
             for tool in all_t:
-                table.add_row(tool.name, (tool.description or "")[:70])
+                table.add_row(tool["name"], tool["type"], tool["doc"][:70])
             console.print(Panel(table,
                                 title=Text(f"tools  {len(all_t)}", style=t["accent"]),
                                 border_style=t["dim"]))
