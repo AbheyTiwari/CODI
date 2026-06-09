@@ -729,30 +729,7 @@ All of these can be set in `.env` in the repo root or as shell environment varia
 
 
 
-#chatbot
-
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Chat</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
-
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  :root {
-    --bg-dark: #060912;
-    --surface: rgba(255,255,255,0.04);
-    --surface-hover: rgba(255,255,255,0.07);
-    --border: rgba(255,255,255,0.08);
-    --text-primary: #e8eaf0;
-    --text-muted: #6b7280;
-    --accent-blue: #4fa3e0;
-    --accent-purple: #a855f7;
-    --accent-pink: #e879a0;
-    --glow-blue: rgba(79,163,224,0.3);
+);
     --glow-purple: rgba(168,85,247,0.2);
   }
 
