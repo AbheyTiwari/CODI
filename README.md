@@ -724,3 +724,515 @@ All of these can be set in `.env` in the repo root or as shell environment varia
 **Local mode works best for focused tasks** — write a function, fix a bug, read a file. For complex multi-step reasoning, cloud mode is more reliable.
 
 **Check `/tools` after startup** to confirm all your MCP servers loaded. If a server failed, it will be absent from the list.
+
+
+
+
+
+#chatbot
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Chat</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg-dark: #060912;
+    --surface: rgba(255,255,255,0.04);
+    --surface-hover: rgba(255,255,255,0.07);
+    --border: rgba(255,255,255,0.08);
+    --text-primary: #e8eaf0;
+    --text-muted: #6b7280;
+    --accent-blue: #4fa3e0;
+    --accent-purple: #a855f7;
+    --accent-pink: #e879a0;
+    --glow-blue: rgba(79,163,224,0.3);
+    --glow-purple: rgba(168,85,247,0.2);
+  }
+
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    font-family: 'Inter', system-ui, sans-serif;
+    background: var(--bg-dark);
+    color: var(--text-primary);
+  }
+
+  /* ── Hex canvas background ── */
+  #hex-bg {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  /* ── Layout ── */
+  #app {
+    position: relative;
+    z-index: 1;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Chat history ── */
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 16px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.1) transparent;
+  }
+  #messages::-webkit-scrollbar { width: 4px; }
+  #messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+
+  /* ── Empty state ── */
+  #empty-state {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    pointer-events: none;
+    user-select: none;
+  }
+  #empty-state .logo-ring {
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(168,85,247,0.5);
+    box-shadow: 0 0 24px var(--glow-purple), inset 0 0 16px rgba(168,85,247,0.1);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #empty-state .logo-ring svg { opacity: 0.7; }
+  #empty-state p {
+    font-size: 13px;
+    color: var(--text-muted);
+    letter-spacing: 0.03em;
+  }
+
+  /* ── Message bubbles ── */
+  .msg {
+    display: flex;
+    gap: 10px;
+    max-width: 720px;
+    width: 100%;
+    align-self: center;
+    animation: fadeUp 0.25s ease both;
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .msg.user { flex-direction: row-reverse; align-self: flex-end; max-width: 80%; }
+
+  .bubble {
+    padding: 11px 15px;
+    border-radius: 14px;
+    font-size: 14px;
+    line-height: 1.65;
+    letter-spacing: 0.01em;
+  }
+  .msg.user .bubble {
+    background: linear-gradient(135deg, rgba(79,163,224,0.22), rgba(168,85,247,0.22));
+    border: 1px solid rgba(168,85,247,0.25);
+    color: var(--text-primary);
+    border-bottom-right-radius: 4px;
+  }
+  .msg.assistant .bubble {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    border-bottom-left-radius: 4px;
+  }
+
+  .avatar {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 500;
+    margin-top: 2px;
+  }
+  .msg.user .avatar {
+    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+    color: #fff;
+  }
+  .msg.assistant .avatar {
+    background: linear-gradient(135deg, var(--accent-purple), var(--accent-pink));
+    color: #fff;
+    box-shadow: 0 0 10px var(--glow-purple);
+  }
+
+  /* Typing indicator */
+  .typing-dots span {
+    display: inline-block;
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--accent-purple);
+    margin: 0 2px;
+    animation: blink 1.1s infinite both;
+  }
+  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink {
+    0%,80%,100% { opacity: 0.2; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+
+  /* ── Bottom input bar ── */
+  #input-area {
+    padding: 12px 16px 20px;
+    display: flex;
+    justify-content: center;
+  }
+
+  #input-wrap {
+    width: 100%;
+    max-width: 720px;
+    display: flex;
+    align-items: flex-end;
+    gap: 0;
+    background: rgba(12, 15, 28, 0.75);
+    backdrop-filter: blur(18px) saturate(1.4);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    border: 1px solid rgba(168,85,247,0.25);
+    border-radius: 22px;
+    padding: 10px 10px 10px 18px;
+    box-shadow:
+      0 0 0 1px rgba(79,163,224,0.08),
+      0 8px 32px rgba(0,0,0,0.5),
+      0 0 40px rgba(168,85,247,0.08);
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  #input-wrap:focus-within {
+    border-color: rgba(168,85,247,0.5);
+    box-shadow:
+      0 0 0 1px rgba(79,163,224,0.15),
+      0 8px 32px rgba(0,0,0,0.5),
+      0 0 50px rgba(168,85,247,0.18);
+  }
+
+  #prompt-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    resize: none;
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 14px;
+    line-height: 1.6;
+    max-height: 160px;
+    min-height: 24px;
+    overflow-y: auto;
+    scrollbar-width: none;
+    caret-color: var(--accent-purple);
+  }
+  #prompt-input::placeholder { color: var(--text-muted); }
+  #prompt-input::-webkit-scrollbar { display: none; }
+
+  #send-btn {
+    flex-shrink: 0;
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+    box-shadow: 0 0 14px var(--glow-purple);
+    transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
+    color: #fff;
+  }
+  #send-btn:hover { transform: scale(1.08); box-shadow: 0 0 22px var(--glow-purple); }
+  #send-btn:active { transform: scale(0.95); }
+  #send-btn:disabled { opacity: 0.35; cursor: default; transform: none; }
+
+  /* ── Scrollbar on messages ── */
+  .msg.assistant .bubble pre {
+    background: rgba(0,0,0,0.3);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12.5px;
+    overflow-x: auto;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="hex-bg"></canvas>
+
+<div id="app">
+  <div id="messages">
+    <div id="empty-state">
+      <div class="logo-ring">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+          <path d="M12 3L20 7.5V16.5L12 21L4 16.5V7.5L12 3Z" stroke="url(#g)" stroke-width="1.5" fill="none"/>
+          <defs>
+            <linearGradient id="g" x1="4" y1="3" x2="20" y2="21" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#4fa3e0"/><stop offset="1" stop-color="#a855f7"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      </div>
+      <p>Ask me anything</p>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div id="input-wrap">
+      <textarea id="prompt-input" rows="1" placeholder="Ask me anything…"></textarea>
+      <button id="send-btn" title="Send">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+          <path d="M22 2L11 13" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ─── Hex canvas background ─── */
+(function () {
+  const canvas = document.getElementById('hex-bg');
+  const ctx = canvas.getContext('2d');
+
+  const HEX_SIZE = 14;
+  const GAP = 1.5;
+  const STEP_X = HEX_SIZE * Math.sqrt(3) + GAP;
+  const STEP_Y = HEX_SIZE * 1.5 + GAP * 0.866;
+
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    drawHexGrid();
+  }
+
+  function hexPath(cx, cy, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI / 3) * i - Math.PI / 6;
+      const x = cx + r * Math.cos(angle);
+      const y = cy + r * Math.sin(angle);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+
+  function getColor(nx, ny) {
+    // Normalised coords 0–1
+    const cx = 0.55, cy = 0.72;   // center of glow — lower right of center
+    const dx = nx - cx, dy = ny - cy;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    // Two-color blobs: blue (left) and pink/purple (right)
+    const blueCx = 0.35, blueCy = 0.75;
+    const pinkCx = 0.65, pinkCy = 0.70;
+    const dBlue = Math.sqrt((nx-blueCx)**2 + (ny-blueCy)**2);
+    const dPink = Math.sqrt((nx-pinkCx)**2 + (ny-pinkCy)**2);
+
+    const blueI = Math.max(0, 1 - dBlue / 0.38);
+    const pinkI = Math.max(0, 1 - dPink / 0.30);
+
+    const totalI = Math.max(blueI, pinkI);
+    if (totalI < 0.01) return null; // pure black → skip stroke
+
+    const t = pinkI / (blueI + pinkI + 0.001);
+
+    const r = Math.round(lerp(40,  232, t));
+    const g = Math.round(lerp(130, 80,  t));
+    const b = Math.round(lerp(220, 180, t));
+    const a = Math.min(1, totalI * 1.2);
+
+    return `rgba(${r},${g},${b},${a})`;
+  }
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function drawHexGrid() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const cols = Math.ceil(canvas.width  / STEP_X) + 2;
+    const rows = Math.ceil(canvas.height / STEP_Y) + 2;
+
+    for (let row = -1; row < rows; row++) {
+      for (let col = -1; col < cols; col++) {
+        const offset = (row % 2 === 0) ? 0 : STEP_X / 2;
+        const cx = col * STEP_X + offset;
+        const cy = row * STEP_Y;
+
+        const nx = cx / canvas.width;
+        const ny = cy / canvas.height;
+        const color = getColor(nx, ny);
+
+        hexPath(cx, cy, HEX_SIZE - GAP);
+
+        if (color) {
+          ctx.fillStyle = color.replace('rgba', 'rgba').replace(/[\d.]+\)$/, v => {
+            return String(Math.min(parseFloat(v)*0.35, 0.35)) + ')';
+          });
+          ctx.fill();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 0.8;
+          ctx.stroke();
+        } else {
+          ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+          ctx.lineWidth = 0.5;
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+})();
+
+/* ─── Chat logic ─── */
+const messagesEl = document.getElementById('messages');
+const emptyEl    = document.getElementById('empty-state');
+const inputEl    = document.getElementById('prompt-input');
+const sendBtn    = document.getElementById('send-btn');
+
+// ── Change this URL to point at your local LLM endpoint ──
+const LLM_URL = 'http://localhost:11434/api/generate';  // Ollama default
+const LLM_MODEL = 'llama3';                             // or whatever model you run
+
+let history = [];
+let busy = false;
+
+function autoResize() {
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
+}
+
+inputEl.addEventListener('input', autoResize);
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+
+sendBtn.addEventListener('click', send);
+
+function addMessage(role, text) {
+  if (emptyEl) emptyEl.remove();
+
+  const msg = document.createElement('div');
+  msg.className = `msg ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'user' ? 'U' : 'AI';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = text;
+
+  msg.appendChild(avatar);
+  msg.appendChild(bubble);
+  messagesEl.appendChild(msg);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
+}
+
+function addTyping() {
+  if (emptyEl) emptyEl.remove();
+
+  const msg = document.createElement('div');
+  msg.className = 'msg assistant';
+  msg.id = 'typing-msg';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = 'AI';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
+
+  msg.appendChild(avatar);
+  msg.appendChild(bubble);
+  messagesEl.appendChild(msg);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return { msg, bubble };
+}
+
+async function send() {
+  const prompt = inputEl.value.trim();
+  if (!prompt || busy) return;
+
+  busy = true;
+  sendBtn.disabled = true;
+  inputEl.value = '';
+  autoResize();
+
+  addMessage('user', prompt);
+  history.push({ role: 'user', content: prompt });
+
+  const { msg: typingMsg, bubble: typingBubble } = addTyping();
+
+  try {
+    const res = await fetch(LLM_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        prompt: history.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n') + '\nAssistant:',
+        stream: true
+      })
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    // Replace typing indicator with streaming bubble
+    typingBubble.innerHTML = '';
+    const avatar = typingMsg.querySelector('.avatar');
+    let fullText = '';
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const lines = decoder.decode(value, { stream: true }).split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const json = JSON.parse(line);
+          if (json.response) {
+            fullText += json.response;
+            typingBubble.textContent = fullText;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+          }
+          if (json.done) break;
+        } catch {}
+      }
+    }
+
+    history.push({ role: 'assistant', content: fullText });
+
+  } catch (err) {
+    typingBubble.style.color = '#e879a0';
+    typingBubble.textContent = `⚠ Could not reach LLM: ${err.message}`;
+  }
+
+  busy = false;
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+</script>
+</body>
+</html>
