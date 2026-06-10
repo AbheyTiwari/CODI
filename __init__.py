@@ -2,47 +2,42 @@
 
 
 """
-app/utils/sanitise.py
-Extra sanitisation helpers beyond Pydantic validators.
+app/api/chat.py
+POST /chat — the main RAG endpoint.
 """
-import re
-import unicodedata
+from fastapi import APIRouter, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+from app.core.pipeline import run_rag
+from app.core.logging import logger
+from app.models.schemas import ChatRequest, ChatResponse
+from app.utils.sanitise import is_prompt_injection, clean_query
+
+router  = APIRouter(prefix="/chat", tags=["chat"])
+limiter = Limiter(key_func=get_remote_address)
 
 
-# Characters that could be used for prompt injection
-_INJECTION_PATTERNS = [
-    r"ignore\s+previous\s+instructions",
-    r"forget\s+everything",
-    r"you\s+are\s+now",
-    r"act\s+as\s+",
-    r"jailbreak",
-    r"<\s*script",           # basic XSS
-    r";\s*drop\s+table",     # SQL injection (just in case)
-]
-_INJECTION_RE = re.compile(
-    "|".join(_INJECTION_PATTERNS),
-    re.IGNORECASE,
-)
-
-
-def is_prompt_injection(text: str) -> bool:
-    """Return True if text looks like a prompt-injection attempt."""
-    return bool(_INJECTION_RE.search(text))
-
-
-def normalise_text(text: str) -> str:
+@router.post("", response_model=ChatResponse)
+async def chat(raw_request: Request, request: ChatRequest) -> ChatResponse:
     """
-    NFC-normalise unicode, collapse whitespace,
-    strip leading/trailing space.
+    Main RAG endpoint.
+    - Validates & sanitises input
+    - Runs embed → retrieve → generate pipeline
+    - Returns answer + sources
     """
-    text = unicodedata.normalize("NFC", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    # Extra sanitisation on top of Pydantic
+    clean = clean_query(request.query)
 
+    if is_prompt_injection(clean):
+        logger.warning("Prompt injection attempt blocked — ip={}", get_remote_address(raw_request))
+        raise HTTPException(status_code=400, detail="Query contains disallowed patterns.")
 
-def clean_query(query: str) -> str:
-    """Full clean pipeline for user queries."""
-    query = normalise_text(query)
-    # Remove zero-width chars
-    query = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", query)
-    return query
+    # Rebuild with cleaned query
+    request = ChatRequest(query=clean, history=request.history)
+
+    try:
+        return run_rag(request)
+    except Exception as exc:
+        logger.error("Pipeline error: {}", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal pipeline error.")
