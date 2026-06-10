@@ -2,95 +2,94 @@
 
 
 """
-app/main.py
-FastAPI application factory.
+app/models/schemas.py
+All Pydantic v2 request & response models.
+Strict validation — bad input never reaches the pipeline.
 """
-import os
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
-
-from app.core.config import get_settings
-from app.core.logging import setup_logging, logger
-from app.core.embedder import get_embedder
-from app.core.vectorstore import get_vectorstore
-from app.api import chat, health, ingest
+from __future__ import annotations
+from typing import Literal
+from pydantic import BaseModel, Field, field_validator
 
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────
-limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
+# ── Shared ────────────────────────────────────────────────────────────────────
+
+class HistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=8000)
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, v: str) -> str:
+        return v.strip()
 
 
-# ── Lifespan (startup / shutdown) ─────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    cfg = get_settings()
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs(cfg.chroma_path, exist_ok=True)
-    setup_logging()
+# ── /chat ─────────────────────────────────────────────────────────────────────
 
-    logger.info("Starting RAGChat API…")
-
-    # Warm up singletons — fail fast if something is broken
-    get_embedder()
-    get_vectorstore()
-    logger.info("All subsystems initialised")
-
-    yield  # ← app is running
-
-    logger.info("Shutting down RAGChat API")
-
-
-# ── App factory ───────────────────────────────────────────────────────────────
-def create_app() -> FastAPI:
-    cfg = get_settings()
-
-    app = FastAPI(
-        title="RAGChat API",
-        description="Retrieval-Augmented Generation over a glossary dataset.",
-        version="1.0.0",
-        lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
+class ChatRequest(BaseModel):
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The user's question.",
+    )
+    history: list[HistoryMessage] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Conversation history, oldest first.",
     )
 
-    # Rate limiting
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    @field_validator("query")
+    @classmethod
+    def sanitise_query(cls, v: str) -> str:
+        v = v.strip()
+        # Strip null bytes and control chars that could break downstream
+        v = "".join(ch for ch in v if ch >= " " or ch in "\t\n")
+        if not v:
+            raise ValueError("query must contain visible characters")
+        return v
 
-    # CORS — allow the frontend origin
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cfg.origins_list,
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type"],
-    )
-
-    # Global exception handler — never leak stack traces to client
-    @app.exception_handler(Exception)
-    async def global_exception_handler(request: Request, exc: Exception):
-        logger.error("Unhandled exception: {}", exc, exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "An internal error occurred."},
-        )
-
-    # Routers
-    app.include_router(chat.router)
-    app.include_router(health.router)
-    app.include_router(ingest.router)
-
-    @app.get("/", include_in_schema=False)
-    async def root():
-        return {"message": "RAGChat API — see /docs"}
-
-    return app
+    @field_validator("history")
+    @classmethod
+    def validate_history_alternates(cls, v: list[HistoryMessage]) -> list[HistoryMessage]:
+        """History should alternate user/assistant. Enforce loosely."""
+        if len(v) > 1:
+            for i in range(1, len(v)):
+                if v[i].role == v[i - 1].role:
+                    raise ValueError(
+                        f"history[{i}] has role '{v[i].role}' same as previous — "
+                        "messages must alternate user/assistant"
+                    )
+        return v
 
 
-app = create_app()
+class SourceDoc(BaseModel):
+    title: str
+    snippet: str
+    link: str = ""
+    score: float = Field(ge=0.0, le=1.0)
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[SourceDoc] = []
+    retrieved_count: int = 0
+    llm_available: bool = False
+
+
+# ── /ingest ───────────────────────────────────────────────────────────────────
+
+class IngestResponse(BaseModel):
+    status: str
+    documents_indexed: int
+    skipped: int
+    collection: str
+
+
+# ── /health ───────────────────────────────────────────────────────────────────
+
+class HealthResponse(BaseModel):
+    status: str
+    chroma: str
+    embedder: str
+    llm: str
+    documents_in_db: int
