@@ -3,43 +3,52 @@
 
 
 """
-app/core/logging.py
-Centralised logging via loguru.
-Import `logger` from here everywhere — never use print().
+app/core/embedder.py
+Wraps sentence-transformers.
+Singleton so the model is loaded once at startup.
+Swap to Ollama embeddings later by replacing _encode().
 """
-import sys
-from loguru import logger
+from __future__ import annotations
+from functools import lru_cache
+from typing import Sequence
+
+from sentence_transformers import SentenceTransformer
+
+from app.core.config import get_settings
+from app.core.logging import logger
 
 
-def setup_logging(debug: bool = False) -> None:
-    logger.remove()  # Remove default handler
+class Embedder:
+    """Thread-safe embedding wrapper."""
 
-    level = "DEBUG" if debug else "INFO"
+    def __init__(self, model_name: str) -> None:
+        logger.info("Loading embedding model: {}", model_name)
+        self._model = SentenceTransformer(model_name)
+        self._dim = self._model.get_sentence_embedding_dimension()
+        logger.info("Embedding model ready — dim={}", self._dim)
 
-    # Console — human-readable
-    logger.add(
-        sys.stdout,
-        level=level,
-        format=(
-            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{name}</cyan>:<cyan>{line}</cyan> — "
-            "<level>{message}</level>"
-        ),
-        colorize=True,
-    )
+    @property
+    def dimension(self) -> int:
+        return self._dim
 
-    # File — JSON structured, rotated daily, kept 7 days
-    logger.add(
-        "logs/app.log",
-        level="INFO",
-        rotation="1 day",
-        retention="7 days",
-        serialize=True,  # JSON lines
-        enqueue=True,    # Thread-safe
-    )
+    def embed(self, texts: Sequence[str], batch_size: int | None = None) -> list[list[float]]:
+        """Embed a list of strings. Returns list of float vectors."""
+        cfg = get_settings()
+        bs = batch_size or cfg.embed_batch_size
+        vecs = self._model.encode(
+            list(texts),
+            batch_size=bs,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,   # cosine similarity via dot product
+        )
+        return vecs.tolist()
 
-    logger.info("Logging initialised at level={}", level)
+    def embed_one(self, text: str) -> list[float]:
+        return self.embed([text])[0]
 
 
-__all__ = ["logger", "setup_logging"]
+@lru_cache(maxsize=1)
+def get_embedder() -> Embedder:
+    """Cached singleton — safe to call from anywhere."""
+    return Embedder(get_settings().embed_model)
