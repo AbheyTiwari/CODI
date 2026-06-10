@@ -2,60 +2,47 @@
 
 
 """
-app/core/pipeline.py
-The RAG pipeline — orchestrates embed → retrieve → generate.
-This is the only place that touches all three subsystems together.
+app/utils/sanitise.py
+Extra sanitisation helpers beyond Pydantic validators.
 """
-from __future__ import annotations
-
-from app.core.config import get_settings
-from app.core.embedder import get_embedder
-from app.core.vectorstore import get_vectorstore
-from app.core.llm import get_llm
-from app.core.logging import logger
-from app.models.schemas import ChatRequest, ChatResponse
+import re
+import unicodedata
 
 
-def run_rag(request: ChatRequest) -> ChatResponse:
+# Characters that could be used for prompt injection
+_INJECTION_PATTERNS = [
+    r"ignore\s+previous\s+instructions",
+    r"forget\s+everything",
+    r"you\s+are\s+now",
+    r"act\s+as\s+",
+    r"jailbreak",
+    r"<\s*script",           # basic XSS
+    r";\s*drop\s+table",     # SQL injection (just in case)
+]
+_INJECTION_RE = re.compile(
+    "|".join(_INJECTION_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+def is_prompt_injection(text: str) -> bool:
+    """Return True if text looks like a prompt-injection attempt."""
+    return bool(_INJECTION_RE.search(text))
+
+
+def normalise_text(text: str) -> str:
     """
-    Full RAG pipeline:
-      1. Embed the query
-      2. Retrieve top-k docs from ChromaDB
-      3. Generate answer via LLM (or stub)
-      4. Return structured ChatResponse
+    NFC-normalise unicode, collapse whitespace,
+    strip leading/trailing space.
     """
-    cfg  = get_settings()
-    query = request.query
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-    logger.info("RAG pipeline start — query='{}'", query[:80])
 
-    # ── 1. Embed ──────────────────────────────────────────────────────────
-    embedder = get_embedder()
-    q_vec    = embedder.embed_one(query)
-
-    # ── 2. Retrieve ───────────────────────────────────────────────────────
-    store   = get_vectorstore()
-    sources = store.query(
-        embedding=q_vec,
-        top_k=cfg.top_k,
-        score_threshold=cfg.score_threshold,
-    )
-    logger.info("Retrieved {} sources", len(sources))
-
-    # ── 3. Generate ───────────────────────────────────────────────────────
-    llm                = get_llm()
-    history_dicts      = [m.model_dump() for m in request.history]
-    answer, llm_used   = llm.generate(query, sources, history_dicts)
-
-    # ── 4. Return ─────────────────────────────────────────────────────────
-    response = ChatResponse(
-        answer=answer,
-        sources=sources,
-        retrieved_count=len(sources),
-        llm_available=llm_used,
-    )
-    logger.info(
-        "Pipeline done — sources={} llm_used={} answer_len={}",
-        len(sources), llm_used, len(answer),
-    )
-    return response
+def clean_query(query: str) -> str:
+    """Full clean pipeline for user queries."""
+    query = normalise_text(query)
+    # Remove zero-width chars
+    query = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", query)
+    return query
