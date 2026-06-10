@@ -1,14 +1,14 @@
 # core/__init__.py
 
 
-
 """
-app/core/vectorstore.py
-All ChromaDB operations — one place, no leaking chroma details elsewhere.
+app/core/llm.py
+Ollama LLM client.
+When Ollama is not running, returns a graceful stub answer
+so the rest of the pipeline (retrieval, frontend) keeps working.
 """
 from __future__ import annotations
-import chromadb
-from chromadb.config import Settings as ChromaSettings
+import httpx
 from functools import lru_cache
 
 from app.core.config import get_settings
@@ -16,97 +16,122 @@ from app.core.logging import logger
 from app.models.schemas import SourceDoc
 
 
-class VectorStore:
+_STUB_PREFIX = "[LLM unavailable — showing retrieved context only]\n\n"
+
+
+class LLMClient:
     def __init__(self) -> None:
         cfg = get_settings()
-        self._client = chromadb.PersistentClient(
-            path=cfg.chroma_path,
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-        self._collection = self._client.get_or_create_collection(
-            name=cfg.chroma_collection,
-            metadata={"hnsw:space": "cosine"},
-        )
-        logger.info(
-            "VectorStore ready — collection='{}' docs={}",
-            cfg.chroma_collection,
-            self._collection.count(),
-        )
+        self._base_url = cfg.ollama_base_url.rstrip("/")
+        self._model    = cfg.ollama_model
+        self._timeout  = cfg.ollama_timeout
+        self._available: bool | None = None  # None = not yet checked
 
-    # ── Write ──────────────────────────────────────────────────────────────
+    # ── Availability probe ─────────────────────────────────────────────────
 
-    def upsert(
-        self,
-        ids: list[str],
-        embeddings: list[list[float]],
-        documents: list[str],
-        metadatas: list[dict],
-        batch_size: int = 500,
-    ) -> None:
-        """Upsert in batches so memory stays bounded."""
-        total = len(ids)
-        for start in range(0, total, batch_size):
-            end = min(start + batch_size, total)
-            self._collection.upsert(
-                ids=ids[start:end],
-                embeddings=embeddings[start:end],
-                documents=documents[start:end],
-                metadatas=metadatas[start:end],
+    def is_available(self) -> bool:
+        try:
+            with httpx.Client(timeout=3) as client:
+                r = client.get(f"{self._base_url}/api/tags")
+                self._available = r.status_code == 200
+        except Exception:
+            self._available = False
+        return self._available
+
+    # ── Prompt builder ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def build_prompt(
+        query: str,
+        sources: list[SourceDoc],
+        history: list[dict],
+    ) -> str:
+        ctx_parts = []
+        for i, src in enumerate(sources, 1):
+            ctx_parts.append(
+                f"[{i}] {src.title}\n{src.snippet}"
+                + (f"\nSource: {src.link}" if src.link else "")
             )
-            logger.debug("Upserted batch {}-{} / {}", start, end, total)
-        logger.info("Upsert complete — {} documents", total)
+        context = "\n\n".join(ctx_parts) if ctx_parts else "No relevant context found."
 
-    # ── Read ───────────────────────────────────────────────────────────────
+        history_text = ""
+        for msg in history[-6:]:  # last 3 turns
+            role = "User" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role}: {msg['content']}\n"
 
-    def query(
-        self,
-        embedding: list[float],
-        top_k: int,
-        score_threshold: float,
-    ) -> list[SourceDoc]:
-        """Return top-k results above score_threshold."""
-        if self._collection.count() == 0:
-            logger.warning("Collection is empty — run ingest first")
-            return []
-
-        results = self._collection.query(
-            query_embeddings=[embedding],
-            n_results=min(top_k, self._collection.count()),
-            include=["documents", "metadatas", "distances"],
+        prompt = (
+            "You are a helpful assistant for a technical glossary. "
+            "Answer ONLY from the provided context. "
+            "If the answer is not in the context, say so honestly.\n\n"
+            f"### Context\n{context}\n\n"
+            + (f"### Conversation so far\n{history_text}\n" if history_text else "")
+            + f"### Question\n{query}\n\n"
+            "### Answer"
         )
+        return prompt
 
-        sources: list[SourceDoc] = []
-        docs      = results["documents"][0]
-        metas     = results["metadatas"][0]
-        distances = results["distances"][0]
+    # ── Generate ───────────────────────────────────────────────────────────
 
-        for doc, meta, dist in zip(docs, metas, distances):
-            # Chroma cosine distance → similarity score (0–1)
-            score = float(1 - dist)
-            if score < score_threshold:
-                continue
-            sources.append(
-                SourceDoc(
-                    title=meta.get("title", "Unknown"),
-                    snippet=doc[:300],
-                    link=meta.get("link", ""),
-                    score=round(score, 4),
+    def generate(
+        self,
+        query: str,
+        sources: list[SourceDoc],
+        history: list[dict],
+    ) -> tuple[str, bool]:
+        """
+        Returns (answer_text, llm_was_used).
+        Never raises — falls back to stub on any error.
+        """
+        if not self.is_available():
+            logger.warning("Ollama not available — returning stub answer")
+            return self._stub_answer(sources), False
+
+        prompt = self.build_prompt(query, sources, history)
+
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.post(
+                    f"{self._base_url}/api/generate",
+                    json={
+                        "model":  self._model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"temperature": 0.2, "num_predict": 512},
+                    },
                 )
+                response.raise_for_status()
+                data   = response.json()
+                answer = data.get("response", "").strip()
+                if not answer:
+                    raise ValueError("Empty response from Ollama")
+                logger.info("LLM generated answer ({} chars)", len(answer))
+                return answer, True
+
+        except Exception as exc:
+            logger.error("Ollama error: {}", exc)
+            return self._stub_answer(sources), False
+
+    # ── Stub ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stub_answer(sources: list[SourceDoc]) -> str:
+        if not sources:
+            return (
+                _STUB_PREFIX
+                + "No matching glossary terms were found for your query. "
+                "Try rephrasing or using different keywords."
             )
-
-        logger.debug("Query returned {} sources above threshold", len(sources))
-        return sources
-
-    # ── Meta ───────────────────────────────────────────────────────────────
-
-    def count(self) -> int:
-        return self._collection.count()
-
-    def collection_name(self) -> str:
-        return self._collection.name
+        lines = [_STUB_PREFIX + "Here are the most relevant glossary terms I found:\n"]
+        for src in sources:
+            lines.append(f"**{src.title}**")
+            if src.snippet:
+                lines.append(src.snippet)
+            if src.link:
+                lines.append(f"→ {src.link}")
+            lines.append("")
+        return "\n".join(lines).strip()
 
 
 @lru_cache(maxsize=1)
-def get_vectorstore() -> VectorStore:
-    """Cached singleton."""
-    return VectorStore()
+def get_llm() -> LLMClient:
+    return LLMClient()
