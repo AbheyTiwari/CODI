@@ -1,43 +1,57 @@
 # core/__init__.py
 
-
 """
-app/api/chat.py
-POST /chat — the main RAG endpoint.
+app/api/health.py
+GET /health — liveness + dependency status.
 """
-from fastapi import APIRouter, HTTPException, Request
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from fastapi import APIRouter
 
-from app.core.pipeline import run_rag
+from app.core.vectorstore import get_vectorstore
+from app.core.embedder import get_embedder
+from app.core.llm import get_llm
 from app.core.logging import logger
-from app.models.schemas import ChatRequest, ChatResponse
-from app.utils.sanitise import is_prompt_injection, clean_query
+from app.models.schemas import HealthResponse
 
-router  = APIRouter(prefix="/chat", tags=["chat"])
-limiter = Limiter(key_func=get_remote_address)
+router = APIRouter(prefix="/health", tags=["health"])
 
 
-@router.post("", response_model=ChatResponse)
-async def chat(raw_request: Request, request: ChatRequest) -> ChatResponse:
-    """
-    Main RAG endpoint.
-    - Validates & sanitises input
-    - Runs embed → retrieve → generate pipeline
-    - Returns answer + sources
-    """
-    # Extra sanitisation on top of Pydantic
-    clean = clean_query(request.query)
-
-    if is_prompt_injection(clean):
-        logger.warning("Prompt injection attempt blocked — ip={}", get_remote_address(raw_request))
-        raise HTTPException(status_code=400, detail="Query contains disallowed patterns.")
-
-    # Rebuild with cleaned query
-    request = ChatRequest(query=clean, history=request.history)
-
+@router.get("", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Returns the status of all subsystems."""
+    # ChromaDB
     try:
-        return run_rag(request)
-    except Exception as exc:
-        logger.error("Pipeline error: {}", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal pipeline error.")
+        store = get_vectorstore()
+        doc_count = store.count()
+        chroma_status = "ok"
+    except Exception as e:
+        logger.error("ChromaDB health check failed: {}", e)
+        chroma_status = f"error: {e}"
+        doc_count = -1
+
+    # Embedder
+    try:
+        get_embedder()
+        embed_status = "ok"
+    except Exception as e:
+        logger.error("Embedder health check failed: {}", e)
+        embed_status = f"error: {e}"
+
+    # LLM
+    try:
+        llm = get_llm()
+        llm_status = "ok" if llm.is_available() else "unavailable (stub mode)"
+    except Exception as e:
+        llm_status = f"error: {e}"
+
+    overall = "ok" if all(
+        s in ("ok", "unavailable (stub mode)")
+        for s in [chroma_status, embed_status, llm_status]
+    ) else "degraded"
+
+    return HealthResponse(
+        status=overall,
+        chroma=chroma_status,
+        embedder=embed_status,
+        llm=llm_status,
+        documents_in_db=doc_count,
+    )
