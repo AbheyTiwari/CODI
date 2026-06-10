@@ -1,95 +1,55 @@
 # core/__init__.py
 
-
 """
-app/models/schemas.py
-All Pydantic v2 request & response models.
-Strict validation — bad input never reaches the pipeline.
+app/core/config.py
+Single source of truth for all configuration.
+Values are read from .env (or environment variables).
 """
-from __future__ import annotations
-from typing import Literal
-from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from functools import lru_cache
 
 
-# ── Shared ────────────────────────────────────────────────────────────────────
-
-class HistoryMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(..., min_length=1, max_length=8000)
-
-    @field_validator("content")
-    @classmethod
-    def strip_content(cls, v: str) -> str:
-        return v.strip()
-
-
-# ── /chat ─────────────────────────────────────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    query: str = Field(
-        ...,
-        min_length=1,
-        max_length=2000,
-        description="The user's question.",
-    )
-    history: list[HistoryMessage] = Field(
-        default_factory=list,
-        max_length=20,
-        description="Conversation history, oldest first.",
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
     )
 
-    @field_validator("query")
-    @classmethod
-    def sanitise_query(cls, v: str) -> str:
-        v = v.strip()
-        # Strip null bytes and control chars that could break downstream
-        v = "".join(ch for ch in v if ch >= " " or ch in "\t\n")
-        if not v:
-            raise ValueError("query must contain visible characters")
-        return v
+    # Server
+    host: str = "0.0.0.0"
+    port: int = 8000
+    allowed_origins: str = "http://localhost:3000,http://127.0.0.1:5500,null"
 
-    @field_validator("history")
-    @classmethod
-    def validate_history_alternates(cls, v: list[HistoryMessage]) -> list[HistoryMessage]:
-        """History should alternate user/assistant. Enforce loosely."""
-        if len(v) > 1:
-            for i in range(1, len(v)):
-                if v[i].role == v[i - 1].role:
-                    raise ValueError(
-                        f"history[{i}] has role '{v[i].role}' same as previous — "
-                        "messages must alternate user/assistant"
-                    )
-        return v
+    # ChromaDB
+    chroma_path: str = "./data/chroma"
+    chroma_collection: str = "glossary"
 
+    # Embeddings
+    embed_model: str = "all-MiniLM-L6-v2"
+    embed_batch_size: int = 64
 
-class SourceDoc(BaseModel):
-    title: str
-    snippet: str
-    link: str = ""
-    score: float = Field(ge=0.0, le=1.0)
+    # Retrieval
+    top_k: int = 5
+    score_threshold: float = 0.3
 
+    # LLM (Ollama)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "llama3"
+    ollama_timeout: int = 60
 
-class ChatResponse(BaseModel):
-    answer: str
-    sources: list[SourceDoc] = []
-    retrieved_count: int = 0
-    llm_available: bool = False
+    # Rate limiting
+    rate_limit: str = "30/minute"
+
+    # Data
+    data_file: str = "./data/glossary_data.json"
+
+    @property
+    def origins_list(self) -> list[str]:
+        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
 
 
-# ── /ingest ───────────────────────────────────────────────────────────────────
-
-class IngestResponse(BaseModel):
-    status: str
-    documents_indexed: int
-    skipped: int
-    collection: str
-
-
-# ── /health ───────────────────────────────────────────────────────────────────
-
-class HealthResponse(BaseModel):
-    status: str
-    chroma: str
-    embedder: str
-    llm: str
-    documents_in_db: int
+@lru_cache
+def get_settings() -> Settings:
+    """Cached singleton — call get_settings() everywhere."""
+    return Settings()
