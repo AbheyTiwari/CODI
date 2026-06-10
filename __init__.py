@@ -1,57 +1,109 @@
 # core/__init__.py
 
-"""
-app/api/health.py
-GET /health — liveness + dependency status.
-"""
-from fastapi import APIRouter
 
-from app.core.vectorstore import get_vectorstore
+"""
+app/api/ingest.py
+POST /ingest — (re)index the glossary JSON into ChromaDB.
+Idempotent: safe to run multiple times (upsert).
+"""
+import json
+import os
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+
+from app.core.config import get_settings
 from app.core.embedder import get_embedder
-from app.core.llm import get_llm
+from app.core.vectorstore import get_vectorstore
 from app.core.logging import logger
-from app.models.schemas import HealthResponse
+from app.models.schemas import IngestResponse
 
-router = APIRouter(prefix="/health", tags=["health"])
+router = APIRouter(prefix="/ingest", tags=["ingest"])
+
+# Simple flag so we don't run two ingests simultaneously
+_ingesting = False
 
 
-@router.get("", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    """Returns the status of all subsystems."""
-    # ChromaDB
-    try:
-        store = get_vectorstore()
-        doc_count = store.count()
-        chroma_status = "ok"
-    except Exception as e:
-        logger.error("ChromaDB health check failed: {}", e)
-        chroma_status = f"error: {e}"
-        doc_count = -1
+def _do_ingest() -> IngestResponse:
+    global _ingesting
+    cfg = get_settings()
 
-    # Embedder
-    try:
-        get_embedder()
-        embed_status = "ok"
-    except Exception as e:
-        logger.error("Embedder health check failed: {}", e)
-        embed_status = f"error: {e}"
+    data_path = cfg.data_file
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data file not found: {data_path}")
 
-    # LLM
-    try:
-        llm = get_llm()
-        llm_status = "ok" if llm.is_available() else "unavailable (stub mode)"
-    except Exception as e:
-        llm_status = f"error: {e}"
+    with open(data_path, encoding="utf-8") as f:
+        raw: list[dict] = json.load(f)
 
-    overall = "ok" if all(
-        s in ("ok", "unavailable (stub mode)")
-        for s in [chroma_status, embed_status, llm_status]
-    ) else "degraded"
+    if not isinstance(raw, list):
+        raise ValueError("JSON must be an array of objects at the top level.")
 
-    return HealthResponse(
-        status=overall,
-        chroma=chroma_status,
-        embedder=embed_status,
-        llm=llm_status,
-        documents_in_db=doc_count,
+    embedder = get_embedder()
+    store    = get_vectorstore()
+
+    ids, embeddings, documents, metadatas = [], [], [], []
+    skipped = 0
+
+    for i, item in enumerate(raw):
+        title       = str(item.get("title", "")).strip()
+        description = str(item.get("description", "")).strip()
+        link        = str(item.get("link", "")).strip()
+
+        if not title:
+            skipped += 1
+            continue
+
+        # Build the text we embed — title + description
+        text = title
+        if description:
+            text += f"\n{description}"
+
+        ids.append(f"doc_{i}")
+        documents.append(text)
+        metadatas.append({
+            "title":       title,
+            "description": description,
+            "link":        link,
+        })
+
+    logger.info("Embedding {} documents (skipped {})…", len(ids), skipped)
+
+    vecs = embedder.embed(documents, batch_size=cfg.embed_batch_size)
+    embeddings = vecs
+
+    store.upsert(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents,
+        metadatas=metadatas,
     )
+
+    return IngestResponse(
+        status="ok",
+        documents_indexed=len(ids),
+        skipped=skipped,
+        collection=store.collection_name(),
+    )
+
+
+@router.post("", response_model=IngestResponse)
+async def ingest(background_tasks: BackgroundTasks) -> IngestResponse:
+    """
+    Reads glossary_data.json, embeds all terms, upserts into ChromaDB.
+    Idempotent — safe to re-run.
+    """
+    global _ingesting
+    if _ingesting:
+        raise HTTPException(status_code=409, detail="Ingest already in progress.")
+
+    _ingesting = True
+    try:
+        logger.info("Ingest started")
+        result = _do_ingest()
+        logger.info("Ingest done — indexed={} skipped={}", result.documents_indexed, result.skipped)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("Ingest failed: {}", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ingest failed: {e}")
+    finally:
+        _ingesting = False
