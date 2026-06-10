@@ -1,55 +1,45 @@
 # core/__init__.py
 
-"""
-app/core/config.py
-Single source of truth for all configuration.
-Values are read from .env (or environment variables).
-"""
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from functools import lru_cache
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
+"""
+app/core/logging.py
+Centralised logging via loguru.
+Import `logger` from here everywhere — never use print().
+"""
+import sys
+from loguru import logger
+
+
+def setup_logging(debug: bool = False) -> None:
+    logger.remove()  # Remove default handler
+
+    level = "DEBUG" if debug else "INFO"
+
+    # Console — human-readable
+    logger.add(
+        sys.stdout,
+        level=level,
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{line}</cyan> — "
+            "<level>{message}</level>"
+        ),
+        colorize=True,
     )
 
-    # Server
-    host: str = "0.0.0.0"
-    port: int = 8000
-    allowed_origins: str = "http://localhost:3000,http://127.0.0.1:5500,null"
+    # File — JSON structured, rotated daily, kept 7 days
+    logger.add(
+        "logs/app.log",
+        level="INFO",
+        rotation="1 day",
+        retention="7 days",
+        serialize=True,  # JSON lines
+        enqueue=True,    # Thread-safe
+    )
 
-    # ChromaDB
-    chroma_path: str = "./data/chroma"
-    chroma_collection: str = "glossary"
-
-    # Embeddings
-    embed_model: str = "all-MiniLM-L6-v2"
-    embed_batch_size: int = 64
-
-    # Retrieval
-    top_k: int = 5
-    score_threshold: float = 0.3
-
-    # LLM (Ollama)
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3"
-    ollama_timeout: int = 60
-
-    # Rate limiting
-    rate_limit: str = "30/minute"
-
-    # Data
-    data_file: str = "./data/glossary_data.json"
-
-    @property
-    def origins_list(self) -> list[str]:
-        return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+    logger.info("Logging initialised at level={}", level)
 
 
-@lru_cache
-def get_settings() -> Settings:
-    """Cached singleton — call get_settings() everywhere."""
-    return Settings()
+__all__ = ["logger", "setup_logging"]
