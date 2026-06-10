@@ -2,136 +2,60 @@
 
 
 """
-app/core/llm.py
-Ollama LLM client.
-When Ollama is not running, returns a graceful stub answer
-so the rest of the pipeline (retrieval, frontend) keeps working.
+app/core/pipeline.py
+The RAG pipeline — orchestrates embed → retrieve → generate.
+This is the only place that touches all three subsystems together.
 """
 from __future__ import annotations
-import httpx
-from functools import lru_cache
 
 from app.core.config import get_settings
+from app.core.embedder import get_embedder
+from app.core.vectorstore import get_vectorstore
+from app.core.llm import get_llm
 from app.core.logging import logger
-from app.models.schemas import SourceDoc
+from app.models.schemas import ChatRequest, ChatResponse
 
 
-_STUB_PREFIX = "[LLM unavailable — showing retrieved context only]\n\n"
+def run_rag(request: ChatRequest) -> ChatResponse:
+    """
+    Full RAG pipeline:
+      1. Embed the query
+      2. Retrieve top-k docs from ChromaDB
+      3. Generate answer via LLM (or stub)
+      4. Return structured ChatResponse
+    """
+    cfg  = get_settings()
+    query = request.query
 
+    logger.info("RAG pipeline start — query='{}'", query[:80])
 
-class LLMClient:
-    def __init__(self) -> None:
-        cfg = get_settings()
-        self._base_url = cfg.ollama_base_url.rstrip("/")
-        self._model    = cfg.ollama_model
-        self._timeout  = cfg.ollama_timeout
-        self._available: bool | None = None  # None = not yet checked
+    # ── 1. Embed ──────────────────────────────────────────────────────────
+    embedder = get_embedder()
+    q_vec    = embedder.embed_one(query)
 
-    # ── Availability probe ─────────────────────────────────────────────────
+    # ── 2. Retrieve ───────────────────────────────────────────────────────
+    store   = get_vectorstore()
+    sources = store.query(
+        embedding=q_vec,
+        top_k=cfg.top_k,
+        score_threshold=cfg.score_threshold,
+    )
+    logger.info("Retrieved {} sources", len(sources))
 
-    def is_available(self) -> bool:
-        try:
-            with httpx.Client(timeout=3) as client:
-                r = client.get(f"{self._base_url}/api/tags")
-                self._available = r.status_code == 200
-        except Exception:
-            self._available = False
-        return self._available
+    # ── 3. Generate ───────────────────────────────────────────────────────
+    llm                = get_llm()
+    history_dicts      = [m.model_dump() for m in request.history]
+    answer, llm_used   = llm.generate(query, sources, history_dicts)
 
-    # ── Prompt builder ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def build_prompt(
-        query: str,
-        sources: list[SourceDoc],
-        history: list[dict],
-    ) -> str:
-        ctx_parts = []
-        for i, src in enumerate(sources, 1):
-            ctx_parts.append(
-                f"[{i}] {src.title}\n{src.snippet}"
-                + (f"\nSource: {src.link}" if src.link else "")
-            )
-        context = "\n\n".join(ctx_parts) if ctx_parts else "No relevant context found."
-
-        history_text = ""
-        for msg in history[-6:]:  # last 3 turns
-            role = "User" if msg["role"] == "user" else "Assistant"
-            history_text += f"{role}: {msg['content']}\n"
-
-        prompt = (
-            "You are a helpful assistant for a technical glossary. "
-            "Answer ONLY from the provided context. "
-            "If the answer is not in the context, say so honestly.\n\n"
-            f"### Context\n{context}\n\n"
-            + (f"### Conversation so far\n{history_text}\n" if history_text else "")
-            + f"### Question\n{query}\n\n"
-            "### Answer"
-        )
-        return prompt
-
-    # ── Generate ───────────────────────────────────────────────────────────
-
-    def generate(
-        self,
-        query: str,
-        sources: list[SourceDoc],
-        history: list[dict],
-    ) -> tuple[str, bool]:
-        """
-        Returns (answer_text, llm_was_used).
-        Never raises — falls back to stub on any error.
-        """
-        if not self.is_available():
-            logger.warning("Ollama not available — returning stub answer")
-            return self._stub_answer(sources), False
-
-        prompt = self.build_prompt(query, sources, history)
-
-        try:
-            with httpx.Client(timeout=self._timeout) as client:
-                response = client.post(
-                    f"{self._base_url}/api/generate",
-                    json={
-                        "model":  self._model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"temperature": 0.2, "num_predict": 512},
-                    },
-                )
-                response.raise_for_status()
-                data   = response.json()
-                answer = data.get("response", "").strip()
-                if not answer:
-                    raise ValueError("Empty response from Ollama")
-                logger.info("LLM generated answer ({} chars)", len(answer))
-                return answer, True
-
-        except Exception as exc:
-            logger.error("Ollama error: {}", exc)
-            return self._stub_answer(sources), False
-
-    # ── Stub ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _stub_answer(sources: list[SourceDoc]) -> str:
-        if not sources:
-            return (
-                _STUB_PREFIX
-                + "No matching glossary terms were found for your query. "
-                "Try rephrasing or using different keywords."
-            )
-        lines = [_STUB_PREFIX + "Here are the most relevant glossary terms I found:\n"]
-        for src in sources:
-            lines.append(f"**{src.title}**")
-            if src.snippet:
-                lines.append(src.snippet)
-            if src.link:
-                lines.append(f"→ {src.link}")
-            lines.append("")
-        return "\n".join(lines).strip()
-
-
-@lru_cache(maxsize=1)
-def get_llm() -> LLMClient:
-    return LLMClient()
+    # ── 4. Return ─────────────────────────────────────────────────────────
+    response = ChatResponse(
+        answer=answer,
+        sources=sources,
+        retrieved_count=len(sources),
+        llm_available=llm_used,
+    )
+    logger.info(
+        "Pipeline done — sources={} llm_used={} answer_len={}",
+        len(sources), llm_used, len(answer),
+    )
+    return response
