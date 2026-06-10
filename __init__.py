@@ -3,52 +3,110 @@
 
 
 """
-app/core/embedder.py
-Wraps sentence-transformers.
-Singleton so the model is loaded once at startup.
-Swap to Ollama embeddings later by replacing _encode().
+app/core/vectorstore.py
+All ChromaDB operations — one place, no leaking chroma details elsewhere.
 """
 from __future__ import annotations
+import chromadb
+from chromadb.config import Settings as ChromaSettings
 from functools import lru_cache
-from typing import Sequence
-
-from sentence_transformers import SentenceTransformer
 
 from app.core.config import get_settings
 from app.core.logging import logger
+from app.models.schemas import SourceDoc
 
 
-class Embedder:
-    """Thread-safe embedding wrapper."""
-
-    def __init__(self, model_name: str) -> None:
-        logger.info("Loading embedding model: {}", model_name)
-        self._model = SentenceTransformer(model_name)
-        self._dim = self._model.get_sentence_embedding_dimension()
-        logger.info("Embedding model ready — dim={}", self._dim)
-
-    @property
-    def dimension(self) -> int:
-        return self._dim
-
-    def embed(self, texts: Sequence[str], batch_size: int | None = None) -> list[list[float]]:
-        """Embed a list of strings. Returns list of float vectors."""
+class VectorStore:
+    def __init__(self) -> None:
         cfg = get_settings()
-        bs = batch_size or cfg.embed_batch_size
-        vecs = self._model.encode(
-            list(texts),
-            batch_size=bs,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True,   # cosine similarity via dot product
+        self._client = chromadb.PersistentClient(
+            path=cfg.chroma_path,
+            settings=ChromaSettings(anonymized_telemetry=False),
         )
-        return vecs.tolist()
+        self._collection = self._client.get_or_create_collection(
+            name=cfg.chroma_collection,
+            metadata={"hnsw:space": "cosine"},
+        )
+        logger.info(
+            "VectorStore ready — collection='{}' docs={}",
+            cfg.chroma_collection,
+            self._collection.count(),
+        )
 
-    def embed_one(self, text: str) -> list[float]:
-        return self.embed([text])[0]
+    # ── Write ──────────────────────────────────────────────────────────────
+
+    def upsert(
+        self,
+        ids: list[str],
+        embeddings: list[list[float]],
+        documents: list[str],
+        metadatas: list[dict],
+        batch_size: int = 500,
+    ) -> None:
+        """Upsert in batches so memory stays bounded."""
+        total = len(ids)
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            self._collection.upsert(
+                ids=ids[start:end],
+                embeddings=embeddings[start:end],
+                documents=documents[start:end],
+                metadatas=metadatas[start:end],
+            )
+            logger.debug("Upserted batch {}-{} / {}", start, end, total)
+        logger.info("Upsert complete — {} documents", total)
+
+    # ── Read ───────────────────────────────────────────────────────────────
+
+    def query(
+        self,
+        embedding: list[float],
+        top_k: int,
+        score_threshold: float,
+    ) -> list[SourceDoc]:
+        """Return top-k results above score_threshold."""
+        if self._collection.count() == 0:
+            logger.warning("Collection is empty — run ingest first")
+            return []
+
+        results = self._collection.query(
+            query_embeddings=[embedding],
+            n_results=min(top_k, self._collection.count()),
+            include=["documents", "metadatas", "distances"],
+        )
+
+        sources: list[SourceDoc] = []
+        docs      = results["documents"][0]
+        metas     = results["metadatas"][0]
+        distances = results["distances"][0]
+
+        for doc, meta, dist in zip(docs, metas, distances):
+            # Chroma cosine distance → similarity score (0–1)
+            score = float(1 - dist)
+            if score < score_threshold:
+                continue
+            sources.append(
+                SourceDoc(
+                    title=meta.get("title", "Unknown"),
+                    snippet=doc[:300],
+                    link=meta.get("link", ""),
+                    score=round(score, 4),
+                )
+            )
+
+        logger.debug("Query returned {} sources above threshold", len(sources))
+        return sources
+
+    # ── Meta ───────────────────────────────────────────────────────────────
+
+    def count(self) -> int:
+        return self._collection.count()
+
+    def collection_name(self) -> str:
+        return self._collection.name
 
 
 @lru_cache(maxsize=1)
-def get_embedder() -> Embedder:
-    """Cached singleton — safe to call from anywhere."""
-    return Embedder(get_settings().embed_model)
+def get_vectorstore() -> VectorStore:
+    """Cached singleton."""
+    return VectorStore()
