@@ -2,398 +2,505 @@
 
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════╗
-║         CAVE EXPLORER  — Site Mapper         ║
-║  Splits into bots at every junction,         ║
-║  explores all paths, merges back, outputs    ║
-║  a complete site map ready for scraping.     ║
-╚══════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════╗
+║     CAVE SCRAPER  —  Full Content Extractor           ║
+║  Reads site_map.json → extracts ALL content from      ║
+║  every page → outputs RAG-ready chunks + assets       ║
+╚═══════════════════════════════════════════════════════╝
+
+Extracts per page:
+  • Clean markdown text (body, headings, paragraphs)
+  • Tables  → list of row dicts with headers
+  • Images  → url, alt text, caption
+  • Links   → anchor text + href
+  • Forms   → fields, action, method
+  • PDFs    → download urls found on the page
+  • Metadata → title, description, og tags, canonical
+  • JSON-LD  → structured data blocks (schema.org etc.)
+  • RAG chunks → text split into overlapping chunks
+                 ready to embed into a vector store
 
 Usage:
-    python crawler.py https://example.com
-    python crawler.py https://example.com --depth 3 --max-pages 100 --threads 10
-    python crawler.py https://example.com --output my_site_map.json
+    python scraper.py site_map.json
+    python scraper.py site_map.json --filter /blog
+    python scraper.py site_map.json --depth 2 --chunk-size 500 --threads 8
+    python scraper.py site_map.json --output my_data --delay 0.5
 """
 
+import os
+import re
 import sys
 import json
 import time
+import hashlib
 import argparse
 import threading
-from collections import defaultdict
+from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse, urldefrag
 from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-# ─── Colours for terminal output ───────────────────────────────────────────
-RESET  = "\033[0m"
-CYAN   = "\033[96m"
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-RED    = "\033[91m"
-PURPLE = "\033[95m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
+try:
+    import markdownify as md_lib
+    HAS_MD = True
+except ImportError:
+    HAS_MD = False
 
-BOT_COLORS = [CYAN, PURPLE, GREEN, YELLOW]
+# ── terminal colours ──────────────────────────────────────────────────────────
+R="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
+CYAN="\033[96m"; GREEN="\033[92m"; YELLOW="\033[93m"; RED="\033[91m"; PURPLE="\033[95m"
 
-def cprint(msg, color=RESET, end="\n"):
-    print(f"{color}{msg}{RESET}", end=end, flush=True)
+def cprint(msg, c=R): print(f"{c}{msg}{R}", flush=True)
 
-
-# ─── Thread-safe visited set ────────────────────────────────────────────────
-class VisitedSet:
-    def __init__(self):
-        self._set = set()
-        self._lock = threading.Lock()
-
-    def add_if_new(self, url):
-        """Returns True if url was not yet visited (and adds it)."""
-        with self._lock:
-            if url in self._set:
-                return False
-            self._set.add(url)
-            return True
-
-    def __len__(self):
-        with self._lock:
-            return len(self._set)
-
-
-# ─── Page node ─────────────────────────────────────────────────────────────
-class PageNode:
-    def __init__(self, url, depth):
-        self.url        = url
-        self.depth      = depth
-        self.path       = urlparse(url).path or "/"
-        self.title      = ""
-        self.status     = None
-        self.content_type = ""
-        self.links_found  = []   # absolute URLs on same domain
-        self.forms        = []   # list of {action, method, fields}
-        self.meta         = {}   # og:title, description, etc.
-        self.headings     = []   # h1..h3 text
-        self.images       = []   # src of <img>
-        self.scripts      = []   # src of <script>
-        self.error        = None
-        self.children     = []   # child PageNode objects
-
-
-# ─── Core fetcher / parser ──────────────────────────────────────────────────
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; CaveExplorerBot/1.0; "
-        "+https://github.com/cave-explorer)"
-    ),
+    "User-Agent": "Mozilla/5.0 (compatible; CaveScraperBot/1.0)",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-def fetch_and_parse(node: PageNode, base_domain: str, session: requests.Session):
-    """Fetch a URL and populate node with extracted data."""
-    try:
-        resp = session.get(node.url, timeout=10, allow_redirects=True,
-                           headers=HEADERS, stream=False)
-        node.status = resp.status_code
-        node.content_type = resp.headers.get("content-type", "")
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-        if resp.status_code != 200:
-            node.error = f"HTTP {resp.status_code}"
-            return
+def uid(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()[:10]
 
-        if "text/html" not in node.content_type:
-            node.error = f"Non-HTML: {node.content_type.split(';')[0].strip()}"
-            return
+def clean_text(text: str) -> str:
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
-        soup = BeautifulSoup(resp.text, "lxml")
+def chunk_text(text: str, size: int, overlap: int) -> list[dict]:
+    """Split text into overlapping chunks for RAG embedding."""
+    words = text.split()
+    chunks = []
+    i = 0
+    idx = 0
+    while i < len(words):
+        chunk_words = words[i:i+size]
+        chunk = " ".join(chunk_words)
+        if chunk.strip():
+            chunks.append({"chunk_index": idx, "text": chunk, "word_count": len(chunk_words)})
+            idx += 1
+        i += size - overlap
+    return chunks
 
-        # Title
-        t = soup.find("title")
-        node.title = t.get_text(strip=True)[:120] if t else ""
+def table_to_dicts(table_tag: Tag) -> list[dict]:
+    """Convert HTML <table> to list of row-dicts keyed by header."""
+    rows = table_tag.find_all("tr")
+    if not rows:
+        return []
+    headers = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
+    if not headers:
+        return []
+    result = []
+    for row in rows[1:]:
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if cells:
+            # pad / trim to header length
+            cells += [""] * (len(headers) - len(cells))
+            result.append(dict(zip(headers, cells[:len(headers)])))
+    return result
 
-        # Meta tags
-        for m in soup.find_all("meta"):
-            name = m.get("name") or m.get("property") or ""
-            content = m.get("content") or ""
-            if name and content:
-                node.meta[name] = content[:200]
+def table_to_text(table_dicts: list[dict]) -> str:
+    """Turn table rows into readable text for RAG."""
+    if not table_dicts:
+        return ""
+    lines = []
+    headers = list(table_dicts[0].keys())
+    lines.append(" | ".join(headers))
+    lines.append("-" * len(lines[0]))
+    for row in table_dicts:
+        lines.append(" | ".join(str(row.get(h,"")) for h in headers))
+    return "\n".join(lines)
 
-        # Headings
-        for tag in soup.find_all(["h1", "h2", "h3"]):
-            txt = tag.get_text(strip=True)
-            if txt:
-                node.headings.append({"level": tag.name, "text": txt[:100]})
 
-        # Links
-        origin = urlparse(node.url)
-        seen_links = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if href.startswith(("mailto:", "tel:", "javascript:", "#")):
-                continue
-            abs_url, _ = urldefrag(urljoin(node.url, href))
-            parsed = urlparse(abs_url)
-            if parsed.scheme not in ("http", "https"):
-                continue
-            if parsed.netloc != base_domain:
-                continue
-            clean = parsed._replace(fragment="").geturl()
-            if clean not in seen_links:
-                seen_links.add(clean)
-                node.links_found.append(clean)
+# ─────────────────────────────────────────────────────────────────────────────
+#  CORE EXTRACTOR  —  everything from one page
+# ─────────────────────────────────────────────────────────────────────────────
 
-        # Forms
-        for form in soup.find_all("form"):
-            fields = []
-            for inp in form.find_all(["input", "textarea", "select"]):
-                fields.append({
-                    "tag":  inp.name,
-                    "name": inp.get("name") or inp.get("id") or "",
-                    "type": inp.get("type") or "text",
-                })
-            node.forms.append({
-                "action": urljoin(node.url, form.get("action") or ""),
-                "method": (form.get("method") or "GET").upper(),
-                "fields": fields,
+def extract_all(url: str, html: str, chunk_size: int, chunk_overlap: int) -> dict:
+    soup = BeautifulSoup(html, "lxml")
+    base = url
+
+    # ── 1. Metadata ──────────────────────────────────────────────────────────
+    meta = {}
+    for m in soup.find_all("meta"):
+        name = m.get("name") or m.get("property") or ""
+        content = m.get("content") or ""
+        if name and content:
+            meta[name] = content[:300]
+
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else meta.get("og:title","")
+
+    canonical = ""
+    link_can = soup.find("link", rel="canonical")
+    if link_can:
+        canonical = link_can.get("href","")
+
+    # ── 2. Remove noise tags ─────────────────────────────────────────────────
+    for tag in soup(["script","style","noscript","svg","header","footer",
+                     "nav","aside","[role=navigation]","[aria-hidden=true]"]):
+        tag.decompose()
+
+    # ── 3. Headings ──────────────────────────────────────────────────────────
+    headings = []
+    for tag in soup.find_all(["h1","h2","h3","h4","h5","h6"]):
+        txt = clean_text(tag.get_text())
+        if txt:
+            headings.append({"level": tag.name, "text": txt})
+
+    # ── 4. Tables ────────────────────────────────────────────────────────────
+    tables = []
+    for i, tbl in enumerate(soup.find_all("table")):
+        rows = table_to_dicts(tbl)
+        if rows:
+            caption_tag = tbl.find("caption")
+            caption = caption_tag.get_text(strip=True) if caption_tag else f"Table {i+1}"
+            tables.append({
+                "caption": caption,
+                "rows": rows,
+                "as_text": table_to_text(rows),
+            })
+        tbl.decompose()  # remove from soup so it doesn't appear in body text
+
+    # ── 5. Images ────────────────────────────────────────────────────────────
+    images = []
+    for img in soup.find_all("img"):
+        src = img.get("src","").strip()
+        if not src or src.startswith("data:"):
+            continue
+        abs_src = urljoin(base, src)
+        alt  = clean_text(img.get("alt",""))
+        # look for caption in adjacent figcaption
+        caption = ""
+        fig = img.find_parent("figure")
+        if fig:
+            fc = fig.find("figcaption")
+            if fc:
+                caption = clean_text(fc.get_text())
+        images.append({
+            "url": abs_src,
+            "alt": alt,
+            "caption": caption,
+        })
+
+    # ── 6. Links ─────────────────────────────────────────────────────────────
+    links = []
+    seen_links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("mailto:","tel:","javascript:","#")):
+            continue
+        abs_href = urljoin(base, href)
+        txt = clean_text(a.get_text())
+        if abs_href not in seen_links:
+            seen_links.add(abs_href)
+            links.append({"text": txt[:100], "url": abs_href})
+
+    # ── 7. PDF / file links ───────────────────────────────────────────────────
+    pdf_links = [
+        lnk for lnk in links
+        if lnk["url"].lower().endswith((".pdf",".docx",".xlsx",".csv",".pptx"))
+    ]
+
+    # ── 8. Forms ─────────────────────────────────────────────────────────────
+    forms = []
+    for form in soup.find_all("form"):
+        fields = []
+        for inp in form.find_all(["input","textarea","select"]):
+            fields.append({
+                "tag":   inp.name,
+                "name":  inp.get("name") or inp.get("id") or "",
+                "type":  inp.get("type","text"),
+                "placeholder": inp.get("placeholder",""),
+            })
+        forms.append({
+            "action": urljoin(base, form.get("action") or ""),
+            "method": (form.get("method") or "GET").upper(),
+            "fields": fields,
+        })
+
+    # ── 9. JSON-LD structured data ────────────────────────────────────────────
+    json_ld = []
+    for s in BeautifulSoup(html, "lxml").find_all("script", type="application/ld+json"):
+        try:
+            json_ld.append(json.loads(s.string or ""))
+        except Exception:
+            pass
+
+    # ── 10. Body text  (markdown if available, else plain) ───────────────────
+    main = soup.find("main") or soup.find("article") or soup.find("body") or soup
+    if HAS_MD:
+        body_text = md_lib.markdownify(str(main), heading_style="ATX", strip=["a","img"])
+        body_text = re.sub(r'\n{3,}', '\n\n', body_text).strip()
+    else:
+        body_text = clean_text(main.get_text(" ", strip=True))
+
+    # ── 11. Full page text (headings + tables + body) for RAG ────────────────
+    heading_text = "\n".join(f"{'#'*int(h['level'][1:])} {h['text']}" for h in headings)
+    table_text   = "\n\n".join(t["as_text"] for t in tables)
+    image_text   = "\n".join(
+        f"[Image: {i['alt'] or 'no alt'}{ ' — ' + i['caption'] if i['caption'] else ''}]"
+        for i in images
+    )
+    full_text = "\n\n".join(filter(None, [heading_text, body_text, table_text, image_text]))
+
+    # ── 12. RAG chunks ────────────────────────────────────────────────────────
+    rag_chunks = []
+    # body chunks
+    rag_chunks += chunk_text(body_text, chunk_size, chunk_overlap)
+    # each table as its own chunk
+    for t in tables:
+        if t["as_text"]:
+            rag_chunks.append({
+                "chunk_index": len(rag_chunks),
+                "text": f"Table: {t['caption']}\n{t['as_text']}",
+                "word_count": len(t['as_text'].split()),
+                "source_type": "table",
+            })
+    # image alt/caption as mini-chunks
+    for img in images:
+        img_txt = " ".join(filter(None,[img["alt"], img["caption"]])).strip()
+        if img_txt:
+            rag_chunks.append({
+                "chunk_index": len(rag_chunks),
+                "text": f"Image on page: {img_txt}",
+                "word_count": len(img_txt.split()),
+                "source_type": "image_description",
+                "image_url": img["url"],
             })
 
-        # Images
-        for img in soup.find_all("img", src=True):
-            node.images.append(urljoin(node.url, img["src"]))
-
-        # Scripts
-        for s in soup.find_all("script", src=True):
-            node.scripts.append(urljoin(node.url, s["src"]))
-
-    except requests.exceptions.Timeout:
-        node.error = "Timeout"
-    except requests.exceptions.ConnectionError as e:
-        node.error = f"Connection error: {str(e)[:80]}"
-    except Exception as e:
-        node.error = f"Error: {str(e)[:80]}"
-
-
-# ─── Recursive explorer (the "cave bot") ───────────────────────────────────
-class CaveExplorer:
-    def __init__(self, root_url, max_depth=2, max_pages=100, max_threads=8):
-        parsed = urlparse(root_url)
-        self.root_url    = parsed._replace(fragment="").geturl()
-        self.base_domain = parsed.netloc
-        self.max_depth   = max_depth
-        self.max_pages   = max_pages
-        self.max_threads = max_threads
-        self.visited     = VisitedSet()
-        self.session     = requests.Session()
-        self._lock       = threading.Lock()
-        self._bot_id     = 0
-        self.stats       = defaultdict(int)
-
-    def _new_bot_id(self):
-        with self._lock:
-            self._bot_id += 1
-            return self._bot_id
-
-    def _log_split(self, bot_id, url, n_children, depth):
-        color = BOT_COLORS[depth % len(BOT_COLORS)]
-        indent = "  " * depth
-        cprint(f"{indent}⑂  BOT-{bot_id:03d}  SPLIT → {n_children} child bots  [{urlparse(url).path or '/'}]", color)
-
-    def _log_scan(self, bot_id, url, depth):
-        color = BOT_COLORS[depth % len(BOT_COLORS)]
-        indent = "  " * depth
-        cprint(f"{indent}◉  BOT-{bot_id:03d}  scanning  {urlparse(url).path or '/'}", DIM)
-
-    def _log_merge(self, bot_id, url, n, depth):
-        color = BOT_COLORS[depth % len(BOT_COLORS)]
-        indent = "  " * depth
-        cprint(f"{indent}⇒  BOT-{bot_id:03d}  MERGE ← {n} children  [{urlparse(url).path or '/'}]", GREEN)
-
-    def _log_error(self, bot_id, url, err, depth):
-        indent = "  " * depth
-        cprint(f"{indent}✕  BOT-{bot_id:03d}  {urlparse(url).path or '/'}  — {err}", RED)
-
-    def _explore(self, url: str, depth: int) -> PageNode | None:
-        """Recursively explore a URL. Returns a populated PageNode or None."""
-        if len(self.visited) >= self.max_pages:
-            return None
-        if not self.visited.add_if_new(url):
-            return None  # already claimed by another bot
-
-        bot_id = self._new_bot_id()
-        node   = PageNode(url, depth)
-
-        self._log_scan(bot_id, url, depth)
-        fetch_and_parse(node, self.base_domain, self.session)
-        self.stats["pages_fetched"] += 1
-
-        if node.error:
-            self._log_error(bot_id, url, node.error, depth)
-            self.stats["errors"] += 1
-            return node
-
-        self.stats["links_total"] += len(node.links_found)
-
-        # Stop recursing at max depth
-        if depth >= self.max_depth:
-            return node
-
-        # New links to explore
-        new_links = [
-            lnk for lnk in node.links_found
-            if lnk not in self.visited._set   # fast non-locking peek
-        ]
-        if not new_links:
-            return node
-
-        self._log_split(bot_id, url, len(new_links), depth)
-
-        # Spawn child bots in parallel
-        with ThreadPoolExecutor(max_workers=min(len(new_links), self.max_threads)) as ex:
-            futures = {ex.submit(self._explore, lnk, depth + 1): lnk
-                       for lnk in new_links}
-            for fut in as_completed(futures):
-                child = fut.result()
-                if child is not None:
-                    node.children.append(child)
-
-        self._log_merge(bot_id, url, len(node.children), depth)
-        return node
-
-    def run(self) -> PageNode:
-        cprint(f"\n{'═'*60}", CYAN)
-        cprint(f"  CAVE EXPLORER  ⑂  {self.root_url}", BOLD)
-        cprint(f"  depth={self.max_depth}  max_pages={self.max_pages}  threads={self.max_threads}", DIM)
-        cprint(f"{'═'*60}\n", CYAN)
-
-        start = time.time()
-        root  = self._explore(self.root_url, 0)
-        elapsed = time.time() - start
-
-        cprint(f"\n{'═'*60}", GREEN)
-        cprint(f"  ✓  EXPLORATION COMPLETE in {elapsed:.1f}s", GREEN + BOLD)
-        cprint(f"  Pages visited : {len(self.visited)}", GREEN)
-        cprint(f"  Errors        : {self.stats['errors']}", YELLOW if self.stats['errors'] else GREEN)
-        cprint(f"  Links found   : {self.stats['links_total']}", GREEN)
-        cprint(f"{'═'*60}\n", GREEN)
-
-        return root
-
-
-# ─── Serialise tree → dict ──────────────────────────────────────────────────
-def node_to_dict(node: PageNode) -> dict:
     return {
-        "url":          node.url,
-        "path":         node.path,
-        "depth":        node.depth,
-        "status":       node.status,
-        "title":        node.title,
-        "content_type": node.content_type,
-        "error":        node.error,
-        "meta":         node.meta,
-        "headings":     node.headings,
-        "forms":        node.forms,
-        "images":       node.images[:20],     # cap to keep JSON sane
-        "scripts":      node.scripts[:20],
-        "links_found":  node.links_found,
-        "children":     [node_to_dict(c) for c in node.children],
+        "url":        url,
+        "path":       urlparse(url).path or "/",
+        "title":      title,
+        "canonical":  canonical,
+        "metadata":   meta,
+        "headings":   headings,
+        "body_text":  body_text,
+        "full_text":  full_text,
+        "tables":     tables,
+        "images":     images,
+        "links":      links,
+        "pdf_links":  pdf_links,
+        "forms":      forms,
+        "json_ld":    json_ld,
+        "rag_chunks": rag_chunks,
+        "stats": {
+            "words":   len(body_text.split()),
+            "tables":  len(tables),
+            "images":  len(images),
+            "links":   len(links),
+            "pdfs":    len(pdf_links),
+            "chunks":  len(rag_chunks),
+        }
     }
 
 
-# ─── Flat list of all pages (for scraping) ─────────────────────────────────
-def flatten(node: PageNode, out=None) -> list[dict]:
-    if out is None:
-        out = []
-    out.append({
-        "url":    node.url,
-        "path":   node.path,
-        "depth":  node.depth,
-        "title":  node.title,
-        "status": node.status,
-        "error":  node.error,
-        "forms":  node.forms,
-        "meta":   node.meta,
-    })
-    for child in node.children:
-        flatten(child, out)
-    return out
+# ─────────────────────────────────────────────────────────────────────────────
+#  FETCH + EXTRACT one page
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scrape_page(page: dict, session: requests.Session,
+                chunk_size: int, chunk_overlap: int) -> dict:
+    url = page["url"]
+    result = {"url": url, "path": page["path"], "error": None, "data": {}}
+    try:
+        resp = session.get(url, timeout=12, headers=HEADERS, allow_redirects=True)
+        if resp.status_code != 200:
+            result["error"] = f"HTTP {resp.status_code}"
+            return result
+        ct = resp.headers.get("content-type","")
+        if "text/html" not in ct:
+            result["error"] = f"Non-HTML ({ct.split(';')[0].strip()})"
+            return result
+        result["data"] = extract_all(url, resp.text, chunk_size, chunk_overlap)
+    except requests.exceptions.Timeout:
+        result["error"] = "Timeout"
+    except Exception as e:
+        result["error"] = str(e)[:120]
+    return result
 
 
-# ─── Pretty tree printer ────────────────────────────────────────────────────
-def print_tree(node: PageNode, prefix="", is_last=True, depth_limit=99):
-    connector = "└── " if is_last else "├── "
-    color     = BOT_COLORS[node.depth % len(BOT_COLORS)]
-    status    = f" [{node.status}]" if node.status else ""
-    err       = f"  ← {node.error}" if node.error else ""
-    title     = f"  \"{node.title}\"" if node.title else ""
-    cprint(f"{prefix}{connector}{node.path}{status}{title}{err}", color)
+# ─────────────────────────────────────────────────────────────────────────────
+#  WRITE OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if node.depth >= depth_limit:
-        return
+def save_outputs(results: list[dict], out_dir: str, site_url: str):
+    os.makedirs(out_dir, exist_ok=True)
 
-    child_prefix = prefix + ("    " if is_last else "│   ")
-    for i, child in enumerate(node.children):
-        print_tree(child, child_prefix, i == len(node.children) - 1, depth_limit)
+    # ── full_data.json  (everything, one file) ───────────────────────────────
+    full_path = os.path.join(out_dir, "full_data.json")
+    with open(full_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "source": site_url,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "total_pages": len(results),
+            "pages": results,
+        }, f, indent=2, ensure_ascii=False)
+
+    # ── rag_chunks.json  (flat list of all chunks — feed this to embeddings) ─
+    all_chunks = []
+    for r in results:
+        if r["error"] or not r["data"]:
+            continue
+        d = r["data"]
+        for chunk in d.get("rag_chunks", []):
+            all_chunks.append({
+                "id":         uid(r["url"] + str(chunk["chunk_index"])),
+                "source_url": r["url"],
+                "source_path": r["path"],
+                "page_title": d.get("title",""),
+                "chunk_index": chunk["chunk_index"],
+                "text":        chunk["text"],
+                "word_count":  chunk.get("word_count", 0),
+                "source_type": chunk.get("source_type","text"),
+                "image_url":   chunk.get("image_url",""),
+            })
+    chunks_path = os.path.join(out_dir, "rag_chunks.json")
+    with open(chunks_path, "w", encoding="utf-8") as f:
+        json.dump(all_chunks, f, indent=2, ensure_ascii=False)
+
+    # ── rag_chunks.jsonl  (one chunk per line — compatible with most loaders) ─
+    jsonl_path = os.path.join(out_dir, "rag_chunks.jsonl")
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for chunk in all_chunks:
+            f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+
+    # ── images.json  (all images across the site) ────────────────────────────
+    all_images = []
+    for r in results:
+        if r["error"] or not r["data"]:
+            continue
+        for img in r["data"].get("images", []):
+            all_images.append({**img, "found_on": r["url"]})
+    images_path = os.path.join(out_dir, "images.json")
+    with open(images_path, "w", encoding="utf-8") as f:
+        json.dump(all_images, f, indent=2, ensure_ascii=False)
+
+    # ── tables.json  (all tables across the site) ────────────────────────────
+    all_tables = []
+    for r in results:
+        if r["error"] or not r["data"]:
+            continue
+        for tbl in r["data"].get("tables", []):
+            all_tables.append({**tbl, "found_on": r["url"], "page_title": r["data"].get("title","")})
+    tables_path = os.path.join(out_dir, "tables.json")
+    with open(tables_path, "w", encoding="utf-8") as f:
+        json.dump(all_tables, f, indent=2, ensure_ascii=False)
+
+    # ── pdfs.json  (all PDF / file links found) ───────────────────────────────
+    all_pdfs = []
+    for r in results:
+        if r["error"] or not r["data"]:
+            continue
+        for pdf in r["data"].get("pdf_links", []):
+            all_pdfs.append({**pdf, "found_on": r["url"]})
+    pdfs_path = os.path.join(out_dir, "pdfs.json")
+    with open(pdfs_path, "w", encoding="utf-8") as f:
+        json.dump(all_pdfs, f, indent=2, ensure_ascii=False)
+
+    return {
+        "full_data":   full_path,
+        "rag_chunks":  chunks_path,
+        "rag_jsonl":   jsonl_path,
+        "images":      images_path,
+        "tables":      tables_path,
+        "pdfs":        pdfs_path,
+        "total_chunks": len(all_chunks),
+        "total_images": len(all_images),
+        "total_tables": len(all_tables),
+        "total_pdfs":   len(all_pdfs),
+    }
 
 
-# ─── CLI ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Cave Explorer — recursive website mapper",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("url",         help="Root URL to explore")
-    parser.add_argument("--depth",     type=int, default=2,   help="Max crawl depth (default 2)")
-    parser.add_argument("--max-pages", type=int, default=100, help="Max pages to visit (default 100)")
-    parser.add_argument("--threads",   type=int, default=8,   help="Parallel bot threads (default 8)")
-    parser.add_argument("--output",    default="site_map.json", help="Output JSON file (default site_map.json)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Cave Scraper — full content extractor")
+    p.add_argument("map_file",     help="site_map.json from crawler.py")
+    p.add_argument("--filter",     default="",   help="Only scrape paths containing this string")
+    p.add_argument("--depth",      type=int, default=99, help="Only scrape pages at/below this depth")
+    p.add_argument("--threads",    type=int, default=8,  help="Parallel threads (default 8)")
+    p.add_argument("--delay",      type=float, default=0.0, help="Seconds delay between requests")
+    p.add_argument("--chunk-size", type=int, default=400,  help="RAG chunk size in words (default 400)")
+    p.add_argument("--chunk-overlap", type=int, default=50, help="Overlap between chunks (default 50)")
+    p.add_argument("--output",     default="scraped_data", help="Output folder (default: scraped_data/)")
+    args = p.parse_args()
 
-    explorer = CaveExplorer(
-        root_url   = args.url,
-        max_depth  = args.depth,
-        max_pages  = args.max_pages,
-        max_threads= args.threads,
-    )
+    with open(args.map_file, encoding="utf-8") as f:
+        site_map = json.load(f)
 
-    root = explorer.run()
+    all_pages = site_map.get("pages", [])
+    pages = [
+        pg for pg in all_pages
+        if (not args.filter or args.filter in pg["path"])
+        and pg["depth"] <= args.depth
+        and not pg.get("error")
+    ]
 
-    # ── Print the tree ──
-    cprint("SITE TREE\n", CYAN + BOLD)
-    print_tree(root)
+    cprint(f"\n{'═'*60}", CYAN)
+    cprint(f"  CAVE SCRAPER  ⑂  Full Content Extractor", BOLD)
+    cprint(f"  Map    : {args.map_file}  ({len(all_pages)} pages mapped)", DIM)
+    cprint(f"  Scraping {len(pages)} pages  |  {args.threads} threads  |  chunk={args.chunk_size}w", DIM)
+    cprint(f"  Output : {args.output}/", DIM)
+    cprint(f"{'═'*60}\n", CYAN)
 
-    # ── Build output ──
-    all_pages = flatten(root)
-    output = {
-        "meta": {
-            "root_url":    args.url,
-            "crawled_at":  datetime.now(timezone.utc).isoformat(),
-            "depth":       args.depth,
-            "pages_total": len(all_pages),
-        },
-        "tree":  node_to_dict(root),
-        "pages": all_pages,        # ← flat list, perfect for scraping loops
-    }
+    session = requests.Session()
+    results = []
+    errors  = 0
+    lock    = threading.Lock()
 
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        futures = {
+            ex.submit(scrape_page, pg, session, args.chunk_size, args.chunk_overlap): pg
+            for pg in pages
+        }
+        done = 0
+        for fut in as_completed(futures):
+            res = fut.result()
+            with lock:
+                results.append(res)
+                done += 1
+            if res["error"]:
+                errors += 1
+                cprint(f"  ✕  {res['path']:<40}  {res['error']}", RED)
+            else:
+                d = res["data"]
+                st = d.get("stats", {})
+                cprint(
+                    f"  ✓  {res['path']:<40}  "
+                    f"{st.get('words',0):>5}w  "
+                    f"{st.get('tables',0)}tbl  "
+                    f"{st.get('images',0)}img  "
+                    f"{st.get('chunks',0)}chunks",
+                    GREEN
+                )
+            if args.delay:
+                time.sleep(args.delay)
 
-    cprint(f"\n✓  Map saved → {args.output}", GREEN + BOLD)
-    cprint(f"  {len(all_pages)} pages  |  use output['pages'] to iterate for scraping\n", DIM)
+    # ── Save everything ──────────────────────────────────────────────────────
+    site_url = site_map.get("meta", {}).get("root_url", "")
+    info = save_outputs(results, args.output, site_url)
 
-    # ── Quick summary ──
-    cprint("QUICK SUMMARY", CYAN + BOLD)
-    cprint(f"  Domain   : {urlparse(args.url).netloc}")
-    cprint(f"  Pages    : {len(all_pages)}")
-    forms_total = sum(len(p['forms']) for p in all_pages)
-    cprint(f"  Forms    : {forms_total}")
-    errors = [p for p in all_pages if p['error']]
-    cprint(f"  Errors   : {len(errors)}")
-    if errors:
-        for e in errors[:5]:
-            cprint(f"    {e['path']}  — {e['error']}", YELLOW)
+    cprint(f"\n{'═'*60}", GREEN)
+    cprint(f"  ✓  DONE  —  {len(results)} pages scraped, {errors} errors", GREEN + BOLD)
+    cprint(f"{'═'*60}", GREEN)
+    cprint(f"\n  OUTPUT FILES:", CYAN + BOLD)
+    cprint(f"  {'rag_chunks.jsonl':<22}  {info['total_chunks']} chunks  ← feed this to your embedder", GREEN)
+    cprint(f"  {'rag_chunks.json':<22}  same, formatted", GREEN)
+    cprint(f"  {'full_data.json':<22}  everything per page", DIM)
+    cprint(f"  {'images.json':<22}  {info['total_images']} images (url + alt + caption)", DIM)
+    cprint(f"  {'tables.json':<22}  {info['total_tables']} tables", DIM)
+    cprint(f"  {'pdfs.json':<22}  {info['total_pdfs']} file links", DIM)
+    cprint(f"\n  Each chunk in rag_chunks.jsonl has:", CYAN)
+    cprint(f"    id, source_url, source_path, page_title,", DIM)
+    cprint(f"    chunk_index, text, word_count, source_type", DIM)
+    cprint(f"\n  → Load rag_chunks.jsonl into your vector store and go!\n", YELLOW + BOLD)
 
 
 if __name__ == "__main__":
