@@ -1,6 +1,7 @@
 # core/__init__.py
 
 
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -601,54 +602,10 @@ html, body {
       <div id="messages">
         <div id="empty-state">
 
-          <div class="empty-badge">
-            <span class="badge-star">✦</span>
-            Most powerful AI assistant
-          </div>
-
           <h1 class="empty-title">
             <strong>AI-Powered</strong> Chat Assistant<br>
             for <strong>Cyient</strong> Teams
           </h1>
-
-          <!-- Decorative hero card (clicks focus real input) -->
-          <div class="hero-card" onclick="focusMain()">
-            <div class="hero-card-text">Ask about glossary terms, definitions, or technical concepts…</div>
-            <div class="hero-card-actions">
-              <div class="hero-card-left">
-                <button class="hc-action-btn" onclick="event.stopPropagation()">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                  </svg>
-                  Attach
-                </button>
-                <button class="hc-action-btn" onclick="event.stopPropagation()">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                    <polyline points="17 8 12 3 7 8"/>
-                    <line x1="12" y1="3" x2="12" y2="15"/>
-                  </svg>
-                  Import
-                </button>
-              </div>
-              <div class="hero-card-right">
-                <button class="hc-public" onclick="event.stopPropagation()">
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="10"/>
-                    <line x1="2" y1="12" x2="22" y2="12"/>
-                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-                  </svg>
-                  Public
-                </button>
-                <button class="hc-send" onclick="event.stopPropagation(); focusMain()">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
-                    <path d="M22 2L11 13" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </div>
 
           <!-- Suggestion chips -->
           <div class="empty-chips">
@@ -657,11 +614,6 @@ html, body {
             <span class="chip" onclick="useChip(this)">What does 3D mean?</span>
             <span class="chip" onclick="useChip(this)">Map reference data</span>
           </div>
-
-          <!-- Description -->
-          <p class="empty-desc">
-            Platform designed to be your <strong>personal AI-powered companion</strong> for exploring glossary terms, technical definitions and concepts using <strong>semantic search</strong> and <strong>RAG technology</strong>.
-          </p>
 
         </div>
       </div>
@@ -724,32 +676,11 @@ function useChip(el) {
 function emptyStateHTML() {
   return `
     <div id="empty-state">
-      <div class="empty-badge"><span class="badge-star">✦</span> Most powerful AI assistant</div>
       <h1 class="empty-title"><strong>AI-Powered</strong> Chat Assistant<br>for <strong>Cyient</strong> Teams</h1>
       <div class="hero-card" onclick="focusMain()">
         <div class="hero-card-text">Ask about glossary terms, definitions, or technical concepts…</div>
         <div class="hero-card-actions">
-          <div class="hero-card-left">
-            <button class="hc-action-btn" onclick="event.stopPropagation()">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-              </svg> Attach
-            </button>
-            <button class="hc-action-btn" onclick="event.stopPropagation()">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-              </svg> Import
-            </button>
-          </div>
-          <div class="hero-card-right">
-            <button class="hc-public" onclick="event.stopPropagation()">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="2" y1="12" x2="22" y2="12"/>
-                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-              </svg> Public
-            </button>
+          <div class="hero-card-right" style="margin-left:auto">
             <button class="hc-send" onclick="event.stopPropagation(); focusMain()">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none">
                 <path d="M22 2L11 13" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -765,7 +696,6 @@ function emptyStateHTML() {
         <span class="chip" onclick="useChip(this)">What does 3D mean?</span>
         <span class="chip" onclick="useChip(this)">Map reference data</span>
       </div>
-      <p class="empty-desc">Platform designed to be your <strong>personal AI-powered companion</strong> for exploring glossary terms, technical definitions and concepts using <strong>semantic search</strong> and <strong>RAG technology</strong>.</p>
     </div>`;
 }
 
