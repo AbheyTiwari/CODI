@@ -1,37 +1,20 @@
 # core/__init__.py
 
-# ── Server ──────────────────────────────────────────────
-HOST=0.0.0.0
-PORT=8000
-ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:5500,null
+I am going to give you a Python codebase and a CSV dataset.
 
-# ── ChromaDB ─────────────────────────────────────────────
-CHROMA_PATH=./data/chroma
-CHROMA_COLLECTION=glossary
+Your task is NOT to explain line-by-line. Instead, build me a mental model of how the system works.
 
-# ── Embeddings ───────────────────────────────────────────
-EMBED_MODEL=all-MiniLM-L6-v2
-EMBED_BATCH_SIZE=64
+Please explain:
 
-# ── Retrieval ────────────────────────────────────────────
-TOP_K=5
-SCORE_THRESHOLD=0.3
+1. The overall goal of the project in one sentence.
+2. The complete data flow from input to output.
+3. The role of each major file, class, and function.
+4. How the CSV data moves through preprocessing, training, inference, and evaluation.
+5. Which machine learning model is being used and why.
+6. What features are created, transformed, or selected.
+7. How predictions are generated.
+8. A simple analogy that helps me visualize the entire pipeline.
+9. A diagram (ASCII/text) showing the architecture and data flow.
+10. If I wanted to modify this project for a similar use case, which components would likely need changes and which can stay the same.
 
-# ── LLM — Ollama ─────────────────────────────────────────
-# 1. Install Ollama: https://ollama.com/download
-# 2. Pull a model:  ollama pull qwen2.5:3b
-# 3. Ollama runs automatically in the background
-#
-# Good models for your i7 + 32GB RAM:
-#   qwen2.5:3b   → fast, ~2GB, good for POC
-#   qwen2.5:7b   → better quality, ~5GB
-#   llama3.2:3b  → alternative option
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:3b
-OLLAMA_TIMEOUT=60
-
-# ── Rate limiting ────────────────────────────────────────
-RATE_LIMIT=30/minute
-
-# ── Data ─────────────────────────────────────────────────
-DATA_FILE=./data/rag_chunks.jsonl
+Assume I am a developer who understands Python but is learning ML. Focus on concepts, dependencies, and reasoning rather than syntax. Point out any design patterns, hidden assumptions, and common beginner mistakes I might miss.
