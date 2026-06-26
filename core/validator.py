@@ -142,12 +142,30 @@ class Validator:
 
             output = result.output or ""
             file_path = None
-            if isinstance(output, str):
-                # try to infer path from the tool result string when available
-                if "file_modified" in output or "Written" in output:
+            if isinstance(output, str) and output.strip().startswith("{"):
+                try:
+                    payload = json.loads(output)
+                    file_path = payload.get("file_modified") or payload.get("path")
+                except json.JSONDecodeError:
+                    file_path = None
+
+            if not file_path and isinstance(output, str):
+                if "Written" in output:
                     file_path = output.split(" ")[-1].strip()
 
-            errors = build_framework_contamination_errors(output, requirements, path=file_path)
+            if not file_path:
+                continue
+
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(os.getcwd(), file_path)
+
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    file_content = f.read()
+            except Exception:
+                continue
+
+            errors = build_framework_contamination_errors(file_content, requirements, path=file_path)
             if errors:
                 return errors[0]
 
