@@ -5,9 +5,11 @@
 # LLM semantic check only runs if deterministic checks pass.
 # ─────────────────────────────────────────────────────────────────────────────
 
+import json
 import os
 from langchain_core.messages import HumanMessage
 
+from context_trimmer import trim_tool_output
 from dispatcher import Dispatcher
 from llm_factory import get_refiner_llm
 from logger import log
@@ -65,7 +67,12 @@ class Validator:
             self._fail(state, fail_reason)
             log("validator", {"passed": False, "reason": fail_reason[:120]})
             return False
-
+        # ── Framework contamination checks on generated/modified content ───────────
+        contamination_reason = self._framework_contamination_check(state)
+        if contamination_reason:
+            self._fail(state, contamination_reason)
+            log("validator", {"passed": False, "reason": contamination_reason[:120]})
+            return False
         # ── Stall detection ───────────────────────────────────────────────────
         if self._is_stalled(state):
             self._pass(state, "No progress in last 4 iterations — stopping.")
@@ -120,6 +127,29 @@ class Validator:
             # Tool not found — schema mismatch, no point retrying without correction
             if output.startswith("Tool not found:"):
                 return output[:200]
+
+        return ""
+
+    def _framework_contamination_check(self, state: RunState) -> str:
+        """Detect forbidden framework content in recent write/edit results."""
+        requirements = getattr(state, "requirements", None)
+        if not requirements:
+            return ""
+
+        for result in reversed(state.tool_results):
+            if result.tool not in ("create_file", "write_file", "edit_file"):
+                continue
+
+            output = result.output or ""
+            file_path = None
+            if isinstance(output, str):
+                # try to infer path from the tool result string when available
+                if "file_modified" in output or "Written" in output:
+                    file_path = output.split(" ")[-1].strip()
+
+            errors = build_framework_contamination_errors(output, requirements, path=file_path)
+            if errors:
+                return errors[0]
 
         return ""
 
