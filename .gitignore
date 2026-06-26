@@ -1,0 +1,25 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local config and secrets
+.env
+.agent_history
+codi.log
+
+# Local database and vector store artifacts
+chroma_db/
+*.sqlite3
+*.db
+
+# Editor files
+.vscode/
+.idea/
