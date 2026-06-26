@@ -42,12 +42,22 @@ def run_command(args: dict) -> str:
         )
         raw = "\n".join(filter(None, [result.stdout.strip(), result.stderr.strip()])) or "(no output)"
         output = trim_tool_output(raw, max_tokens=600)
+        exit_code = result.returncode
         log("tool_result", {"tool": "run_command", "status": "ok", "output": output[:200]})
-        return output
+        import json
+        return json.dumps({
+            "success":   exit_code == 0,
+            "tool":      "run_command",
+            "command":   command,
+            "exit_code": exit_code,
+            "output":    output,
+        })
     except subprocess.TimeoutExpired:
-        return "ERROR: command timed out after 60s"
+        import json
+        return json.dumps({"success": False, "tool": "run_command", "error": "timed out after 60s", "command": command})
     except Exception as e:
-        return f"ERROR: {e}"
+        import json
+        return json.dumps({"success": False, "tool": "run_command", "error": str(e), "command": command})
 
 
 def register_shell_tools(registry):

@@ -15,11 +15,11 @@
 import json
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
-from context_trimmer import trim_tool_output
+
 from llm_factory import get_refiner_llm
 from logger import log
 from core.prompts import planner_system_prompt, correction_system_prompt
-from state.temp_db import RunState
+from state.temp_db import RunState, TaskRequirements
 from tools.registry import ToolRegistry
 
 
@@ -30,6 +30,30 @@ You are the Improver — the orchestrator of a coding agent called Codi.
 You plan, coordinate, and decide. You never call tools yourself.
 Always respond in valid JSON (no prose, no markdown fences).
 Working directory: {working_dir}"""
+
+
+# ── Requirements extraction prompt ───────────────────────────────────────────
+_REQUIREMENTS_PROMPT = """\
+Extract the task requirements from this user request.
+
+User request: {task}
+
+Respond ONLY with JSON — no fences, no prose:
+{{
+  "framework": "fastapi" or "flask" or "react" or "vanilla" or "django" or null,
+  "must_have": ["list of concrete things that must exist in the output"],
+  "must_not":  ["list of things explicitly forbidden or that would contaminate the stack"],
+  "files":     ["list of files that must be created or modified"]
+}}
+
+Rules:
+- framework: only set if a specific framework is named or clearly implied
+- must_have: be specific — "FastAPI GET / endpoint" not just "endpoint"
+- must_not: always include competing frameworks if framework is set
+- files: include all files needed to complete the task
+- Keep each list item under 60 chars
+
+JSON only:"""
 
 
 # ── Plan prompt ───────────────────────────────────────────────────────────────
@@ -156,25 +180,52 @@ class Improver:
         context_parts = []
         for r in result.get("results", []):
             if r["status"] == "ok":
-                context_parts.append(
-                    f"[{r['tool']}]{chr(10)}{trim_tool_output(r['output'], max_tokens=120)}"
-                )
+                context_parts.append(f"[{r['tool']}]\n{r['output'][:600]}")
             state.add_tool_result(r["tool"], r["status"], r["output"])
 
         return "\n\n".join(context_parts)
 
     # ── Phase 2: Create plan ──────────────────────────────────────────────────
 
+    def _extract_requirements(self, state: RunState):
+        """
+        Ask the LLM to extract structured requirements from the user input.
+        Populates state.requirements — called once at the start of create_plan.
+        Falls back silently if parsing fails (requirements stay empty defaults).
+        """
+        from dispatcher import Dispatcher
+        prompt = _REQUIREMENTS_PROMPT.format(task=state.user_input)
+        raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
+        parsed = Dispatcher.parse_llm_json(raw)
+
+        if isinstance(parsed, dict):
+            state.requirements = TaskRequirements(
+                framework = parsed.get("framework") or None,
+                must_have = [str(x) for x in parsed.get("must_have", []) if x],
+                must_not  = [str(x) for x in parsed.get("must_not",  []) if x],
+                files     = [str(x) for x in parsed.get("files",     []) if x],
+            )
+            log("improver_requirements", {"requirements": state.requirements.to_dict()})
+        else:
+            log("improver_requirements_fail", {"raw": raw[:200]})
+
     def create_plan(self, state: RunState, context: str) -> dict:
         """
-        Ask the LLM to produce {"plan": str, "steps": [str]}.
+        Extract requirements first, then ask the LLM to produce a plan.
+        Requirements are injected into the plan prompt so every step
+        is grounded against them from the start.
         Falls back gracefully if the LLM outputs plain text instead of JSON.
         """
         from dispatcher import Dispatcher
+
+        # Extract requirements before planning — they anchor every subsequent step
+        self._extract_requirements(state)
+
         prompt = _PLAN_PROMPT.format(
             task=state.user_input,
+            requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
-            context=trim_tool_output(context, max_tokens=1000),
+            context=context[:1200],
         )
 
         # Use planner_system_prompt (from prompts.py) for this call —
@@ -221,10 +272,7 @@ class Improver:
             plan=state.plan,
             plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
             done_steps=f"{done_count} of {len(state.plan_steps)}",
-            tool_results="\n".join(
-                trim_tool_output(o, max_tokens=120)
-                for o in state.recent_tool_outputs(5)
-            ),
+            tool_results="\n".join(state.recent_tool_outputs(5)),
         )
         raw = self._call(prompt)
         state.record_llm("improver_next_step", raw)
@@ -246,31 +294,64 @@ class Improver:
     def improve(self, state: RunState) -> str:
         """
         Called when validation fails.
-        Returns a correction string that gets injected into the plan for Coder.
-        Uses correction_system_prompt() for tight JSON-only output.
+        Returns a correction string injected into the plan for the next Coder call.
+
+        KEY CHANGE: the correction is adaptive — it names the SPECIFIC failure
+        (e.g. "Flask detected") and gives explicit DELETE + REPLACE instructions.
+        Vague corrections like "use FastAPI instead" caused the infinite retry loop.
         """
         from dispatcher import Dispatcher
-        prompt = (
-            f"Task: {state.user_input}\n"
-            f"Validation failed: {state.validation_notes}\n"
-            f"Last tool outputs:\n"
-            + "\n".join(
-                trim_tool_output(o, max_tokens=120)
-                for o in state.recent_tool_outputs(5)
-            )
-            + "\n\nDescribe what the Coder should do differently to fix this.\n"
-            + 'Respond ONLY with JSON: {"correction":"what to fix and how"}\n'
-            + "JSON only:"
+        notes = state.validation_notes or "unknown failure"
+        reqs  = state.requirements
+        forbidden = reqs.framework_lock()
+
+        # Build an adaptive, specific correction based on what failed
+        lines = [
+            f"PREVIOUS ATTEMPT FAILED. Reason: {notes}",
+            "",
+            "REQUIREMENTS (non-negotiable):",
+            reqs.as_prompt_block(),
+            "",
+        ]
+
+        # If it is a framework contamination failure, be brutally explicit
+        if forbidden and any(p.lower() in notes.lower() for p in forbidden):
+            lines += [
+                "CRITICAL: You used a forbidden framework.",
+                "You MUST:",
+                f"  1. DELETE every line containing: {', '.join(forbidden)}",
+                f"  2. Rewrite the ENTIRE file using {reqs.framework} ONLY.",
+                "  3. Do NOT import anything from the forbidden frameworks.",
+                f"Any output still containing forbidden imports is automatic failure.",
+            ]
+
+        lines += [
+            "",
+            "Last tool outputs for context:",
+            *state.recent_tool_outputs(3),
+            "",
+            "Describe the SPECIFIC fix in one sentence.",
+            'Respond ONLY with JSON: {"correction":"exact fix instruction"}',
+            "JSON only:",
+        ]
+
+        raw = self._call(
+            "\n".join(lines),
+            system=SystemMessage(content=correction_system_prompt())
         )
-        raw = self._call(prompt, system=SystemMessage(content=correction_system_prompt()))
         state.record_llm("improver_improve", raw)
 
         parsed = Dispatcher.parse_llm_json(raw)
         if isinstance(parsed, dict):
-            return _as_text(parsed.get("correction", raw))
-        if parsed:
-            return _as_text(parsed)
-        return _as_text(raw)
+            correction = _as_text(parsed.get("correction", raw))
+        elif parsed:
+            correction = _as_text(parsed)
+        else:
+            # Fallback: construct correction directly — don't rely on LLM if it's struggling
+            correction = f"FAILED: {notes}. Fix required: {reqs.as_prompt_block()}"
+
+        log("improver_correction", {"correction": correction[:200]})
+        return correction
 
     # ── Phase 5: Final summary ────────────────────────────────────────────────
 
@@ -281,10 +362,7 @@ class Improver:
 
         prompt = _FINAL_PROMPT.format(
             task=state.user_input,
-            tool_results="\n".join(
-                trim_tool_output(o, max_tokens=120)
-                for o in state.recent_tool_outputs(8)
-            ),
+            tool_results="\n".join(state.recent_tool_outputs(8)),
         )
         raw = self._call(prompt)
         state.record_llm("improver_summary", raw)

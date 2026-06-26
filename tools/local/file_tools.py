@@ -1,6 +1,7 @@
 # File I/O tools. All callables receive a plain dict of args and return a string.
 
 import ast
+import json
 import os
 import subprocess
 import time
@@ -109,12 +110,18 @@ def write_file(args: dict) -> str:
             else:
                 f.write(content)
         log("tool_result", {"tool": "write_file", "path": path, "status": "ok"})
-        msg = f"Written {len(content)} chars to {path}"
+        result = {
+            "success":       True,
+            "tool":          "write_file",
+            "file_modified": path,
+            "bytes_written": len(content),
+            "syntax_ok":     not bool(syntax_warning),
+        }
         if syntax_warning:
-            msg += f"\n{syntax_warning}"
-        return msg
+            result["syntax_warning"] = syntax_warning
+        return json.dumps(result)
     except Exception as e:
-        return f"ERROR writing {path}: {e}"
+        return json.dumps({"success": False, "tool": "write_file", "error": str(e), "path": path})
 
 
 def edit_file(args: dict) -> str:
@@ -164,12 +171,18 @@ def edit_file(args: dict) -> str:
             "status": "ok",
             "changes": changes,
         })
-        msg = f"Edited {path} ({changes} change{'s' if changes != 1 else ''})"
+        result = {
+            "success":       True,
+            "tool":          "edit_file",
+            "file_modified": path,
+            "changes":       changes,
+            "syntax_ok":     not bool(syntax_warning),
+        }
         if syntax_warning:
-            msg += f"\n{syntax_warning}"
-        return msg
+            result["syntax_warning"] = syntax_warning
+        return json.dumps(result)
     except Exception as e:
-        return f"ERROR editing {path}: {e}"
+        return json.dumps({"success": False, "tool": "edit_file", "error": str(e), "path": path})
 
 
 def list_files(args) -> str:
@@ -241,15 +254,67 @@ def _python_syntax_check(path: str, content: str) -> str:
         return f"WARNING: SyntaxError in {path} (line {e.lineno}): {e.msg} — file was written, please fix."
 
 
+def _normalize_whitespace(text: str) -> str:
+    """Normalize line endings and strip trailing whitespace per line."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    return "\n".join(line.rstrip() for line in lines)
+
+
 def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tuple[str, int]:
+    """
+    Replace old with new inside content.
+
+    Tries exact match first. If that fails, attempts three cheap normalizations
+    before giving up — catches the most common local-model mistakes:
+      1. Trailing whitespace differences  (model strips trailing spaces)
+      2. Line ending differences          (CRLF vs LF)
+      3. Indentation collapse             (model uses spaces instead of tabs)
+
+    Never silently corrupts the file — if all attempts fail, raises ValueError
+    so the agent knows to retry with the correct old string.
+    """
     if old == "":
         raise ValueError("old text for replacement cannot be empty")
-    occurrences = content.count(old)
-    if occurrences == 0:
-        raise ValueError(f"text not found: {old[:80]}")
-    if count is None or count <= 0:
-        return content.replace(old, new), occurrences
-    return content.replace(old, new, count), min(count, occurrences)
+
+    def _do_replace(c: str, o: str, n: str) -> tuple[str, int]:
+        occurrences = c.count(o)
+        if occurrences == 0:
+            return c, 0
+        if count is None or count <= 0:
+            return c.replace(o, n), occurrences
+        return c.replace(o, n, count), min(count, occurrences)
+
+    # ── Attempt 1: exact match ────────────────────────────────────────────────
+    result, found = _do_replace(content, old, new)
+    if found:
+        return result, found
+
+    # ── Attempt 2: normalize trailing whitespace on both sides ────────────────
+    norm_content = _normalize_whitespace(content)
+    norm_old     = _normalize_whitespace(old)
+    norm_new     = _normalize_whitespace(new)
+
+    result, found = _do_replace(norm_content, norm_old, norm_new)
+    if found:
+        log("edit_fuzzy_match", {"reason": "trailing_whitespace", "old": old[:60]})
+        return result, found
+
+    # ── Attempt 3: collapse runs of spaces/tabs to single space ──────────────
+    import re as _re
+    def _collapse(t: str) -> str:
+        return _re.sub(r"[ \t]+", " ", t)
+
+    coll_content = _collapse(norm_content)
+    coll_old     = _collapse(norm_old)
+    coll_new     = _collapse(norm_new)
+
+    result, found = _do_replace(coll_content, coll_old, coll_new)
+    if found:
+        log("edit_fuzzy_match", {"reason": "indentation_collapse", "old": old[:60]})
+        return result, found
+
+    # ── All attempts failed ───────────────────────────────────────────────────
+    raise ValueError(f"text not found (tried exact + whitespace normalization): {old[:80]}")
 
 
 def _coerce_count(value) -> int | None:
