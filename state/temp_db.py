@@ -141,3 +141,54 @@ class RunState:
             "plan_steps":   len(self.plan_steps),
             "requirements": self.requirements.to_dict(),
         }, indent=2)
+
+    def to_decision_trace(self) -> dict:
+        """
+        Return a comprehensive decision trace for observability.
+        Includes: total LLM calls, tool calls, iterations, validation layers per iteration,
+        files touched, plan adherence, framework lock status.
+        """
+        # Count LLM calls by role
+        llm_calls_by_role = {}
+        for exchange in self.llm_exchanges:
+            role = exchange.get("role", "unknown")
+            llm_calls_by_role[role] = llm_calls_by_role.get(role, 0) + 1
+        
+        # Extract touched files from tool results
+        files_touched = set()
+        for result in self.tool_results:
+            if result.tool in ("create_file", "write_file", "edit_file") and result.status == "ok":
+                # Try to extract file path from output
+                if "file_modified" in result.output or "Written" in result.output:
+                    # Rough heuristic: file paths often appear after these keywords
+                    for line in result.output.split("\n"):
+                        if "file_modified" in line or "Written" in line:
+                            # Extract path-like strings
+                            import re
+                            matches = re.findall(r'([A-Za-z0-9_./\-]+\.(?:py|js|ts|html|css|json|md))', line)
+                            files_touched.update(matches)
+        
+        # Extract validation layers from llm_exchanges (they include validation_decision logs)
+        validation_layers = {}
+        for result in self.tool_results:
+            # Count by tool type as a proxy for validation stages
+            tool = result.tool
+            if tool not in validation_layers:
+                validation_layers[tool] = {"ok": 0, "error": 0}
+            validation_layers[tool][result.status] += 1
+        
+        return {
+            "total_iterations": self.iteration,
+            "max_iterations": self.max_iterations,
+            "total_tool_calls": len(self.tool_results),
+            "successful_tools": len([r for r in self.tool_results if r.status == "ok"]),
+            "failed_tools": len([r for r in self.tool_results if r.status == "error"]),
+            "total_llm_calls": len(self.llm_exchanges),
+            "llm_calls_by_role": llm_calls_by_role,
+            "plan_steps_count": len(self.plan_steps),
+            "files_touched": list(files_touched)[:20],  # Limit to first 20
+            "files_count": len(files_touched),
+            "validation_passed": self.validation_passed,
+            "framework_locked": self.requirements.framework or None,
+            "status": self.status,
+        }

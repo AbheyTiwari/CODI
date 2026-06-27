@@ -41,42 +41,67 @@ class Validator:
         Run all checks. Returns True if task is considered complete.
         Always sets state.validation_passed and state.validation_notes.
         """
+        from context_trimmer import trim_tool_output
 
         # ── Hard cap ──────────────────────────────────────────────────────────
         if state.exceeds_max():
             self._pass(state, "Max iterations reached.")
-            log("validator", {"passed": True, "reason": "max_iterations"})
+            log("validation_decision", {
+                "layer": "max_iterations",
+                "passed": True,
+                "notes": "Max iterations reached.",
+            })
             return True
 
         # ── noop / done signal from Dispatcher means Executor decided it's done
         last = state.tool_results[-1] if state.tool_results else None
         if last and last.tool == "dispatcher" and last.output in ("noop", "done"):
             self._pass(state, "Executor signalled completion.")
-            log("validator", {"passed": True, "reason": "noop_signal"})
+            log("validation_decision", {
+                "layer": "noop_signal",
+                "passed": True,
+                "signal": last.output,
+            })
             return True
 
         # ── No tools ran at all ───────────────────────────────────────────────
         if not state.tool_results:
             self._fail(state, "No tools were executed.")
-            log("validator", {"passed": False, "reason": "no_tool_results"})
+            log("validation_decision", {
+                "layer": "no_tools",
+                "passed": False,
+                "reason": "No tools were executed.",
+            })
             return False
 
         # ── Deterministic checks ──────────────────────────────────────────────
         fail_reason = self._deterministic_checks(state)
         if fail_reason:
             self._fail(state, fail_reason)
-            log("validator", {"passed": False, "reason": fail_reason[:120]})
+            log("validation_decision", {
+                "layer": "deterministic",
+                "passed": False,
+                "reason": trim_tool_output(fail_reason, max_tokens=15),
+            })
             return False
         # ── Framework contamination checks on generated/modified content ───────────
         contamination_reason = self._framework_contamination_check(state)
         if contamination_reason:
             self._fail(state, contamination_reason)
-            log("validator", {"passed": False, "reason": contamination_reason[:120]})
+            log("validation_decision", {
+                "layer": "contamination",
+                "passed": False,
+                "reason": trim_tool_output(contamination_reason, max_tokens=15),
+            })
             return False
         # ── Stall detection ───────────────────────────────────────────────────
         if self._is_stalled(state):
             self._pass(state, "No progress in last 4 iterations — stopping.")
-            log("validator", {"passed": True, "reason": "stalled"})
+            log("validation_decision", {
+                "layer": "stall_detection",
+                "passed": True,
+                "reason": "No progress in last 4 iterations",
+            })
             return True
 
         # ── LLM semantic check ────────────────────────────────────────────────
@@ -198,6 +223,8 @@ class Validator:
 
     def _llm_check(self, state: RunState) -> bool:
         """Ask the LLM if the task is semantically complete."""
+        from context_trimmer import trim_tool_output
+        
         prompt = _VALIDATE_PROMPT.format(
             task=state.user_input,
             tool_results="\n".join(
@@ -207,17 +234,33 @@ class Validator:
         )
         try:
             resp   = self.llm.invoke([HumanMessage(content=prompt)])
-            parsed = Dispatcher.parse_llm_json(resp.content)
+            raw_response = resp.content
+            parsed = Dispatcher.parse_llm_json(raw_response)
             if isinstance(parsed, dict):
                 passed = bool(parsed.get("passed", False))
                 notes  = str(parsed.get("notes", ""))
                 state.validation_passed = passed
                 state.validation_notes  = notes
-                log("validator", {"passed": passed, "notes": notes[:100]})
+                
+                log("validation_decision", {
+                    "layer": "llm_semantic",
+                    "passed": passed,
+                    "notes": trim_tool_output(notes, max_tokens=20),
+                    "prompt": trim_tool_output(prompt, max_tokens=40),
+                    "response": trim_tool_output(raw_response, max_tokens=30),
+                })
                 return passed
         except Exception as e:
-            log("validator_error", {"error": str(e)})
+            log("validation_decision", {
+                "layer": "llm_semantic",
+                "error": str(e)[:200],
+            })
 
         # Can't validate → assume done to prevent infinite loop
         self._pass(state, "Validation check failed — assuming complete.")
+        log("validation_decision", {
+            "layer": "llm_semantic",
+            "fallback": True,
+            "reason": "Validation check failed",
+        })
         return True

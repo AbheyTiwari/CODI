@@ -160,6 +160,7 @@ class Improver:
         """
         import re
         from dispatcher import Dispatcher
+        from context_trimmer import trim_tool_output
         dispatcher = Dispatcher(self.registry)
 
         tools_to_run = [
@@ -178,10 +179,36 @@ class Improver:
         result = dispatcher.dispatch({"action": "tool_call", "tools": tools_to_run})
 
         context_parts = []
+        files_inspected = []
+        total_context_chars = 0
         for r in result.get("results", []):
-            if r["status"] == "ok":
-                context_parts.append(f"[{r['tool']}]\n{r['output'][:600]}")
-            state.add_tool_result(r["tool"], r["status"], r["output"])
+            tool_name = r["tool"]
+            status = r["status"]
+            output = r["output"]
+            output_len = len(output)
+            total_context_chars += output_len
+            
+            # Log each tool call
+            log("context_gathered_tool", {
+                "tool": tool_name,
+                "status": status,
+                "output_len": output_len,
+                "output_sample": trim_tool_output(output, max_tokens=10) if status == "ok" else output[:150],
+            })
+            
+            if status == "ok":
+                context_parts.append(f"[{tool_name}]\n{output[:600]}")
+                if tool_name == "read_file" and "path" in (r.get("args") or {}):
+                    files_inspected.append(r.get("args", {}).get("path"))
+            state.add_tool_result(tool_name, status, output)
+        
+        # Log final context summary
+        log("context_gathered", {
+            "files_inspected": len(files_inspected),
+            "total_context_chars": total_context_chars,
+            "tools_run": len([r for r in result.get("results", []) if r["status"] == "ok"]),
+            "files_list": files_inspected[:10],
+        })
 
         return "\n\n".join(context_parts)
 
@@ -233,6 +260,7 @@ class Improver:
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
         state.record_llm("improver_plan_raw", raw)
 
+        from context_trimmer import trim_tool_output
         parsed = Dispatcher.parse_llm_json(raw)
         if isinstance(parsed, dict) and "steps" in parsed:
             state.plan = _as_text(parsed.get("plan", ""))
@@ -242,11 +270,15 @@ class Improver:
             else:
                 s = _as_text(raw_steps)
                 state.plan_steps = [s] if s else []
-            log("improver_plan", {"steps": len(state.plan_steps), "plan": state.plan[:120]})
+            log("plan_created", {
+                "plan_source": "json",
+                "steps": len(state.plan_steps),
+                "plan": trim_tool_output(state.plan, max_tokens=20),
+                "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
+            })
             return parsed
 
         # Fallback: LLM output wasn't JSON — extract non-empty lines as steps
-        log("improver_plan_fallback", {"raw": raw[:200]})
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
         # Strip markdown fences and leading numbers/bullets
         steps = []
@@ -259,6 +291,14 @@ class Improver:
                 steps.append(line)
         state.plan       = raw[:200]
         state.plan_steps = steps[:5]
+        
+        log("plan_created", {
+            "plan_source": "fallback",
+            "steps": len(state.plan_steps),
+            "plan": trim_tool_output(state.plan, max_tokens=20),
+            "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
+            "raw_sample": trim_tool_output(raw, max_tokens=30),
+        })
         return {"plan": state.plan, "steps": state.plan_steps}
 
     # ── Phase 3: Decide next step ─────────────────────────────────────────────
@@ -266,6 +306,7 @@ class Improver:
     def next_step(self, state: RunState) -> dict:
         """Return {"step": str, "done": bool} for the current iteration."""
         from dispatcher import Dispatcher
+        from context_trimmer import trim_tool_output
         done_count = max(0, state.iteration - 1)
         prompt = _NEXT_STEP_PROMPT.format(
             task=state.user_input,
@@ -278,16 +319,32 @@ class Improver:
         state.record_llm("improver_next_step", raw)
 
         parsed = Dispatcher.parse_llm_json(raw)
+        selected_step = None
+        matched_plan = False
+        done = False
+        
         if isinstance(parsed, dict):
-            return {
-                "step": _as_text(parsed.get("step", "")),
-                "done": bool(parsed.get("done", False)),
-            }
-        # parse returned something non-dict (rare) — treat as a step string
-        if parsed:
-            return {"step": _as_text(parsed), "done": False}
-        # Total parse failure — return raw text as the step, keep going
-        return {"step": _as_text(raw)[:300], "done": False}
+            selected_step = _as_text(parsed.get("step", ""))
+            done = bool(parsed.get("done", False))
+        elif parsed:
+            selected_step = _as_text(parsed)
+        else:
+            # Total parse failure — return raw text as the step, keep going
+            selected_step = _as_text(raw)[:300]
+        
+        # Check if selected step exactly matches a plan step
+        if selected_step and state.plan_steps:
+            matched_plan = any(selected_step.strip() == ps.strip() for ps in state.plan_steps)
+        
+        log("step_selected", {
+            "step": trim_tool_output(selected_step, max_tokens=20),
+            "matched_plan": matched_plan,
+            "iteration": state.iteration,
+            "done": done,
+            "plan_steps_remaining": max(0, len([s for s in state.plan_steps if s]) - done_count),
+        })
+        
+        return {"step": selected_step, "done": done}
 
     # ── Phase 4: Generate correction after validation failure ─────────────────
 

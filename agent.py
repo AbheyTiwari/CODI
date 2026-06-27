@@ -131,6 +131,10 @@ class CodiAgent:
         # ── Phase 4: Final output ──────────────────────────────────────────────
         output = self.improver.summarize(state)
         state.final_output = output
+        
+        # ── Log decision trace for observability ────────────────────────────────
+        log("task_complete_trace", state.to_decision_trace())
+        
         return output
 
 

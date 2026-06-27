@@ -268,16 +268,20 @@ class Executor:
         For steps that involve writing large files (HTML, CSS, JS with design
         requirements), uses the content-first strategy to avoid JSON truncation.
         """
+        from context_trimmer import trim_tool_output
 
         # ── Content-first routing ─────────────────────────────────────────────
         tool, path = _detect_file_write_step(step)
         if tool and path and _is_large_content_step(step, path):
-            log("executor_routing", {"strategy": "content_first", "path": path})
+            log("tool_routing", {
+                "strategy": "content_first",
+                "tool": tool,
+                "path": path[:80],
+                "repair": False,
+            })
             return self._execute_content_first(step, tool, path, state)
 
         # ── Standard JSON path ────────────────────────────────────────────────
-        log("executor_routing", {"strategy": "json", "step": step[:60]})
-
         prompt = _STEP_PROMPT.format(
             step=step,
             tools=self.registry.summary(),
@@ -302,14 +306,15 @@ class Executor:
             }
 
         state.record_llm("coder", raw)
-        log("executor_coder_raw", {"step": step[:80], "raw": raw[:300]})
 
         # ── Parse ─────────────────────────────────────────────────────────────
         action_bundle = Dispatcher.parse_llm_json(raw)
+        repair_needed = False
 
         # If parse failed, try once more with the repair prompt
         if action_bundle is None:
             action_bundle = self._repair_action_bundle(step, raw, state)
+            repair_needed = True
 
         # If STILL None and this looks like a truncated file-write, switch
         # to content-first as a last resort (catches cases where the LLM
@@ -317,20 +322,39 @@ class Executor:
         if action_bundle is None:
             tool_fb, path_fb = _detect_file_write_step(step)
             if tool_fb and path_fb:
-                log("executor_json_fallback_content_first", {
-                    "step": step[:80], "path": path_fb
+                log("tool_routing", {
+                    "strategy": "json_fallback_content_first",
+                    "tool": tool_fb,
+                    "path": path_fb[:80],
+                    "repair": repair_needed,
                 })
                 return self._execute_content_first(step, tool_fb, path_fb, state)
 
         if action_bundle is None:
             error = f"Coder output was not valid JSON: {raw[:200]}"
-            log("executor_parse_fail", {"raw": raw[:200]})
+            log("tool_routing", {
+                "strategy": "json",
+                "status": "parse_fail",
+                "repair": repair_needed,
+            })
             state.add_tool_result("coder", "error", error)
             return {
                 "status":  "error",
                 "results": [{"tool": "coder", "status": "error", "output": error}],
                 "error":   error,
             }
+
+        # Extract which tools will be called
+        tools_to_call = []
+        if isinstance(action_bundle, dict) and "tools" in action_bundle:
+            tools_to_call = [t.get("name", "unknown") for t in action_bundle.get("tools", [])]
+
+        log("tool_routing", {
+            "strategy": "json",
+            "tools": tools_to_call,
+            "repair": repair_needed,
+            "action": action_bundle.get("action"),
+        })
 
         # ── Dispatch ──────────────────────────────────────────────────────────
         dispatch_result = self.dispatcher.dispatch(action_bundle)
