@@ -268,7 +268,7 @@ class Improver:
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
-            context=context[:1200],
+            context=wrap_prompt_data(context[:1200]),
         )
 
         # Use planner_system_prompt (from prompts.py) for this call —

@@ -189,6 +189,18 @@ class Dispatcher:
         try:
             output = handler(args)
             output_text = str(output)
+            warning = args.get("truncation_warning") if isinstance(args, dict) else None
+            if warning:
+                try:
+                    payload = json.loads(output_text)
+                except (TypeError, ValueError):
+                    payload = None
+
+                if isinstance(payload, dict):
+                    payload["truncation_warning"] = warning
+                    output_text = json.dumps(payload)
+                else:
+                    output_text = f"{output_text}\n{warning}" if output_text else warning
             status = "error" if output_text.startswith(("ERROR", "WRITE REJECTED", "BLOCKED")) else "ok"
             log("dispatcher_ok", {"tool": name, "status": status, "output_len": len(output_text)})
             return {
@@ -218,12 +230,13 @@ class Dispatcher:
         raw_len = len(raw_text)
         repaired_len = len(json.dumps(parsed, ensure_ascii=False))
         if raw_len > repaired_len + 300 and len(content_value) < max(50, raw_len // 3):
+            warning = "WARNING: content may be truncated, verify the file."
             log("dispatcher_content_truncated", {
                 "raw_len": raw_len,
                 "repaired_len": repaired_len,
                 "content_len": len(content_value),
             })
-            parsed["content"] = "WARNING: content may be truncated, verify the file.\n" + content_value
+            parsed["truncation_warning"] = warning
         return parsed
 
     @staticmethod
