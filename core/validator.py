@@ -19,11 +19,13 @@ from core.validation_utils import build_framework_contamination_errors
 
 # Validate prompt — tight JSON-only output expected.
 _VALIDATE_PROMPT = """\
+You are the validator subagent in the dispatcher workflow.
 Task: {task}
 Tool results:
 {tool_results}
 
-Is the task fully complete and correct based on these results?
+Verify whether the current step is complete and correct based on the tool outcomes.
+If the step passes, report success. If it fails, explain the specific issue and hand it back to the improver for repair.
 Respond ONLY with JSON — no fences, no prose:
 {{"passed":true,"notes":""}}
 OR:

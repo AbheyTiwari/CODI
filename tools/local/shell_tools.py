@@ -6,6 +6,8 @@ import subprocess
 from context_trimmer import trim_tool_output
 from logger import log
 
+# Shell execution is intentionally constrained so destructive commands are
+# blocked before they can run and callers receive structured feedback.
 DANGEROUS_PATTERNS = [
     "rm -rf", "rm -f", "mkfs", "dd if=",
     "chmod 777", "> /dev/", "format c:",

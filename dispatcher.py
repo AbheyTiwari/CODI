@@ -66,6 +66,16 @@ class Dispatcher:
 
     # ── Normalization — silently repair common LLM schema errors ─────────────
 
+    @staticmethod
+    def _attach_truncation_warning(tool_call: dict, warning: str | None) -> dict:
+        if not isinstance(tool_call, dict):
+            return tool_call
+
+        args = tool_call.get("args", {})
+        if isinstance(warning, str) and isinstance(args, dict) and "truncation_warning" not in args:
+            args["truncation_warning"] = warning
+        return tool_call
+
     def _normalize_bundle(self, raw: dict) -> dict:
         """
         Repair the most common LLM schema mistakes before dispatch.
@@ -91,16 +101,18 @@ class Dispatcher:
             # content_lines → content (fix 3 inline)
             if "content_lines" in args:
                 args["content"] = "\n".join(str(l) for l in args.pop("content_lines"))
+            warning = raw.get("truncation_warning") if isinstance(raw, dict) else None
             log("dispatcher_normalize", {"fix": "action_as_toolname", "tool": action})
-            return {"action": "tool_call", "tools": [{"name": action, "args": args}]}
+            return {"action": "tool_call", "tools": [self._attach_truncation_warning({"name": action, "args": args}, warning)]}
 
         # ── Fix 2: single tool at root without tools[] wrapper ────────────────
         if action == "tool_call" and "name" in raw and "tools" not in raw:
             args = raw.get("args", {})
             if "content_lines" in args:
                 args["content"] = "\n".join(str(l) for l in args.pop("content_lines"))
+            warning = raw.get("truncation_warning") if isinstance(raw, dict) else None
             log("dispatcher_normalize", {"fix": "missing_tools_wrapper", "tool": raw["name"]})
-            return {"action": "tool_call", "tools": [{"name": raw["name"], "args": args}]}
+            return {"action": "tool_call", "tools": [self._attach_truncation_warning({"name": raw["name"], "args": args}, warning)]}
 
         # ── Fix 3 + 4: tools[] present — clean each entry ────────────────────
         tools = raw.get("tools", [])
@@ -124,7 +136,8 @@ class Dispatcher:
                     args["command"] = t["command"]
                 cleaned.append({"name": t.get("name", ""), "args": args})
             raw = dict(raw)
-            raw["tools"] = cleaned
+            warning = raw.get("truncation_warning") if isinstance(raw, dict) else None
+            raw["tools"] = [self._attach_truncation_warning(tool, warning) for tool in cleaned]
 
         return raw
 
@@ -190,6 +203,8 @@ class Dispatcher:
             output = handler(args)
             output_text = str(output)
             warning = args.get("truncation_warning") if isinstance(args, dict) else None
+            if not warning and isinstance(tool_call, dict):
+                warning = tool_call.get("truncation_warning")
             if warning:
                 try:
                     payload = json.loads(output_text)

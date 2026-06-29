@@ -74,6 +74,8 @@ def _path_arg(args) -> str:
     # dispatcher and agent pass a dict.
     if isinstance(args, str):
         return _abs(args) if args else ""
+    if not isinstance(args, dict):
+        return ""
     raw_path = args.get("path") or args.get("filename") or args.get("file") or ""
     return _abs(str(raw_path)) if raw_path else ""
 
@@ -236,6 +238,9 @@ def create_directory(args: dict) -> str:
 
 def _coerce_content(args: dict) -> str:
     """Accept the content shapes that small local models commonly produce."""
+    if not isinstance(args, dict):
+        return ""
+
     lines = args.get("content_lines")
     if isinstance(lines, list):
         return "\n".join(str(line) for line in lines)
@@ -339,6 +344,9 @@ def _coerce_count(value) -> int | None:
 
 
 def _edit_payload(args: dict) -> str:
+    if not isinstance(args, dict):
+        return ""
+
     for key in ("content", "text", "insert", "value", "new"):
         if key in args:
             value = args.get(key)
@@ -369,6 +377,9 @@ def _find_occurrence(text: str, marker: str, occurrence: int = 1) -> int:
 
 
 def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
+    if not isinstance(args, dict):
+        return content, 0
+
     changes = 0
     replacements = args.get("replacements")
 

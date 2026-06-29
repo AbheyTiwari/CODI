@@ -79,7 +79,7 @@ def trim_context_for_llm(
 
     Token budgets (rough):
       local   — 3500 total context
-      hybrid  — uses the cloud-style budget when the backend is cloud-backed
+      hybrid  — uses the same cloud-style budget as cloud-backed runs
       cloud   — 8000 total context
       air     — 2000 total (phones are memory-constrained)
     """
