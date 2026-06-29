@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm_factory import get_refiner_llm
 from logger import log
 from core.prompts import planner_system_prompt, correction_system_prompt
+from dispatcher import Dispatcher, wrap_prompt_data
 from state.temp_db import RunState, TaskRequirements
 from tools.registry import ToolRegistry
 
@@ -59,6 +60,9 @@ JSON only:"""
 # ── Plan prompt ───────────────────────────────────────────────────────────────
 _PLAN_PROMPT = """\
 Task: {task}
+
+Requirements:
+{requirements}
 
 Available tools: {tools}
 
@@ -159,7 +163,6 @@ class Improver:
         so the Coder LLM can produce valid edit_file old/new pairs.
         """
         import re
-        from dispatcher import Dispatcher
         from context_trimmer import trim_tool_output
         dispatcher = Dispatcher(self.registry)
 
@@ -181,12 +184,13 @@ class Improver:
         context_parts = []
         files_inspected = []
         total_context_chars = 0
+        max_files = 5
+        max_chars = 4000
         for r in result.get("results", []):
             tool_name = r["tool"]
             status = r["status"]
             output = r["output"]
             output_len = len(output)
-            total_context_chars += output_len
             
             # Log each tool call
             log("context_gathered_tool", {
@@ -197,9 +201,22 @@ class Improver:
             })
             
             if status == "ok":
-                context_parts.append(f"[{tool_name}]\n{output[:600]}")
-                if tool_name == "read_file" and "path" in (r.get("args") or {}):
-                    files_inspected.append(r.get("args", {}).get("path"))
+                should_add_context = True
+                if tool_name == "read_file":
+                    path_value = (r.get("args") or {}).get("path")
+                    if len(files_inspected) >= max_files or total_context_chars + len(output) > max_chars:
+                        log("context_capped", {"path": path_value or "unknown", "reason": "read_context_limit"})
+                        should_add_context = False
+                    else:
+                        files_inspected.append(path_value)
+                elif total_context_chars + len(output) > max_chars:
+                    log("context_capped", {"tool": tool_name, "reason": "read_context_limit"})
+                    should_add_context = False
+
+                if should_add_context:
+                    wrapped_output = wrap_prompt_data(output, path=(r.get("args") or {}).get("path"))
+                    context_parts.append(f"[{tool_name}]\n{wrapped_output}")
+                    total_context_chars += len(wrapped_output)
             state.add_tool_result(tool_name, status, output)
         
         # Log final context summary
@@ -220,7 +237,6 @@ class Improver:
         Populates state.requirements — called once at the start of create_plan.
         Falls back silently if parsing fails (requirements stay empty defaults).
         """
-        from dispatcher import Dispatcher
         prompt = _REQUIREMENTS_PROMPT.format(task=state.user_input)
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
         parsed = Dispatcher.parse_llm_json(raw)
@@ -313,7 +329,7 @@ class Improver:
             plan=state.plan,
             plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
             done_steps=f"{done_count} of {len(state.plan_steps)}",
-            tool_results="\n".join(state.recent_tool_outputs(5)),
+            tool_results=wrap_prompt_data("\n".join(state.recent_tool_outputs(5))),
         )
         raw = self._call(prompt)
         state.record_llm("improver_next_step", raw)
@@ -419,7 +435,7 @@ class Improver:
 
         prompt = _FINAL_PROMPT.format(
             task=state.user_input,
-            tool_results="\n".join(state.recent_tool_outputs(8)),
+            tool_results=wrap_prompt_data("\n".join(state.recent_tool_outputs(8))),
         )
         raw = self._call(prompt)
         state.record_llm("improver_summary", raw)

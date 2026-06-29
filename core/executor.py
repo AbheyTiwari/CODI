@@ -14,7 +14,7 @@ import re
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from context_trimmer import trim_tool_output
-from dispatcher import Dispatcher
+from dispatcher import Dispatcher, wrap_prompt_data
 from llm_factory import get_coder_llm
 from logger import log
 from core.prompts import executor_system_prompt
@@ -65,6 +65,9 @@ No JSON. No markdown fences. No explanation. Just the file content itself.
 
 File to write: {path}
 Task: {step}
+
+Requirements:
+{requirements}
 
 Context from project:
 {context}
@@ -214,7 +217,8 @@ class Executor:
         prompt = _CONTENT_PROMPT.format(
             path=path,
             step=step,
-            context=context_str,
+            requirements=state.requirements.as_prompt_block(),
+            context=wrap_prompt_data(context_str, path=path),
         )
 
         try:
@@ -285,10 +289,12 @@ class Executor:
         prompt = _STEP_PROMPT.format(
             step=step,
             tools=self.registry.summary(),
-            context="\n".join(
-                trim_tool_output(o, max_tokens=120)
-                for o in state.recent_tool_outputs(8)
-            ) or "(none yet)",
+            context=wrap_prompt_data(
+                "\n".join(
+                    trim_tool_output(o, max_tokens=120)
+                    for o in state.recent_tool_outputs(8)
+                ) or "(none yet)"
+            ),
         )
 
         # ── Ask Coder LLM ─────────────────────────────────────────────────────

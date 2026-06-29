@@ -353,8 +353,6 @@ MCP (Model Context Protocol) servers extend Codi with external capabilities. The
 | Server | What it does |
 |---|---|
 | `filesystem` | Read and write files anywhere on disk |
-| `sqlite` | Query SQLite databases in your project |
-| `git` | `git status`, `git diff`, `git commit`, `git log` |
 | `memory` | Persistent knowledge graph across sessions |
 | `sequential-thinking` | Forces structured step-by-step reasoning |
 | `github` | Read/write repos, issues, pull requests |
@@ -367,6 +365,8 @@ MCP (Model Context Protocol) servers extend Codi with external capabilities. The
 | Server | What it does | Key needed |
 |---|---|---|
 | `brave-search` | Web search | `BRAVE_API_KEY` |
+| `sqlite` | Query SQLite databases in your project | — |
+| `git` | `git status`, `git diff`, `git commit`, `git log` | — |
 | `postgres` | Query PostgreSQL databases | Connection string in config |
 | `mysql` | Query MySQL databases | Credentials in config |
 | `redis` | Redis key inspection | Redis URL in config |

@@ -70,7 +70,8 @@ class SessionMemory:
             pass  # if compression fails, oldest messages are already dropped — that's fine
 
         finally:
-            self._compressing = False
+            with self._lock:
+                self._compressing = False
 
     def as_text(self) -> str:
         with self._lock:

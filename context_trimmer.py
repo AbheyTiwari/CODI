@@ -85,7 +85,7 @@ def trim_context_for_llm(
     """
     budgets = {
         "local":  3500,
-        "hybrid": 3500,   # local-tier calls; cloud calls skip this trimmer
+        "hybrid": 3500,
         "cloud":  8000,
         "air":    2000,
     }

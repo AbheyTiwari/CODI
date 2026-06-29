@@ -29,8 +29,8 @@ def get_embeddings():
                 model_name="all-MiniLM-L6-v2",
                 use_quantization=_use_quantization
             )
-        except ImportError:
-            # Fall back to regular embeddings if turboquant not available
+        except Exception:
+            # Fall back to regular embeddings if quantized embeddings are unavailable
             _embeddings_instance = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return _embeddings_instance
 

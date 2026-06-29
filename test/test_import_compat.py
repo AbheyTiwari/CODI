@@ -18,6 +18,14 @@ class ImportCompatTests(unittest.TestCase):
         self.assertEqual(executor_cls.__module__, "core.executor")
         self.assertTrue(os.path.normpath(inspect.getsourcefile(executor_cls)).endswith(os.path.normpath("core/executor.py")))
 
+    def test_duplicate_root_files_are_not_present(self):
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        for filename in ("quick_actions.py", "refiner.py"):
+            self.assertFalse(
+                os.path.exists(os.path.join(root_dir, filename)),
+                f"Unexpected duplicate root-level file present: {filename}",
+            )
+
     def test_no_duplicate_class_names_across_source(self):
         root_dir = os.path.dirname(os.path.dirname(__file__))
         duplicate_classes = {}

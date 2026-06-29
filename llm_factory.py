@@ -2,6 +2,8 @@
 # Returns the right LLM instance based on MODE in config.py
 # Supports: local (Ollama) | cloud (Groq/Anthropic/OpenAI/Gemini) | air (Air LLM) | hybrid
 
+from types import SimpleNamespace
+
 import requests
 from config import (
     MODE, CLOUD_PROVIDER,
@@ -10,6 +12,14 @@ from config import (
     AIR_LLM_URL, AIR_LLM_REFINER_MODEL, AIR_LLM_CODER_MODEL, AIR_LLM_TIMEOUT,
 )
 from config_loader import get_api_key
+
+
+class _FallbackLLM:
+    def __init__(self, error: str):
+        self._error = error
+
+    def invoke(self, *_args, **_kwargs):
+        return SimpleNamespace(content="")
 
 
 # ── Ollama health check ───────────────────────────────────────────────────────
@@ -72,7 +82,11 @@ def _resolve(role: str):
 # ── Local (Ollama) ────────────────────────────────────────────────────────────
 
 def _local_llm(role: str):
-    from langchain_ollama import ChatOllama
+    try:
+        from langchain_ollama import ChatOllama
+    except Exception:
+        return _FallbackLLM("langchain_ollama unavailable")
+
     model   = REFINER_MODEL_LOCAL if role == "refiner" else CODER_MODEL_LOCAL
     num_ctx = 4096 if role == "refiner" else 8192
     return ChatOllama(
@@ -91,7 +105,11 @@ def _air_llm(role: str):
     We use langchain_openai with a custom base_url pointing to the phone.
     Make sure the model is loaded in the Air LLM app before calling this.
     """
-    from langchain_openai import ChatOpenAI
+    try:
+        from langchain_openai import ChatOpenAI
+    except Exception:
+        return _FallbackLLM("langchain_openai unavailable")
+
     model = AIR_LLM_REFINER_MODEL if role == "refiner" else AIR_LLM_CODER_MODEL
     return ChatOpenAI(
         model=model,
@@ -110,7 +128,10 @@ def _cloud_llm(role: str):
     temp  = 0.2 if role == "refiner" else 0.1
 
     if CLOUD_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
+        try:
+            from langchain_groq import ChatGroq
+        except Exception:
+            return _FallbackLLM("langchain_groq unavailable")
         return ChatGroq(
             model=model,
             temperature=temp,
@@ -118,7 +139,10 @@ def _cloud_llm(role: str):
         )
 
     if CLOUD_PROVIDER == "anthropic":
-        from langchain_anthropic import ChatAnthropic
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except Exception:
+            return _FallbackLLM("langchain_anthropic unavailable")
         return ChatAnthropic(
             model=model,
             temperature=temp,
@@ -126,7 +150,10 @@ def _cloud_llm(role: str):
         )
 
     if CLOUD_PROVIDER == "openai":
-        from langchain_openai import ChatOpenAI
+        try:
+            from langchain_openai import ChatOpenAI
+        except Exception:
+            return _FallbackLLM("langchain_openai unavailable")
         return ChatOpenAI(
             model=model,
             temperature=temp,
@@ -134,7 +161,10 @@ def _cloud_llm(role: str):
         )
 
     if CLOUD_PROVIDER == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except Exception:
+            return _FallbackLLM("langchain_google_genai unavailable")
         return ChatGoogleGenerativeAI(
             model=model,
             temperature=temp,

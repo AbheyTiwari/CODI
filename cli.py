@@ -18,7 +18,25 @@ import sys
 # so _REPO_ROOT is just the directory containing this file.
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+def _warn_if_privileged():
+    """Warn when Codi runs with elevated privileges; accepted bounded risk for a local dev tool."""
+    is_admin = False
+    if os.name == "nt":
+        try:
+            import ctypes
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            is_admin = False
+    else:
+        is_admin = os.geteuid() == 0
+
+    if is_admin:
+        print("WARNING: CODI is running as root or Administrator. This is an accepted bounded risk for a local dev tool, not something a denylist can fully solve.")
+
+
 def main():
+    _warn_if_privileged()
+
     # 1. Put the repo on sys.path so all Codi modules import correctly
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)

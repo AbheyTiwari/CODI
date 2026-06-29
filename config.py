@@ -86,12 +86,5 @@ CODER_MODEL_CLOUD   = "llama-3.3-70b-versatile"  # strong — use for actual cod
 #  CODER_MODEL_CLOUD   = "gpt-4o"
 
 # ── API keys ──────────────────────────────────────────────────────────────────
-# Best practice: keep these blank here and set in .env or shell env instead:
-#   CODI_GROQ_API_KEY=gsk_...
-#   CODI_ANTHROPIC_API_KEY=sk-ant-...
-#   CODI_OPENAI_API_KEY=sk-...
-#   CODI_GEMINI_API_KEY=AIza...
-GROQ_API_KEY      = ""
-OPENAI_API_KEY    = ""
-ANTHROPIC_API_KEY = ""
-GEMINI_API_KEY    = ""
+# Best practice: keep these blank here and set in .env or shell env instead.
+# The runtime reads them via config_loader.get_api_key().

@@ -58,7 +58,15 @@ def _working_dir() -> str:
 
 
 def _abs(path: str) -> str:
-    return path if os.path.isabs(path) else os.path.join(_working_dir(), path)
+    working_dir = os.path.realpath(_working_dir())
+    candidate = path if os.path.isabs(path) else os.path.join(working_dir, path)
+    candidate_real = os.path.realpath(candidate)
+    try:
+        if os.path.commonpath([working_dir, candidate_real]) != working_dir:
+            return "ERROR: path escapes project directory"
+    except ValueError:
+        return "ERROR: path escapes project directory"
+    return candidate_real
 
 
 def _path_arg(args) -> str:
@@ -101,8 +109,9 @@ def write_file(args: dict) -> str:
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         
-        # Open file in VS Code so user can see the typing effect
-        _open_in_vscode(path)
+        if TYPING_ENABLED:
+            # Open file in VS Code so user can see the typing effect
+            _open_in_vscode(path)
         
         with open(path, "w", encoding="utf-8") as f:
             if TYPING_ENABLED and len(content) > 0:
@@ -157,8 +166,9 @@ def edit_file(args: dict) -> str:
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         
-        # Open file in VS Code before editing so user can see the typing effect
-        _open_in_vscode(path)
+        if TYPING_ENABLED:
+            # Open file in VS Code before editing so user can see the typing effect
+            _open_in_vscode(path)
         
         with open(path, "w", encoding="utf-8") as f:
             if TYPING_ENABLED and len(content) > 0:
@@ -338,6 +348,26 @@ def _edit_payload(args: dict) -> str:
     return ""
 
 
+def _coerce_occurrence(value, default: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 1 else default
+
+
+def _find_occurrence(text: str, marker: str, occurrence: int = 1) -> int:
+    start = 0
+    for index in range(occurrence):
+        pos = text.find(marker, start)
+        if pos == -1:
+            raise ValueError(f"marker not found at occurrence {index + 1}: {marker[:80]}")
+        if index == occurrence - 1:
+            return pos
+        start = pos + len(marker)
+    raise ValueError(f"marker not found: {marker[:80]}")
+
+
 def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
     changes = 0
     replacements = args.get("replacements")
@@ -384,9 +414,8 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
         payload = _edit_payload(args)
         if not marker:
             raise ValueError("insert_after marker cannot be empty")
-        pos = content.find(marker)
-        if pos == -1:
-            raise ValueError(f"insert_after marker not found: {marker[:80]}")
+        occurrence = _coerce_occurrence(args.get("occurrence", 1))
+        pos = _find_occurrence(content, marker, occurrence)
         pos += len(marker)
         content = content[:pos] + payload + content[pos:]
         changes += 1
@@ -396,9 +425,8 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
         payload = _edit_payload(args)
         if not marker:
             raise ValueError("insert_before marker cannot be empty")
-        pos = content.find(marker)
-        if pos == -1:
-            raise ValueError(f"insert_before marker not found: {marker[:80]}")
+        occurrence = _coerce_occurrence(args.get("occurrence", 1))
+        pos = _find_occurrence(content, marker, occurrence)
         content = content[:pos] + payload + content[pos:]
         changes += 1
 
