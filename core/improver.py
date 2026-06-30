@@ -326,6 +326,21 @@ class Improver:
         from dispatcher import Dispatcher
         from context_trimmer import trim_tool_output
         done_count = max(0, state.iteration - 1)
+
+        if state.plan_steps and "[CORRECTION]" not in (state.plan or ""):
+            index = state.iteration - 1
+            if 0 <= index < len(state.plan_steps):
+                selected_step = state.plan_steps[index]
+                log("step_selected", {
+                    "step": trim_tool_output(selected_step, max_tokens=20),
+                    "matched_plan": True,
+                    "iteration": state.iteration,
+                    "done": False,
+                    "plan_steps_remaining": max(0, len(state.plan_steps) - done_count),
+                    "source": "plan_index",
+                })
+                return {"step": selected_step, "done": False}
+
         prompt = _NEXT_STEP_PROMPT.format(
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
