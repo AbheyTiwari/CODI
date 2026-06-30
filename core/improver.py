@@ -14,6 +14,7 @@
 
 import json
 import os
+import re
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_factory import get_refiner_llm
@@ -137,6 +138,59 @@ def _as_text(value) -> str:
         return str(value)
 
 
+def _unique(items: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for item in items:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _extract_file_refs(text: str) -> list[str]:
+    pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|svg))"
+    return _unique([m.group(1).strip("'\"` ") for m in re.finditer(pattern, text or "")])
+
+
+def _deterministic_requirements(task: str) -> TaskRequirements:
+    lowered = (task or "").lower()
+    framework = None
+    for candidate in ("fastapi", "flask", "django", "react"):
+        if candidate in lowered:
+            framework = candidate
+            break
+    if not framework and any(term in lowered for term in ("vanilla js", "plain html", "no framework")):
+        framework = "vanilla"
+
+    files = _extract_file_refs(task)
+    reqs = TaskRequirements(framework=framework, files=files)
+    if framework:
+        reqs.must_have.append(f"{framework} implementation")
+        reqs.must_not.extend(reqs.framework_lock())
+    return reqs
+
+
+def _files_from_tool_results(state: RunState) -> list[str]:
+    files = []
+    for result in state.tool_results:
+        if result.tool not in ("create_file", "write_file", "edit_file"):
+            continue
+        output = result.output or ""
+        if output.strip().startswith("{"):
+            try:
+                payload = json.loads(output)
+                path = payload.get("file_modified") or payload.get("path")
+                if path:
+                    files.append(str(path))
+                    continue
+            except json.JSONDecodeError:
+                pass
+        files.extend(_extract_file_refs(output))
+    return _unique(files)
+
+
 class Improver:
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
@@ -235,24 +289,15 @@ class Improver:
 
     def _extract_requirements(self, state: RunState):
         """
-        Ask the LLM to extract structured requirements from the user input.
-        Populates state.requirements — called once at the start of create_plan.
-        Falls back silently if parsing fails (requirements stay empty defaults).
+        Extract structured requirements without an LLM round trip.
+        The planner still sees the full task, so this only anchors obvious
+        framework and file constraints for validators/executors.
         """
-        prompt = _REQUIREMENTS_PROMPT.format(task=state.user_input)
-        raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
-        parsed = Dispatcher.parse_llm_json(raw)
-
-        if isinstance(parsed, dict):
-            state.requirements = TaskRequirements(
-                framework = parsed.get("framework") or None,
-                must_have = [str(x) for x in parsed.get("must_have", []) if x],
-                must_not  = [str(x) for x in parsed.get("must_not",  []) if x],
-                files     = [str(x) for x in parsed.get("files",     []) if x],
-            )
-            log("improver_requirements", {"requirements": state.requirements.to_dict()})
-        else:
-            log("improver_requirements_fail", {"raw": raw[:200]})
+        state.requirements = _deterministic_requirements(state.user_input)
+        log("improver_requirements", {
+            "source": "deterministic",
+            "requirements": state.requirements.to_dict(),
+        })
 
     def create_plan(self, state: RunState, context: str) -> dict:
         """
@@ -447,15 +492,23 @@ class Improver:
     # ── Phase 5: Final summary ────────────────────────────────────────────────
 
     def summarize(self, state: RunState) -> str:
-        """Produce the final user-facing output. Only place prose is allowed."""
+        """Produce the final user-facing output without an LLM round trip."""
         if not state.tool_results:
             return "Task completed with no tool executions."
 
-        prompt = _FINAL_PROMPT.format(
-            task=state.user_input,
-            tool_results=wrap_prompt_data("\n".join(state.recent_tool_outputs(8))),
-        )
-        raw = self._call(prompt)
-        state.record_llm("improver_summary", raw)
-        log("improver_summary", {"output": raw[:200]})
-        return raw or "Done."
+        files = _files_from_tool_results(state)
+        successes = len([r for r in state.tool_results if r.status == "ok"])
+        failures = len([r for r in state.tool_results if r.status == "error"])
+
+        if files:
+            output = "Done. Changed: " + ", ".join(files[:8]) + "."
+        elif successes:
+            output = f"Done. Completed {successes} tool action(s)."
+        else:
+            output = "Done."
+
+        if failures:
+            output += f" {failures} tool action(s) reported errors."
+
+        log("improver_summary", {"source": "deterministic", "output": output[:200]})
+        return output

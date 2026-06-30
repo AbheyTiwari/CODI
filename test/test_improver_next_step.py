@@ -1,7 +1,8 @@
 import unittest
+import json
 
 from core.improver import Improver
-from state.temp_db import RunState
+from state.temp_db import RunState, ToolResult
 
 
 class ImproverNextStepTests(unittest.TestCase):
@@ -30,6 +31,36 @@ class ImproverNextStepTests(unittest.TestCase):
 
         self.assertEqual(decision, {"step": "Fix compile error", "done": False})
         self.assertEqual(state.llm_exchanges[0]["role"], "improver_next_step")
+
+    def test_extract_requirements_is_deterministic(self):
+        state = RunState(user_input="Create a FastAPI app in main.py and models.py")
+
+        improver = Improver.__new__(Improver)
+        improver._call = lambda *args, **kwargs: self.fail("_extract_requirements called the LLM")
+
+        improver._extract_requirements(state)
+
+        self.assertEqual(state.requirements.framework, "fastapi")
+        self.assertEqual(state.requirements.files, ["main.py", "models.py"])
+        self.assertIn("from flask", state.requirements.must_not)
+
+    def test_summarize_is_deterministic(self):
+        state = RunState()
+        state.tool_results = [
+            ToolResult(
+                "write_file",
+                "ok",
+                json.dumps({"success": True, "file_modified": "Book.java"}),
+            )
+        ]
+
+        improver = Improver.__new__(Improver)
+        improver._call = lambda *args, **kwargs: self.fail("summarize called the LLM")
+
+        output = improver.summarize(state)
+
+        self.assertEqual(output, "Done. Changed: Book.java.")
+        self.assertEqual(state.llm_exchanges, [])
 
 
 if __name__ == "__main__":
