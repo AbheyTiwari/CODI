@@ -7,6 +7,7 @@
 
 import json
 import os
+import subprocess
 from langchain_core.messages import HumanMessage
 
 from context_trimmer import trim_tool_output
@@ -100,6 +101,17 @@ class Validator:
                 "reason": trim_tool_output(fail_reason, max_tokens=15),
             })
             return False
+
+        java_compile_reason = self._java_compile_check(state)
+        if java_compile_reason:
+            self._fail(state, java_compile_reason)
+            log("validation_decision", {
+                "layer": "java_compile",
+                "passed": False,
+                "reason": trim_tool_output(java_compile_reason, max_tokens=15),
+            })
+            return False
+
         # ── Framework contamination checks on generated/modified content ───────────
         contamination_reason = self._framework_contamination_check(state)
         if contamination_reason:
@@ -185,6 +197,50 @@ class Validator:
                 return output[:200]
 
         return ""
+
+    def _java_compile_check(self, state: RunState) -> str:
+        """Run Maven compile when file tools touched Java sources."""
+        java_touched = False
+        for result in state.tool_results:
+            if result.tool not in ("create_file", "write_file", "edit_file"):
+                continue
+            output = result.output or ""
+            if ".java" in output.lower():
+                java_touched = True
+                break
+
+        if not java_touched:
+            return ""
+
+        working_dir = os.environ.get("CODI_WORKING_DIR")
+        if not working_dir or not os.path.exists(os.path.join(working_dir, "pom.xml")):
+            return ""
+
+        try:
+            proc = subprocess.run(
+                ["mvn", "-q", "compile"],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except Exception as e:
+            log("validation_warning", {
+                "layer": "java_compile",
+                "warning": str(e)[:200],
+            })
+            return ""
+
+        if proc.returncode == 0:
+            return ""
+
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        tail = combined[-2000:]
+        try:
+            tail = trim_tool_output(tail, max_tokens=575)
+        except Exception:
+            tail = tail[-2000:]
+        return "JAVA COMPILE FAILED:\n" + tail
 
     def _framework_contamination_check(self, state: RunState) -> str:
         """Detect forbidden framework content in recent write/edit results."""
