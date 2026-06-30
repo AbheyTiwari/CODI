@@ -26,6 +26,9 @@ from tools.registry import ToolRegistry
 _STEP_PROMPT = """\
 Step to execute: {step}
 
+Requirements:
+{requirements}
+
 Available tools:
 {tools}
 
@@ -250,11 +253,27 @@ class Executor:
                 "error":   error,
             }
 
-        # Dispatch directly — no LLM JSON round-trip
-        dispatch_result = self.dispatcher.dispatch({
+        action_bundle = {
             "action": "tool_call",
             "tools":  [{"name": tool, "args": {"path": path, "content": content}}],
-        })
+        }
+
+        violation = self._framework_violation(state, action_bundle)
+        if violation:
+            log("executor_framework_violation", {
+                "tool": tool,
+                "path": path,
+                "reason": violation,
+            })
+            state.add_tool_result(tool, "error", violation)
+            return {
+                "status": "error",
+                "results": [{"tool": tool, "status": "error", "output": violation}],
+                "error": violation,
+            }
+
+        # Dispatch directly — no LLM JSON round-trip
+        dispatch_result = self.dispatcher.dispatch(action_bundle)
 
         # Store results
         for r in dispatch_result.get("results", []):
@@ -288,6 +307,7 @@ class Executor:
         # ── Standard JSON path ────────────────────────────────────────────────
         prompt = _STEP_PROMPT.format(
             step=step,
+            requirements=state.requirements.as_prompt_block(),
             tools=self.registry.summary(),
             context=wrap_prompt_data(
                 "\n".join(
@@ -362,6 +382,19 @@ class Executor:
             "action": action_bundle.get("action"),
         })
 
+        violation = self._framework_violation(state, action_bundle)
+        if violation:
+            log("executor_framework_violation", {
+                "step": step[:80],
+                "reason": violation,
+            })
+            state.add_tool_result("coder", "error", violation)
+            return {
+                "status": "error",
+                "results": [{"tool": "coder", "status": "error", "output": violation}],
+                "error": violation,
+            }
+
         # ── Dispatch ──────────────────────────────────────────────────────────
         dispatch_result = self.dispatcher.dispatch(action_bundle)
 
@@ -377,6 +410,30 @@ class Executor:
             state.add_tool_result(r["tool"], r["status"], r["output"])
 
         return dispatch_result
+
+    def _framework_violation(self, state: RunState, action_bundle: dict) -> str | None:
+        forbidden = getattr(state, "requirements", None)
+        if not forbidden:
+            return None
+        patterns = forbidden.framework_lock()
+        if not patterns or not isinstance(action_bundle, dict):
+            return None
+
+        for tool in action_bundle.get("tools", []):
+            if not isinstance(tool, dict):
+                continue
+            args = tool.get("args") or {}
+            for value in args.values():
+                if not isinstance(value, str):
+                    continue
+                lowered = value.lower()
+                for pattern in patterns:
+                    if pattern.lower() in lowered:
+                        return (
+                            f"Forbidden framework content detected in tool args: '{pattern}'. "
+                            f"This task is locked to {state.requirements.framework}."
+                        )
+        return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -91,6 +91,8 @@ JSON only:"""
 # ── Next step prompt ──────────────────────────────────────────────────────────
 _NEXT_STEP_PROMPT = """\
 Task: {task}
+Requirements:
+{requirements}
 Plan: {plan}
 
 All plan steps:
@@ -326,6 +328,7 @@ class Improver:
         done_count = max(0, state.iteration - 1)
         prompt = _NEXT_STEP_PROMPT.format(
             task=state.user_input,
+            requirements=state.requirements.as_prompt_block(),
             plan=state.plan,
             plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
             done_steps=f"{done_count} of {len(state.plan_steps)}",

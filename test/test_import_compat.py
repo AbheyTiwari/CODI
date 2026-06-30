@@ -18,6 +18,13 @@ class ImportCompatTests(unittest.TestCase):
         self.assertEqual(executor_cls.__module__, "core.executor")
         self.assertTrue(os.path.normpath(inspect.getsourcefile(executor_cls)).endswith(os.path.normpath("core/executor.py")))
 
+    def test_mcp_package_does_not_shadow_sdk(self):
+        import mcp
+        self.assertTrue(
+            hasattr(mcp, "ClientSession"),
+            "local mcp/ package is shadowing the real MCP SDK; delete repo-root mcp/ directory"
+        )
+
     def test_duplicate_root_files_are_not_present(self):
         root_dir = os.path.dirname(os.path.dirname(__file__))
         for filename in ("quick_actions.py", "refiner.py"):

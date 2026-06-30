@@ -11,16 +11,21 @@ from langchain_core.messages import HumanMessage
 
 from context_trimmer import trim_tool_output
 from dispatcher import Dispatcher
-from llm_factory import get_refiner_llm
+from llm_factory import get_refiner_llm, _FallbackLLM
 from logger import log
 from state.temp_db import RunState
 from core.validation_utils import build_framework_contamination_errors
 
 
 # Validate prompt — tight JSON-only output expected.
-_VALIDATE_PROMPT = """\
+_VALIDATE_PROMPT = """
 You are the validator subagent in the dispatcher workflow.
 Task: {task}
+Requirements:
+{requirements}
+Plan progress: {plan_progress}
+Plan steps:
+{plan_steps}
 Tool results:
 {tool_results}
 
@@ -36,7 +41,16 @@ JSON only:"""
 
 class Validator:
     def __init__(self):
-        self.llm = get_refiner_llm()
+        self.llm = None
+
+    def _get_llm(self):
+        if self.llm is None:
+            try:
+                self.llm = get_refiner_llm()
+            except Exception as e:
+                log("validator_llm_error", {"error": str(e)[:200]})
+                self.llm = _FallbackLLM("refiner llm unavailable")
+        return self.llm
 
     def validate(self, state: RunState) -> bool:
         """
@@ -106,6 +120,19 @@ class Validator:
             })
             return True
 
+        # ── Plan progress guard ────────────────────────────────────────────────
+        if state.plan_steps and state.iteration < len(state.plan_steps):
+            reason = "Task has remaining plan steps."
+            self._fail(state, reason, requires_correction=False)
+            log("validation_decision", {
+                "layer": "plan_progress",
+                "passed": False,
+                "reason": reason,
+                "iteration": state.iteration,
+                "plan_steps": len(state.plan_steps),
+            })
+            return False
+
         # ── LLM semantic check ────────────────────────────────────────────────
         return self._llm_check(state)
 
@@ -114,10 +141,12 @@ class Validator:
     def _pass(self, state: RunState, notes: str):
         state.validation_passed = True
         state.validation_notes  = notes
+        state.validation_requires_correction = False
 
-    def _fail(self, state: RunState, notes: str):
+    def _fail(self, state: RunState, notes: str, requires_correction: bool = True):
         state.validation_passed = False
         state.validation_notes  = notes
+        state.validation_requires_correction = requires_correction
 
     def _deterministic_checks(self, state: RunState) -> str:
         """
@@ -229,13 +258,16 @@ class Validator:
         
         prompt = _VALIDATE_PROMPT.format(
             task=state.user_input,
+            requirements=state.requirements.as_prompt_block(),
+            plan_progress=f"{min(state.iteration, len(state.plan_steps))}/{len(state.plan_steps)}",
+            plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no plan steps)",
             tool_results="\n".join(
                 trim_tool_output(o, max_tokens=120)
                 for o in state.recent_tool_outputs(5)
             ),
         )
         try:
-            resp   = self.llm.invoke([HumanMessage(content=prompt)])
+            resp   = self._get_llm().invoke([HumanMessage(content=prompt)])
             raw_response = resp.content
             parsed = Dispatcher.parse_llm_json(raw_response)
             if isinstance(parsed, dict):
@@ -257,6 +289,7 @@ class Validator:
                 "layer": "llm_semantic",
                 "error": str(e)[:200],
             })
+        return False
 
         # Can't validate → assume done to prevent infinite loop
         self._pass(state, "Validation check failed — assuming complete.")

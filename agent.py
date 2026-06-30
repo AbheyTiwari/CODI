@@ -121,8 +121,8 @@ class CodiAgent:
                 state.status = "complete"
                 break
 
-            # Validation failed — ask Improver to correct
-            if not state.validation_passed and state.iteration < state.max_iterations:
+            # Validation failed — ask Improver to correct only real failures
+            if not state.validation_passed and state.iteration < state.max_iterations and getattr(state, "validation_requires_correction", True):
                 correction = str(self.improver.improve(state))
                 log("agent_correction", {"correction": correction[:100]})
                 # Inject correction as next step context
