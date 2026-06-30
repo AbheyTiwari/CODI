@@ -11,6 +11,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import json
+import inspect
+import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -145,6 +147,7 @@ class Dispatcher:
 
     def _execute_tools(self, tool_calls: list[dict]) -> dict:
         if not tool_calls:
+            log("dispatcher_empty_tools", {"status": "noop"})
             return {"status": "success", "results": []}
 
         results = []
@@ -187,7 +190,7 @@ class Dispatcher:
         name = tool_call.get("name", "")
         args = tool_call.get("args", {})
 
-        log("dispatcher_call", {"tool": name, "args": str(args)[:200]})
+        log("dispatcher_call", {"tool": name, "args": str(args)[:500]})
 
         handler = self.registry.get(name)
         if handler is None:
@@ -197,7 +200,11 @@ class Dispatcher:
                 "tool":   name,
                 "status": "error",
                 "output": f"Tool not found: '{name}'. Available: {available}",
+                "args": args,
             }
+
+        handler_info = _handler_info(handler)
+        log("dispatcher_handler", {"tool": name, **handler_info})
 
         try:
             output = handler(args)
@@ -217,18 +224,28 @@ class Dispatcher:
                 else:
                     output_text = f"{output_text}\n{warning}" if output_text else warning
             status = "error" if output_text.startswith(("ERROR", "WRITE REJECTED", "BLOCKED")) else "ok"
-            log("dispatcher_ok", {"tool": name, "status": status, "output_len": len(output_text)})
+            log("dispatcher_ok", {
+                "tool": name,
+                "status": status,
+                "output_len": len(output_text),
+                "output_sample": output_text[:500],
+                **handler_info,
+            })
             return {
                 "tool":   name,
                 "status": status,
                 "output": output_text,
+                "args": args,
+                **handler_info,
             }
         except Exception as e:
-            log("dispatcher_error", {"tool": name, "error": str(e)})
+            log("dispatcher_error", {"tool": name, "error": str(e), **handler_info})
             return {
                 "tool":   name,
                 "status": "error",
                 "output": f"Tool error: {e}",
+                "args": args,
+                **handler_info,
             }
 
     # ── JSON parsing ──────────────────────────────────────────────────────────
@@ -357,3 +374,21 @@ class Dispatcher:
 
         suffix += "".join(reversed(stack))
         return text.rstrip().rstrip(",") + suffix
+
+
+def _handler_info(handler: Any) -> dict:
+    """Return Python source metadata for a registered tool handler."""
+    try:
+        module = inspect.getmodule(handler)
+        source_file = inspect.getsourcefile(handler) or inspect.getfile(handler)
+        return {
+            "handler_module": module.__name__ if module else "",
+            "handler_function": getattr(handler, "__name__", repr(handler)),
+            "handler_file": os.path.abspath(source_file) if source_file else "",
+        }
+    except Exception:
+        return {
+            "handler_module": "",
+            "handler_function": getattr(handler, "__name__", repr(handler)),
+            "handler_file": "",
+        }

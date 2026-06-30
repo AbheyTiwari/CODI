@@ -5,6 +5,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
+import re
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_factory import get_refiner_llm
@@ -13,10 +14,10 @@ from core.quick_actions import is_direct_file_request
 from state.temp_db import RunState
 
 
-SIMPLE_TRIGGERS = (
-    "hello", "hi ", "hey ", "what is", "what are", "who is", "explain",
+SIMPLE_PREFIXES = (
+    "hello", "hi", "hey", "what is", "what are", "who is", "explain",
     "how do", "how does", "tell me", "what's", "whats", "thanks", "thank you",
-    "yes", "no", "ok", "okay", "sure", "help", "why ", "when ", "where "
+    "yes", "no", "ok", "okay", "sure", "help", "why", "when", "where"
 )
 
 ACTION_TRIGGERS = (
@@ -31,20 +32,58 @@ ACTION_TRIGGERS = (
     "repo", "repository", "github", "git",
 )
 
+EXECUTION_CONTEXT_HINTS = (
+    "this repo", "this repository", "this project", "current project",
+    "codebase", "workspace", "current file", "these files", "my files",
+    "local file", "codi.log",
+)
+
+
+def _tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9_]+", text.lower()))
+
+
+def _starts_with_phrase(text: str, phrases: tuple[str, ...]) -> bool:
+    for phrase in phrases:
+        if re.match(rf"^{re.escape(phrase)}(\b|[?.!,]|$)", text):
+            return True
+    return False
+
+
+def route_reason(text: str) -> tuple[bool, str]:
+    """Return (needs_execution, reason) using word-aware routing."""
+    t = text.lower().strip()
+    words = _tokens(t)
+
+    if not t:
+        return False, "empty"
+
+    if any(hint in t for hint in EXECUTION_CONTEXT_HINTS):
+        return True, "mentions_workspace_context"
+
+    if re.search(r"[A-Za-z0-9_./\\-]+\.(?:py|js|ts|jsx|tsx|html|css|json|md|txt|svg|sh)\b", text):
+        return True, "mentions_file_path"
+
+    action_hits = sorted(set(ACTION_TRIGGERS).intersection(words))
+    if action_hits:
+        return True, f"action_trigger:{','.join(action_hits[:5])}"
+
+    if len(t) < 80:
+        return False, "short_no_action"
+
+    if _starts_with_phrase(t, SIMPLE_PREFIXES):
+        return False, "simple_question_prefix"
+
+    return True, "long_or_ambiguous"
+
 
 def is_simple_input(text: str) -> bool:
     """
     True when the input is clearly a Q&A question that needs no tool execution.
     Returns False (i.e. needs execution) if any action trigger word is found.
     """
-    t = text.lower().strip()
-    if any(w in t for w in ACTION_TRIGGERS):
-        return False
-    if len(t) < 80:
-        return True
-    if any(t.startswith(trigger) for trigger in SIMPLE_TRIGGERS):
-        return True
-    return False
+    needs_execution, _ = route_reason(text)
+    return not needs_execution
 
 
 class Planner:
@@ -61,8 +100,13 @@ class Planner:
 
     def needs_execution(self, state: RunState) -> bool:
         """True if the task requires tool execution. False for simple Q&A."""
-        result = not is_simple_input(state.user_input)
-        log("planner_route", {"input": state.user_input[:80], "needs_execution": result})
+        result, reason = route_reason(state.user_input)
+        log("planner_route", {
+            "input": state.user_input[:160],
+            "needs_execution": result,
+            "reason": reason,
+            "input_len": len(state.user_input or ""),
+        })
         return result
 
     def direct_answer(self, state: RunState) -> str:

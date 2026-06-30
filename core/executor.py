@@ -274,6 +274,14 @@ class Executor:
 
         # Dispatch directly — no LLM JSON round-trip
         dispatch_result = self.dispatcher.dispatch(action_bundle)
+        if dispatch_result.get("signal") in ("noop", "done"):
+            signal = dispatch_result.get("signal", "noop")
+            state.add_tool_result("dispatcher", "ok", signal)
+            log("executor_dispatch_signal", {
+                "signal": signal,
+                "step": step[:160],
+                "action": action_bundle.get("action"),
+            })
 
         # Store results
         for r in dispatch_result.get("results", []):
@@ -382,6 +390,23 @@ class Executor:
             "action": action_bundle.get("action"),
         })
 
+        action = action_bundle.get("action")
+        if action in ("tool_call", "parallel") and not tools_to_call:
+            error = "Executor produced a tool_call action with no tools; no requested work could run."
+            log("tool_routing", {
+                "strategy": "json",
+                "status": "empty_tool_list",
+                "step": step[:160],
+                "repair": repair_needed,
+                "action_bundle": str(action_bundle)[:500],
+            })
+            state.add_tool_result("dispatcher", "error", error)
+            return {
+                "status":  "error",
+                "results": [{"tool": "dispatcher", "status": "error", "output": error}],
+                "error":   error,
+            }
+
         violation = self._framework_violation(state, action_bundle)
         if violation:
             log("executor_framework_violation", {
@@ -399,6 +424,15 @@ class Executor:
         dispatch_result = self.dispatcher.dispatch(action_bundle)
 
         # ── Store results in state ────────────────────────────────────────────
+        if dispatch_result.get("signal") in ("noop", "done"):
+            signal = dispatch_result.get("signal", "noop")
+            state.add_tool_result("dispatcher", "ok", signal)
+            log("executor_dispatch_signal", {
+                "signal": signal,
+                "step": step[:160],
+                "action": action_bundle.get("action"),
+            })
+
         results = dispatch_result.get("results", [])
         if not results and dispatch_result.get("status") == "error":
             state.add_tool_result(
