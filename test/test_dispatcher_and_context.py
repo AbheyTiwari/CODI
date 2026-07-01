@@ -1,6 +1,7 @@
 import unittest
 
 from context_trimmer import trim_context_for_llm
+from core.executor import _detect_file_write_step, _is_large_content_step
 from dispatcher import Dispatcher
 from tools.local.file_tools import write_file
 
@@ -57,6 +58,14 @@ class DispatcherTruncationTests(unittest.TestCase):
 
         self.assertEqual(hybrid["history"], cloud["history"])
         self.assertEqual(hybrid["tool_outputs"], cloud["tool_outputs"])
+
+    def test_large_xml_step_uses_content_first_strategy(self):
+        step = "Create pom.xml with Java 16+, JUnit 5, and Lombok dependencies"
+        tool, path = _detect_file_write_step(step)
+
+        self.assertEqual(tool, "create_file")
+        self.assertEqual(path, "pom.xml")
+        self.assertTrue(_is_large_content_step(step, path))
 
 
 if __name__ == "__main__":

@@ -91,7 +91,7 @@ _LARGE_CONTENT_TRIGGERS = (
 )
 
 # Extensions that commonly produce large content
-_LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg")
+_LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg", ".xml", ".java")
 
 # File write tool names
 _WRITE_TOOLS = {"write_file", "create_file"}
@@ -115,7 +115,7 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
         return None, None
 
     # Extract file path — look for known extensions
-    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))"
+    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh|xml|java))"
     match = re.search(ext_pattern, step)
     if not match:
         return None, None
