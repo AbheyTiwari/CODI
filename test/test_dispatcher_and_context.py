@@ -1,7 +1,13 @@
 import unittest
 
 from context_trimmer import trim_context_for_llm
-from core.executor import _detect_file_write_step, _is_large_content_step
+from core.executor import (
+    _detect_file_write_step,
+    _estimate_token_count,
+    _extract_token_metrics,
+    _is_large_content_step,
+    _should_use_content_first,
+)
 from dispatcher import Dispatcher
 from tools.local.file_tools import write_file
 
@@ -66,6 +72,25 @@ class DispatcherTruncationTests(unittest.TestCase):
         self.assertEqual(tool, "create_file")
         self.assertEqual(path, "pom.xml")
         self.assertTrue(_is_large_content_step(step, path))
+
+    def test_simple_file_write_steps_use_content_first_strategy(self):
+        step = "Write README.md with a short project summary"
+        tool, path = _detect_file_write_step(step)
+
+        self.assertEqual(tool, "write_file")
+        self.assertEqual(path, "README.md")
+        self.assertTrue(_should_use_content_first(step, path))
+
+    def test_token_metrics_are_extracted_from_response_metadata(self):
+        class DummyResponse:
+            usage_metadata = {"input_tokens": 123, "output_tokens": 45, "total_tokens": 168}
+
+        metrics = _extract_token_metrics(DummyResponse())
+
+        self.assertEqual(metrics["prompt_tokens"], 123)
+        self.assertEqual(metrics["output_tokens"], 45)
+        self.assertEqual(metrics["total_tokens"], 168)
+        self.assertEqual(_estimate_token_count("one two three"), 3)
 
 
 if __name__ == "__main__":

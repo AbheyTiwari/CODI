@@ -11,6 +11,7 @@
 
 import os
 import re
+import time
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from context_trimmer import trim_tool_output
@@ -97,6 +98,48 @@ _LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg", ".
 _WRITE_TOOLS = {"write_file", "create_file"}
 
 
+def _estimate_token_count(text: str) -> int:
+    """Rough token estimate used when the LLM client does not expose usage metadata."""
+    if not text:
+        return 0
+    return max(1, len(re.findall(r"\S+", text)))
+
+
+def _extract_token_metrics(response: object) -> dict[str, int]:
+    """Extract prompt/output/total token metrics from a LangChain response if available."""
+    usage = getattr(response, "usage_metadata", None)
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        total_tokens = usage.get("total_tokens") or (prompt_tokens + output_tokens) or 0
+        return {
+            "prompt_tokens": int(prompt_tokens),
+            "output_tokens": int(output_tokens),
+            "total_tokens": int(total_tokens),
+        }
+    return {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def _log_llm_metrics(stage: str, prompt: str, response: object, start_time: float, end_time: float) -> None:
+    """Emit concise performance metrics about the LLM call."""
+    content = getattr(response, "content", "") or ""
+    if not isinstance(content, str):
+        content = str(content)
+    metrics = _extract_token_metrics(response)
+    raw_response_len = len(content)
+    raw_response_tokens = metrics.get("output_tokens") or _estimate_token_count(content)
+    log(stage, {
+        "prompt_build_s": round((end_time - start_time), 3),
+        "prompt_tokens": metrics.get("prompt_tokens", 0),
+        "generation_started": True,
+        "first_token_s": round((time.time() - start_time), 3),
+        "generation_finished_s": round((end_time - start_time), 3),
+        "output_tokens": metrics.get("output_tokens", 0),
+        "raw_response_length_characters": raw_response_len,
+        "raw_response_tokens": raw_response_tokens,
+    })
+
+
 def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     """
     If this step is clearly a file-write operation, return (tool_name, path).
@@ -166,6 +209,16 @@ def _is_large_content_step(step: str, path: str) -> bool:
     return False
 
 
+def _should_use_content_first(step: str, path: str) -> bool:
+    """Use content-first for any clear file-write step to avoid JSON repair loops."""
+    tool, detected_path = _detect_file_write_step(step)
+    if not tool or not detected_path:
+        return False
+    if path and detected_path != path:
+        return False
+    return True
+
+
 class Executor:
     def __init__(self, registry: ToolRegistry):
         self.registry   = registry
@@ -225,8 +278,11 @@ class Executor:
         )
 
         try:
-            resp    = self.llm.invoke([HumanMessage(content=prompt)])
+            start_time = time.time()
+            resp = self.llm.invoke([HumanMessage(content=prompt)])
+            end_time = time.time()
             content = resp.content.strip()
+            _log_llm_metrics("executor_content_first_llm", prompt, resp, start_time, end_time)
         except Exception as e:
             error = f"Coder LLM error (content-first): {e}"
             log("executor_content_first_error", {"error": str(e)})
@@ -303,7 +359,7 @@ class Executor:
 
         # ── Content-first routing ─────────────────────────────────────────────
         tool, path = _detect_file_write_step(step)
-        if tool and path and _is_large_content_step(step, path):
+        if tool and path and (_is_large_content_step(step, path) or _should_use_content_first(step, path)):
             log("tool_routing", {
                 "strategy": "content_first",
                 "tool": tool,
@@ -325,8 +381,11 @@ class Executor:
 
         # ── Ask Coder LLM ─────────────────────────────────────────────────────
         try:
+            start_time = time.time()
             resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
-            raw  = resp.content.strip()
+            end_time = time.time()
+            raw = resp.content.strip()
+            _log_llm_metrics("executor_llm_call", prompt, resp, start_time, end_time)
         except Exception as e:
             error = f"Coder LLM error: {e}"
             log("executor_llm_error", {"step": step[:100], "error": str(e)})
