@@ -392,7 +392,7 @@ class Improver:
             plan=state.plan,
             plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
             done_steps=f"{done_count} of {len(state.plan_steps)}",
-            tool_results=wrap_prompt_data("\n".join(state.recent_tool_outputs(5))),
+            tool_results=wrap_prompt_data(trim_tool_output(state.context_snapshot(max_recent=3), max_tokens=900)),
         )
         raw = self._call(prompt)
         state.record_llm("improver_next_step", raw)

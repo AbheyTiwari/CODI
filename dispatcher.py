@@ -21,6 +21,8 @@ from typing import Any
 from logger import log
 from tools.registry import ToolRegistry
 
+_handler_info_cache: dict[int, dict] = {}
+
 
 def wrap_prompt_data(content: str, *, path: str | None = None) -> str:
     """Wrap untrusted tool/file content so LLMs treat it as data, not instructions."""
@@ -378,17 +380,25 @@ class Dispatcher:
 
 def _handler_info(handler: Any) -> dict:
     """Return Python source metadata for a registered tool handler."""
+    key = id(handler)
+    cached = _handler_info_cache.get(key)
+    if cached is not None:
+        return cached
+
     try:
         module = inspect.getmodule(handler)
         source_file = inspect.getsourcefile(handler) or inspect.getfile(handler)
-        return {
+        result = {
             "handler_module": module.__name__ if module else "",
             "handler_function": getattr(handler, "__name__", repr(handler)),
             "handler_file": os.path.abspath(source_file) if source_file else "",
         }
     except Exception:
-        return {
+        result = {
             "handler_module": "",
             "handler_function": getattr(handler, "__name__", repr(handler)),
             "handler_file": "",
         }
+
+    _handler_info_cache[key] = result
+    return result

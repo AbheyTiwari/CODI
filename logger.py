@@ -1,28 +1,56 @@
 import inspect
 import json
 import os
+import queue
 import threading
 from datetime import datetime
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "codi.log")
+_CALLER_DEBUG = os.getenv("CODI_CALLER_DEBUG", "0") == "1"
+_LOG_QUEUE: "queue.Queue[dict]" = queue.Queue()
+_LOG_WORKER_STARTED = False
+_LOG_WORKER_LOCK = threading.Lock()
+
+
+def _log_worker() -> None:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        while True:
+            entry = _LOG_QUEUE.get()
+            if entry is None:
+                break
+            f.write(json.dumps(entry, ensure_ascii=True, default=str) + "\n")
+            f.flush()
+
+
+def _start_log_worker() -> None:
+    global _LOG_WORKER_STARTED
+    with _LOG_WORKER_LOCK:
+        if _LOG_WORKER_STARTED:
+            return
+        worker = threading.Thread(target=_log_worker, daemon=True, name="codi-log-worker")
+        worker.start()
+        _LOG_WORKER_STARTED = True
+
 
 def log(event: str, data: dict = None):
     if data is None:
         data = {}
-    caller = _caller_info()
+    caller = _caller_info() if _CALLER_DEBUG else {}
     entry = {
         "ts": datetime.now().isoformat(),
         "event": event,
         "pid": os.getpid(),
         "thread": threading.current_thread().name,
         **caller,
-        **data
+        **data,
     }
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=True, default=str) + "\n")
+        _LOG_QUEUE.put_nowait(entry)
     except Exception:
-        pass  # fail silently if log file isn't writable
+        pass  # fail silently if the queue is full or unavailable
+
+
+_start_log_worker()
 
 
 def _caller_info() -> dict:

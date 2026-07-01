@@ -109,9 +109,66 @@ class RunState:
 
     def add_tool_result(self, tool: str, status: str, output: str):
         self.tool_results.append(ToolResult(tool=tool, status=status, output=output))
+        self._compress_tool_history_if_needed()
+
+    def _compress_tool_history_if_needed(self, threshold: int = 10):
+        """Collapse older tool results into a summary once history becomes too long."""
+        if len(self.tool_results) <= threshold:
+            return
+
+        keep = max(3, threshold // 2)
+        older = self.tool_results[:-keep]
+        recent = self.tool_results[-keep:]
+        summary_lines = ["[SUMMARY] Earlier tool activity:"]
+        tool_counts: dict[str, int] = {}
+        for result in older:
+            tool_counts[result.tool] = tool_counts.get(result.tool, 0) + 1
+
+        summary_lines.extend(f"- {tool}: {count} call(s)" for tool, count in sorted(tool_counts.items()))
+        summary_lines.append("[RECENT]")
+        summary_lines.extend(f"{r.tool}: {r.output}" for r in recent)
+
+        compressed = ToolResult(
+            tool="context_summary",
+            status="ok",
+            output="\n".join(summary_lines),
+        )
+        self.tool_results = [compressed, *recent]
 
     def recent_tool_outputs(self, n: int = 5) -> list[str]:
         return [f"{r.tool}: {r.output}" for r in self.tool_results[-n:]]
+
+    def context_snapshot(self, max_recent: int = 3) -> str:
+        """Return a compact summary of tool history for prompt construction."""
+        if not self.tool_results:
+            return "(no tool activity yet)"
+
+        recent = self.tool_results[-max_recent:]
+        recent_lines = [f"{r.tool}: {r.output}" for r in recent]
+
+        older = self.tool_results[:-max_recent]
+        if not older:
+            return "\n".join(recent_lines)
+
+        tool_counts: dict[str, int] = {}
+        files_touched: set[str] = set()
+        for result in older:
+            tool_counts[result.tool] = tool_counts.get(result.tool, 0) + 1
+            if result.output and result.tool in {"create_file", "write_file", "edit_file"}:
+                lowered = result.output.lower()
+                if "file_modified" in lowered:
+                    import re
+                    matches = re.findall(r'([A-Za-z0-9_./\\-]+\.(?:py|js|ts|html|css|json|md|txt|svg|sh))', result.output)
+                    files_touched.update(matches)
+
+        summary_lines = [
+            "[SUMMARY] Earlier tool activity:",
+            *[f"- {tool}: {count} call(s)" for tool, count in sorted(tool_counts.items())],
+        ]
+        if files_touched:
+            summary_lines.append(f"- files touched: {', '.join(sorted(files_touched)[:5])}")
+        summary_lines.extend(["[RECENT]", *recent_lines])
+        return "\n".join(summary_lines)
 
     def all_tool_outputs_text(self) -> str:
         return "\n".join(self.recent_tool_outputs(n=len(self.tool_results)))

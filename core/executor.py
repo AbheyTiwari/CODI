@@ -318,10 +318,8 @@ class Executor:
             requirements=state.requirements.as_prompt_block(),
             tools=self.registry.summary(),
             context=wrap_prompt_data(
-                "\n".join(
-                    trim_tool_output(o, max_tokens=120)
-                    for o in state.recent_tool_outputs(8)
-                ) or "(none yet)"
+                trim_tool_output(state.context_snapshot(max_recent=3), max_tokens=900)
+                or "(none yet)"
             ),
         )
 

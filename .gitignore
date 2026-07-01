@@ -9,6 +9,7 @@ __pycache__/
 venv/
 env/
 ENV/
+pyvenv.cfg
 
 # Local config and secrets
 .env
