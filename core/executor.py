@@ -36,19 +36,7 @@ Available tools:
 Previous tool results (for context):
 {context}
 
-Output the JSON action bundle now. JSON only — no prose, no fences."""
-
-
-# ── Repair prompt ─────────────────────────────────────────────────────────────
-_REPAIR_PROMPT = """\
-Your previous output was NOT valid JSON. No tool ran.
-
-Original step: {step}
-
-What you output (broken):
-{raw}
-
-Available tools:
+Protocol: choose exactly one atomic tool action for this step. Do not emit a batch of tool calls.
 {tools}
 
 Output ONLY the corrected JSON. Use exactly this structure:
