@@ -66,8 +66,8 @@ AIR_LLM_TIMEOUT       = 180                          # phones are slower — be 
 #    ollama pull qwen2.5-coder:14b      (coder — full quality)
 #    ollama pull deepseek-r1:8b         (deep reasoning tasks)
 #
-REFINER_MODEL_LOCAL = "qwen2.5-coder:7b"           # fast planner / refiner
-CODER_MODEL_LOCAL = "qwen2.5-coder:7b" # main coder — set to same as refiner for low-end machines
+REFINER_MODEL_LOCAL = "qwen3:14b"           # fast planner / refiner
+CODER_MODEL_LOCAL = "qwen3:14b" # main coder — set to same as refiner for low-end machines
 # ── Cloud models ──────────────────────────────────────────────────────────────
 #  Groq (free tier, very fast):
 REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"     # fast, cheap — good for planning

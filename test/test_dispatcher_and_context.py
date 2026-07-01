@@ -1,6 +1,7 @@
 import unittest
 
 from context_trimmer import trim_context_for_llm
+from core import executor as executor_module
 from core.executor import (
     _detect_file_write_step,
     _estimate_token_count,
@@ -91,6 +92,9 @@ class DispatcherTruncationTests(unittest.TestCase):
         self.assertEqual(metrics["output_tokens"], 45)
         self.assertEqual(metrics["total_tokens"], 168)
         self.assertEqual(_estimate_token_count("one two three"), 3)
+
+    def test_executor_exposes_repair_prompt_constant(self):
+        self.assertTrue(hasattr(executor_module, "_REPAIR_PROMPT"))
 
 
 if __name__ == "__main__":
