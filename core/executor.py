@@ -232,22 +232,27 @@ class Executor:
             tool_names=self.registry.list_names(),
         ))
 
-    def _repair_action_bundle(self, step: str, raw: str, state: RunState) -> dict | None:
-        """Second attempt: send the broken output back to the LLM with a tighter repair prompt."""
+    def _repair_action_bundle(self, step: str, raw: str, state: RunState, reason: str) -> dict | None:
+        """Send the broken output back to the LLM with a tighter repair prompt."""
         prompt = _REPAIR_PROMPT.format(
             step=step,
             tools=self.registry.summary(),
             raw=raw[:2000],
         )
         try:
-            resp     = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
+            start_time = time.time()
+            resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
+            end_time = time.time()
             repaired = resp.content.strip()
+            _log_llm_metrics("executor_repair_llm", prompt, resp, start_time, end_time)
         except Exception as e:
             log("executor_repair_error", {"step": step[:100], "error": str(e)})
             return None
 
         state.record_llm("coder_repair", repaired)
         log("executor_repair_raw", {"step": step[:80], "raw": repaired[:300]})
+        log("repair_reason", {"reason": reason, "step": step[:120]})
+        log("repair_attempt", {"step": step[:120], "attempt": True})
         return Dispatcher.parse_llm_json(repaired)
 
     # ── Content-first strategy ────────────────────────────────────────────────
@@ -346,6 +351,72 @@ class Executor:
 
         return dispatch_result
 
+    def _validate_atomic_contract(self, step: str, action_bundle: dict, raw: str, state: RunState) -> tuple[bool, str | None, list[dict]]:
+        """Validate that the LLM returned exactly one atomic tool action affecting one file."""
+        if not isinstance(action_bundle, dict):
+            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "invalid_bundle"})
+            return False, "Response was not a valid action bundle.", []
+
+        action = action_bundle.get("action")
+        tools = action_bundle.get("tools", [])
+        if not isinstance(tools, list):
+            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "tools_not_list"})
+            return False, "Response did not contain a valid tools list.", []
+
+        tool_count = len(tools)
+        log("executor_contract_check", {"step": step[:120], "passed": tool_count == 1, "tool_count": tool_count, "reason": "tool_count_check"})
+        if tool_count != 1:
+            return False, f"Expected exactly one tool call but received {tool_count}.", tools
+
+        tool = tools[0]
+        if not isinstance(tool, dict):
+            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "tool_not_object"})
+            return False, "Tool entry was malformed.", tools
+
+        name = tool.get("name")
+        args = tool.get("args") or {}
+        if not isinstance(name, str) or not name:
+            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "missing_tool_name"})
+            return False, "Tool name was missing.", tools
+
+        if not isinstance(args, dict):
+            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "args_not_object"})
+            return False, "Tool arguments were malformed.", tools
+
+        if name in _WRITE_TOOLS:
+            path = args.get("path")
+            if not path:
+                log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "missing_path"})
+                return False, "The tool call did not include a file path.", tools
+
+        if action not in ("tool_call", "parallel") and action != "noop":
+            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "unsupported_action"})
+            return False, f"Unsupported action: {action}", tools
+
+        return True, None, tools
+
+    def _split_child_steps(self, step: str) -> list[str]:
+        """Split a broad planner step into child steps when it clearly targets multiple files."""
+        lowered = step.lower()
+        if not any(keyword in lowered for keyword in ("implement", "create", "build", "add", "write")):
+            return [step]
+
+        if " and " not in lowered and "," not in lowered:
+            return [step]
+
+        base = step.strip()
+        parts = [p.strip() for p in re.split(r"\s*(?:,|and)\s*", base) if p.strip()]
+        if len(parts) <= 1:
+            return [step]
+
+        child_steps = []
+        for part in parts:
+            if part.lower().endswith(("class", "record", "model", "service", "repository", "exception")):
+                child_steps.append(f"Create {part}")
+            else:
+                child_steps.append(f"Create {part}")
+        return child_steps
+
     # ── Main entry point ──────────────────────────────────────────────────────
 
     def execute_step(self, step: str, state: RunState) -> dict:
@@ -357,6 +428,17 @@ class Executor:
         requirements), uses the content-first strategy to avoid JSON truncation.
         """
         from context_trimmer import trim_tool_output
+
+        child_steps = self._split_child_steps(step)
+        if len(child_steps) > 1:
+            log("child_step_created", {"parent_step": step[:160], "children": child_steps})
+            for child_step in child_steps:
+                self.execute_step(child_step, state)
+            return {
+                "status": "success",
+                "results": [],
+                "child_steps": child_steps,
+            }
 
         # ── Content-first routing ─────────────────────────────────────────────
         tool, path = _detect_file_write_step(step)
@@ -405,7 +487,7 @@ class Executor:
 
         # If parse failed, try once more with the repair prompt
         if action_bundle is None:
-            action_bundle = self._repair_action_bundle(step, raw, state)
+            action_bundle = self._repair_action_bundle(step, raw, state, "malformed_json")
             repair_needed = True
 
         # If STILL None and this looks like a truncated file-write, switch
@@ -441,12 +523,24 @@ class Executor:
         if isinstance(action_bundle, dict) and "tools" in action_bundle:
             tools_to_call = [t.get("name", "unknown") for t in action_bundle.get("tools", [])]
 
+        log("tool_count", {"step": step[:160], "count": len(tools_to_call), "repair": repair_needed})
         log("tool_routing", {
             "strategy": "json",
             "tools": tools_to_call,
             "repair": repair_needed,
             "action": action_bundle.get("action"),
         })
+
+        contract_ok, contract_error, _ = self._validate_atomic_contract(step, action_bundle, raw, state)
+        if not contract_ok:
+            error = f"Executor rejected non-atomic response: {contract_error}"
+            log("executor_contract_check", {"step": step[:160], "passed": False, "reason": contract_error})
+            state.add_tool_result("dispatcher", "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": "dispatcher", "status": "error", "output": error}],
+                "error": error,
+            }
 
         action = action_bundle.get("action")
         if action in ("tool_call", "parallel") and not tools_to_call:

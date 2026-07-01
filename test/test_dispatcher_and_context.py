@@ -8,6 +8,7 @@ from core.executor import (
     _extract_token_metrics,
     _is_large_content_step,
     _should_use_content_first,
+    Executor,
 )
 from dispatcher import Dispatcher
 from tools.local.file_tools import write_file
@@ -95,6 +96,56 @@ class DispatcherTruncationTests(unittest.TestCase):
 
     def test_executor_exposes_repair_prompt_constant(self):
         self.assertTrue(hasattr(executor_module, "_REPAIR_PROMPT"))
+
+    def test_single_tool_bundle_is_accepted(self):
+        class DummyRegistry:
+            def list_names(self):
+                return ["write_file"]
+
+            def summary(self):
+                return "write_file"
+
+        executor = Executor(DummyRegistry())
+        valid, error, tools = executor._validate_atomic_contract(
+            "Write demo.txt",
+            {"action": "tool_call", "tools": [{"name": "write_file", "args": {"path": "demo.txt", "content": "x"}}]},
+            "{}",
+            None,
+        )
+        self.assertTrue(valid)
+        self.assertIsNone(error)
+        self.assertEqual(len(tools), 1)
+
+    def test_multiple_tool_bundle_is_rejected(self):
+        class DummyRegistry:
+            def list_names(self):
+                return ["write_file"]
+
+            def summary(self):
+                return "write_file"
+
+        executor = Executor(DummyRegistry())
+        valid, error, tools = executor._validate_atomic_contract(
+            "Write demo.txt and readme",
+            {"action": "tool_call", "tools": [{"name": "write_file", "args": {"path": "demo.txt", "content": "x"}}, {"name": "write_file", "args": {"path": "readme.txt", "content": "y"}}]},
+            "{}",
+            None,
+        )
+        self.assertFalse(valid)
+        self.assertIn("Expected exactly one tool call", error)
+        self.assertEqual(len(tools), 2)
+
+    def test_child_steps_are_split_for_multiple_files(self):
+        class DummyRegistry:
+            def list_names(self):
+                return ["write_file"]
+
+            def summary(self):
+                return "write_file"
+
+        executor = Executor(DummyRegistry())
+        children = executor._split_child_steps("Implement Book and Member and Loan")
+        self.assertEqual(children, ["Create Book", "Create Member", "Create Loan"])
 
 
 if __name__ == "__main__":
