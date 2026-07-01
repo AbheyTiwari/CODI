@@ -94,6 +94,7 @@ def _local_llm(role: str):
         temperature=0.2 if role == "refiner" else 0.1,
         num_ctx=num_ctx,
         timeout=300,
+        options={"think": False},
     )
 
 

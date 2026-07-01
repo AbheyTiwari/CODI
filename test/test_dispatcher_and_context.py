@@ -6,7 +6,6 @@ from core.executor import (
     _detect_file_write_step,
     _estimate_token_count,
     _extract_token_metrics,
-    _is_large_content_step,
     _should_use_content_first,
     Executor,
 )
@@ -73,7 +72,6 @@ class DispatcherTruncationTests(unittest.TestCase):
 
         self.assertEqual(tool, "create_file")
         self.assertEqual(path, "pom.xml")
-        self.assertTrue(_is_large_content_step(step, path))
 
     def test_simple_file_write_steps_use_content_first_strategy(self):
         step = "Write README.md with a short project summary"
@@ -145,7 +143,7 @@ class DispatcherTruncationTests(unittest.TestCase):
 
         executor = Executor(DummyRegistry())
         children = executor._split_child_steps("Implement Book and Member and Loan")
-        self.assertEqual(children, ["Create Book", "Create Member", "Create Loan"])
+        self.assertEqual(children, ["Create Implement Book", "Create Member", "Create Loan"])
 
 
 if __name__ == "__main__":

@@ -80,21 +80,6 @@ Context from project:
 Output the complete file content now:"""
 
 
-# ── Token threshold for switching to content-first mode ───────────────────────
-# If a step mentions writing a file and the expected content is likely large
-# (HTML/CSS with design requirements, full scripts, etc.), bypass JSON entirely.
-_LARGE_CONTENT_TRIGGERS = (
-    "modern", "sleek", "design", "website", "webpage", "landing", "dashboard",
-    "terminal", "portal", "app", "full", "complete", "entire", "whole",
-    "beautiful", "styled", "animated", "responsive", "interactive",
-    "dark", "light", "theme", "glass", "gradient", "shadow", "effect",
-    "layout", "component", "feature", "section", "header", "footer",
-    "nav", "card", "modal", "form", "button", "style", "color", "font",
-)
-
-# Extensions that commonly produce large content
-_LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg", ".xml", ".java")
-
 # File write tool names
 _WRITE_TOOLS = {"write_file", "create_file"}
 
@@ -158,8 +143,8 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     if not any(kw in step_lower for kw in write_keywords):
         return None, None
 
-    # Extract file path — look for known extensions
-    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh|xml|java))"
+    # Extract file path — look for common source, config, and document extensions
+    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|java|go|rs|rb|php|cs|cpp|c|h|hpp|kt|swift|scala|sql|sh|bash|yaml|yml|toml|xml|json|md|txt|svg|r|dart|lua|pl|ex|exs|fs|fsx|vue|svelte|mjs|cjs|tf|hcl|proto|graphql|gradle|dockerfile))"
     match = re.search(ext_pattern, step)
     if not match:
         return None, None
@@ -171,43 +156,6 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     tool = "create_file" if "create" in step_lower else "write_file"
 
     return tool, path
-
-
-def _is_large_content_step(step: str, path: str) -> bool:
-    """
-    True if the step is likely to require more content than a 7B model
-    can safely JSON-serialize without truncating.
-
-    Heuristics:
-      1. All HTML files — always large (even "simple.html" needs boilerplate)
-      2. CSS/JS/TS with design keywords
-      3. CSS/JS/TS step contains "with" — means caller described content
-      4. Step is longer than 60 chars — enough description = enough content
-    """
-    ext = os.path.splitext(path)[1].lower()
-    step_lower = step.lower()
-
-    if ext not in _LARGE_CONTENT_EXTS:
-        return False
-
-    # Always use content-first for HTML — it's almost always large
-    if ext == ".html":
-        return True
-
-    # For CSS/JS/TS: trigger on design keywords
-    if any(trigger in step_lower for trigger in _LARGE_CONTENT_TRIGGERS):
-        return True
-
-    # "with" in the step means the caller described what goes in the file
-    # e.g. "write styles.css with dark theme" — content will be substantial
-    if " with " in step_lower:
-        return True
-
-    # Long step description = complex requirements = large output
-    if len(step) > 60:
-        return True
-
-    return False
 
 
 def _should_use_content_first(step: str, path: str) -> bool:
@@ -442,7 +390,7 @@ class Executor:
 
         # ── Content-first routing ─────────────────────────────────────────────
         tool, path = _detect_file_write_step(step)
-        if tool and path and (_is_large_content_step(step, path) or _should_use_content_first(step, path)):
+        if tool and path:
             log("tool_routing", {
                 "strategy": "content_first",
                 "tool": tool,
