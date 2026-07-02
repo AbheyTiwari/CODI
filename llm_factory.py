@@ -82,6 +82,9 @@ def _resolve(role: str):
 # ── Local (Ollama) ────────────────────────────────────────────────────────────
 
 def _local_llm(role: str):
+    if not _ollama_is_running():
+        return _FallbackLLM("Ollama is not reachable on localhost:11434")
+
     try:
         from langchain_ollama import ChatOllama
     except Exception:
