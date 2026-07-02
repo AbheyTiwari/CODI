@@ -30,8 +30,9 @@ class StatusStream:
         log("status_event", {"prefix": prefix, "message": message})
         with self._lock:
             self._lines.append(line)
-            for callback in list(self._callbacks):
-                callback(line)
+            callbacks = list(self._callbacks)
+        for callback in callbacks:
+            callback(line)
 
     def snapshot(self) -> list[str]:
         with self._lock:

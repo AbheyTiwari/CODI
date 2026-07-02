@@ -10,6 +10,11 @@ class LLMFactoryTests(unittest.TestCase):
             llm = llm_factory.get_coder_llm()
         self.assertIsInstance(llm, llm_factory._FallbackLLM)
 
+    def test_fallback_llm_raises_clear_error(self):
+        llm = llm_factory._FallbackLLM("backend missing")
+        with self.assertRaisesRegex(RuntimeError, "backend missing"):
+            llm.invoke([])
+
 
 if __name__ == "__main__":
     unittest.main()

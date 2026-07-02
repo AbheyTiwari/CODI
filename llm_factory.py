@@ -2,8 +2,6 @@
 # Returns the right LLM instance based on MODE in config.py
 # Supports: local (Ollama) | cloud (Groq/Anthropic/OpenAI/Gemini) | air (Air LLM) | hybrid
 
-from types import SimpleNamespace
-
 import requests
 from config import (
     MODE, CLOUD_PROVIDER,
@@ -19,7 +17,7 @@ class _FallbackLLM:
         self._error = error
 
     def invoke(self, *_args, **_kwargs):
-        return SimpleNamespace(content="")
+        raise RuntimeError(self._error)
 
 
 # ── Ollama health check ───────────────────────────────────────────────────────

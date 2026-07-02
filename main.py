@@ -520,7 +520,7 @@ def main():
                     renderer.push(f"⚠ context ~{token_est} tokens — consider /clear")
 
                 response     = agent_executor.invoke({"input": refined, "history": history_str})
-                output       = response.get("output", "No output returned.")
+                output       = response.get("output") or "No output returned."
                 tool_outputs = response.get("tool_outputs", [])
 
                 log("agent_end", {"output": output[:200], "mode": config.MODE})
