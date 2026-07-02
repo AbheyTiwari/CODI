@@ -51,7 +51,7 @@ def refine_prompt(text: str) -> str:
 
 console = Console()
 _STATUS_MAX_LINES = 8
-_STATUS_LIVE = None
+_ACTIVE_RENDERER = None
 _STATUS_LINES: list[str] = []
 
 
@@ -66,12 +66,8 @@ def _build_status_panel() -> Panel:
 
 
 def _refresh_status_panel() -> None:
-    global _STATUS_LIVE
-    if _STATUS_LIVE is None:
-        _STATUS_LIVE = Live(_build_status_panel(), console=console, refresh_per_second=6, transient=True)
-        _STATUS_LIVE.start()
-    else:
-        _STATUS_LIVE.update(_build_status_panel())
+    if _ACTIVE_RENDERER is not None:
+        _ACTIVE_RENDERER.refresh()
 
 
 def _status_callback(line: str) -> None:
@@ -232,10 +228,18 @@ class LiveRenderer:
         t = _t()
         body = Text()
         body.append(f"  {self.task}\n\n", style="bold")
+        status_lines = get_status_snapshot() or _STATUS_LINES or ["starting"]
+        for line in status_lines[-_STATUS_MAX_LINES:]:
+            body.append(f"  *  {line.strip()}\n", style="dim")
         for line in self.lines[-10:]:
-            body.append(f"  ·  {line.strip()}\n", style="dim")
+            body.append(f"  *  {line.strip()}\n", style="dim")
         return Panel(body, title=Text(f" {t['label']} · working ", style=f"bold {t['accent']}"),
                      border_style=t["dim"], padding=(0,1))
+
+    def refresh(self):
+        with self._lock:
+            if self._live:
+                self._live.update(self._panel())
 
     def push(self, line: str):
         with self._lock:
@@ -244,14 +248,19 @@ class LiveRenderer:
                 self._live.update(self._panel())
 
     def start(self):
+        global _ACTIVE_RENDERER
+        _ACTIVE_RENDERER = self
         self._live = Live(self._panel(), console=console,
                           refresh_per_second=8, transient=True)
         self._live.start()
 
     def stop(self):
+        global _ACTIVE_RENDERER
         if self._live:
             self._live.stop()
             self._live = None
+        if _ACTIVE_RENDERER is self:
+            _ACTIVE_RENDERER = None
 
 # ── Response renderer ─────────────────────────────────────────────────────────
 def render_response(output: str, tool_outputs: list = None):
@@ -344,7 +353,6 @@ def _pt_style():
 def main():
     print_banner()
     register_status_callback(_status_callback)
-    _refresh_status_panel()
     startup_sequence()
     _auto_index_background()
 
