@@ -38,6 +38,28 @@ class Dispatcher:
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
 
+    def dispatch_file_write(self, tool: str, path: str, content: str, metadata: dict | None = None) -> dict:
+        """Route generated file content without requiring an LLM JSON action bundle."""
+        args = {"path": path, "content": content}
+        if isinstance(metadata, dict):
+            args.update(metadata)
+        result = self._run_one({"name": tool, "args": args})
+        if isinstance(metadata, dict) and isinstance(result, dict):
+            output = result.get("output", "")
+            try:
+                payload = json.loads(output)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                payload.update({
+                    "code_generation_complete": metadata.get("code_generation_complete", False),
+                    "completion_sentinel": metadata.get("completion_sentinel"),
+                    "continuation_attempts": metadata.get("continuation_attempts", 0),
+                })
+                result["output"] = json.dumps(payload)
+        status = "success" if result.get("status") == "ok" else "error"
+        return {"status": status, "results": [result]}
+
     # ── Public entry point ────────────────────────────────────────────────────
 
     def dispatch(self, action_bundle: dict) -> dict:

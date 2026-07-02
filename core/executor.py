@@ -61,12 +61,19 @@ JSON only:"""
 
 
 # ── Content-first prompt ──────────────────────────────────────────────────────
-# Used when the step involves writing a file with substantial content.
-# The LLM outputs the file content directly (no JSON wrapper) so it can
-# use its full context window for content instead of JSON escaping overhead.
+# Used when the step involves writing a file.
+# The LLM outputs markdown-wrapped file content, not a JSON tool bundle, so it
+# can use its full context window for content instead of JSON escaping overhead.
 _CONTENT_PROMPT = """\
-You are writing the full content of a file. Output ONLY the raw file content.
-No JSON. No markdown fences. No explanation. Just the file content itself.
+You are writing the full content of a file.
+Do not output JSON. Do not describe your reasoning.
+
+Output format:
+1. A single markdown code fence containing the complete file content.
+2. After the closing fence, output this exact sentinel on its own line:
+{sentinel}
+
+The sentinel is not part of the file. It tells the executor that generation finished.
 
 File to write: {path}
 Task: {step}
@@ -78,6 +85,26 @@ Context from project:
 {context}
 
 Output the complete file content now:"""
+
+
+_CONTENT_CONTINUATION_PROMPT = """\
+The previous file generation for {path} ended before the required sentinel.
+Continue from the exact next character after the current partial content.
+Do not repeat content that is already present. Do not output JSON. Do not explain.
+
+When the file is complete, close any markdown fence you opened and output this exact sentinel on its own line:
+{sentinel}
+
+Task: {step}
+
+Tail of current partial content:
+{tail}
+
+Output only the remaining file content:"""
+
+
+_CONTENT_COMPLETE_SENTINEL = "CODI_FILE_WRITE_COMPLETE"
+_MAX_CONTENT_CONTINUATIONS = 3
 
 
 # File write tool names
@@ -168,6 +195,26 @@ def _should_use_content_first(step: str, path: str) -> bool:
     return True
 
 
+def _cli_status(message: str) -> None:
+    """Show high-level progress in the CLI without exposing hidden reasoning."""
+    print(f"  [Executor] {message}", flush=True)
+
+
+def _has_completion_sentinel(text: str) -> bool:
+    return _CONTENT_COMPLETE_SENTINEL in (text or "")
+
+
+def _extract_markdown_file_content(text: str) -> tuple[str, bool]:
+    """
+    Extract generated file content from the markdown content protocol.
+    Returns (content_without_sentinel, complete).
+    """
+    raw = text or ""
+    complete = _has_completion_sentinel(raw)
+    before_sentinel = raw.split(_CONTENT_COMPLETE_SENTINEL, 1)[0] if complete else raw
+    return _strip_fences(before_sentinel), complete
+
+
 class Executor:
     def __init__(self, registry: ToolRegistry):
         self.registry   = registry
@@ -209,16 +256,19 @@ class Executor:
         self, step: str, tool: str, path: str, state: RunState
     ) -> dict:
         """
-        Bypass JSON entirely for large file writes.
+        Bypass LLM JSON entirely for file writes.
 
         Strategy:
-          1. Ask the coder LLM to output ONLY the raw file content.
-          2. Take that raw output and call write_file/create_file directly.
+          1. Ask the coder LLM to output markdown-wrapped file content.
+          2. Require an explicit completion sentinel after the content.
+          3. If the sentinel is missing, ask only for the remaining content.
+          4. Send the final content through a direct dispatcher write path.
 
         This means the LLM's full output window goes to content quality,
-        not to JSON escaping. No truncation. No parse failures.
+        not to JSON escaping.
         """
         log("executor_content_first", {"tool": tool, "path": path, "step": step[:80]})
+        _cli_status(f"Generating file content for {path} using markdown protocol.")
 
         context_str = trim_tool_output(
             "\n".join(state.recent_tool_outputs(4)) or "(none yet)",
@@ -229,13 +279,14 @@ class Executor:
             step=step,
             requirements=state.requirements.as_prompt_block(),
             context=wrap_prompt_data(context_str, path=path),
+            sentinel=_CONTENT_COMPLETE_SENTINEL,
         )
 
         try:
             start_time = time.time()
             resp = self.llm.invoke([HumanMessage(content=prompt)])
             end_time = time.time()
-            content = resp.content.strip()
+            raw_content = resp.content.strip()
             _log_llm_metrics("executor_content_first_llm", prompt, resp, start_time, end_time)
         except Exception as e:
             error = f"Coder LLM error (content-first): {e}"
@@ -247,11 +298,71 @@ class Executor:
                 "error":   error,
             }
 
-        state.record_llm("coder_content_first", content[:200])
-        log("executor_content_first_raw", {"path": path, "content_len": len(content)})
+        state.record_llm("coder_content_first", raw_content[:200])
+        log("executor_content_first_raw", {"path": path, "content_len": len(raw_content)})
 
-        # Strip any accidental markdown fences the model adds anyway
-        content = _strip_fences(content)
+        complete = _has_completion_sentinel(raw_content)
+        continuation_attempts = 0
+        while not complete and continuation_attempts < _MAX_CONTENT_CONTINUATIONS:
+            continuation_attempts += 1
+            _cli_status(
+                f"Generation for {path} is missing the completion marker; requesting continuation "
+                f"{continuation_attempts}/{_MAX_CONTENT_CONTINUATIONS}."
+            )
+            log("executor_content_continuation", {
+                "path": path,
+                "attempt": continuation_attempts,
+                "current_len": len(raw_content),
+            })
+            continuation_prompt = _CONTENT_CONTINUATION_PROMPT.format(
+                path=path,
+                step=step,
+                sentinel=_CONTENT_COMPLETE_SENTINEL,
+                tail=wrap_prompt_data(raw_content[-2000:], path=path),
+            )
+            try:
+                start_time = time.time()
+                resp = self.llm.invoke([HumanMessage(content=continuation_prompt)])
+                end_time = time.time()
+                continuation = resp.content.strip()
+                _log_llm_metrics(
+                    "executor_content_continuation_llm",
+                    continuation_prompt,
+                    resp,
+                    start_time,
+                    end_time,
+                )
+            except Exception as e:
+                error = f"Coder LLM error during content continuation: {e}"
+                log("executor_content_continuation_error", {"error": str(e), "path": path})
+                state.add_tool_result(tool, "error", error)
+                return {
+                    "status": "error",
+                    "results": [{"tool": tool, "status": "error", "output": error}],
+                    "error": error,
+                }
+
+            state.record_llm("coder_content_continuation", continuation[:200])
+            raw_content += continuation
+            complete = _has_completion_sentinel(raw_content)
+
+        content, complete = _extract_markdown_file_content(raw_content)
+        if not complete:
+            error = (
+                f"{_CONTENT_COMPLETE_SENTINEL} missing after {continuation_attempts} continuation attempts; "
+                "generated content may be truncated. Ask the coder to regenerate only the remaining portion."
+            )
+            log("executor_content_incomplete", {
+                "path": path,
+                "attempts": continuation_attempts,
+                "content_len": len(content),
+            })
+            state.add_tool_result(tool, "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": tool, "status": "error", "output": error}],
+                "error": error,
+            }
 
         if not content:
             error = "Coder returned empty content for file write."
@@ -263,10 +374,8 @@ class Executor:
                 "error":   error,
             }
 
-        action_bundle = {
-            "action": "tool_call",
-            "tools":  [{"name": tool, "args": {"path": path, "content": content}}],
-        }
+        _cli_status(f"Completion marker found for {path}; writing {len(content)} characters.")
+        action_bundle = {"tools": [{"name": tool, "args": {"path": path, "content": content}}]}
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -283,14 +392,23 @@ class Executor:
             }
 
         # Dispatch directly — no LLM JSON round-trip
-        dispatch_result = self.dispatcher.dispatch(action_bundle)
+        dispatch_result = self.dispatcher.dispatch_file_write(
+            tool,
+            path,
+            content,
+            {
+                "code_generation_complete": True,
+                "completion_sentinel": _CONTENT_COMPLETE_SENTINEL,
+                "continuation_attempts": continuation_attempts,
+            },
+        )
         if dispatch_result.get("signal") in ("noop", "done"):
             signal = dispatch_result.get("signal", "noop")
             state.add_tool_result("dispatcher", "ok", signal)
             log("executor_dispatch_signal", {
                 "signal": signal,
                 "step": step[:160],
-                "action": action_bundle.get("action"),
+                "action": "direct_file_write",
             })
 
         # Store results
@@ -376,6 +494,7 @@ class Executor:
         requirements), uses the content-first strategy to avoid JSON truncation.
         """
         from context_trimmer import trim_tool_output
+        _cli_status(f"Executing step: {step[:120]}")
 
         child_steps = self._split_child_steps(step)
         if len(child_steps) > 1:
@@ -412,6 +531,7 @@ class Executor:
 
         # ── Ask Coder LLM ─────────────────────────────────────────────────────
         try:
+            _cli_status("Asking coder to choose the next tool action.")
             start_time = time.time()
             resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
             end_time = time.time()
@@ -521,6 +641,7 @@ class Executor:
             }
 
         # ── Dispatch ──────────────────────────────────────────────────────────
+        _cli_status(f"Dispatching tool action: {', '.join(tools_to_call) or 'none'}")
         dispatch_result = self.dispatcher.dispatch(action_bundle)
 
         # ── Store results in state ────────────────────────────────────────────

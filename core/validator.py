@@ -92,6 +92,16 @@ class Validator:
             return False
 
         # ── Deterministic checks ──────────────────────────────────────────────
+        generation_reason = self._generation_completion_check(state)
+        if generation_reason:
+            self._fail(state, generation_reason)
+            log("validation_decision", {
+                "layer": "code_generation_completion",
+                "passed": False,
+                "reason": trim_tool_output(generation_reason, max_tokens=15),
+            })
+            return False
+
         fail_reason = self._deterministic_checks(state)
         if fail_reason:
             self._fail(state, fail_reason)
@@ -159,6 +169,38 @@ class Validator:
         state.validation_passed = False
         state.validation_notes  = notes
         state.validation_requires_correction = requires_correction
+
+    def _generation_completion_check(self, state: RunState) -> str:
+        """Fail fast when content-first generation did not provide its end marker."""
+        for result in reversed(state.tool_results):
+            if result.tool not in ("create_file", "write_file", "edit_file"):
+                continue
+
+            output = result.output or ""
+            if "CODI_FILE_WRITE_COMPLETE missing" in output:
+                return output[:300]
+
+            if not isinstance(output, str) or not output.strip().startswith("{"):
+                continue
+
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                continue
+
+            if "code_generation_complete" not in payload:
+                continue
+
+            if not payload.get("code_generation_complete"):
+                sentinel = payload.get("completion_sentinel") or "completion sentinel"
+                return (
+                    f"Generated file is missing {sentinel}; ask the coder to regenerate only "
+                    "the remaining portion and append it before validating again."
+                )
+
+            return ""
+
+        return ""
 
     def _deterministic_checks(self, state: RunState) -> str:
         """

@@ -3,8 +3,10 @@ import unittest
 from context_trimmer import trim_context_for_llm
 from core import executor as executor_module
 from core.executor import (
+    _CONTENT_COMPLETE_SENTINEL,
     _detect_file_write_step,
     _estimate_token_count,
+    _extract_markdown_file_content,
     _extract_token_metrics,
     _should_use_content_first,
     Executor,
@@ -80,6 +82,72 @@ class DispatcherTruncationTests(unittest.TestCase):
         self.assertEqual(tool, "write_file")
         self.assertEqual(path, "README.md")
         self.assertTrue(_should_use_content_first(step, path))
+
+    def test_markdown_content_protocol_strips_fence_and_sentinel(self):
+        raw = f"```python\nprint('hello')\n```\n{_CONTENT_COMPLETE_SENTINEL}"
+
+        content, complete = _extract_markdown_file_content(raw)
+
+        self.assertTrue(complete)
+        self.assertEqual(content, "print('hello')")
+
+    def test_content_first_continues_until_completion_sentinel(self):
+        class DummyResponse:
+            def __init__(self, content):
+                self.content = content
+                self.usage_metadata = {}
+
+        class DummyLLM:
+            def __init__(self):
+                self.responses = [
+                    DummyResponse("```python\nprint('hel"),
+                    DummyResponse("lo')\n```\nCODI_FILE_WRITE_COMPLETE"),
+                ]
+
+            def invoke(self, _messages):
+                return self.responses.pop(0)
+
+        class DummyRequirements:
+            def as_prompt_block(self):
+                return "(none)"
+
+            def framework_lock(self):
+                return []
+
+        class DummyState:
+            def __init__(self):
+                self.requirements = DummyRequirements()
+                self.tool_results = []
+                self.llm_outputs = []
+
+            def recent_tool_outputs(self, _limit):
+                return []
+
+            def record_llm(self, role, content):
+                self.llm_outputs.append((role, content))
+
+            def add_tool_result(self, tool, status, output):
+                self.tool_results.append((tool, status, output))
+
+        class DummyDispatcher:
+            def __init__(self):
+                self.calls = []
+
+            def dispatch_file_write(self, tool, path, content, metadata=None):
+                self.calls.append((tool, path, content, metadata))
+                return {"status": "success", "results": [{"tool": tool, "status": "ok", "output": "wrote"}]}
+
+        executor = Executor.__new__(Executor)
+        executor.llm = DummyLLM()
+        executor.dispatcher = DummyDispatcher()
+        state = DummyState()
+
+        result = executor._execute_content_first("Write demo.py", "write_file", "demo.py", state)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(executor.dispatcher.calls[0][2], "print('hello')")
+        self.assertTrue(executor.dispatcher.calls[0][3]["code_generation_complete"])
+        self.assertEqual(executor.dispatcher.calls[0][3]["continuation_attempts"], 1)
 
     def test_token_metrics_are_extracted_from_response_metadata(self):
         class DummyResponse:
