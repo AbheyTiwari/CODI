@@ -144,7 +144,7 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
         return None, None
 
     # Extract file path — look for common source, config, and document extensions
-    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|java|go|rs|rb|php|cs|cpp|c|h|hpp|kt|swift|scala|sql|sh|bash|yaml|yml|toml|xml|json|md|txt|svg|r|dart|lua|pl|ex|exs|fs|fsx|vue|svelte|mjs|cjs|tf|hcl|proto|graphql|gradle|dockerfile))"
+    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|c|cpp|h|hpp|go|rs|rb|php|graphql|svg))"
     match = re.search(ext_pattern, step)
     if not match:
         return None, None
