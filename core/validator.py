@@ -254,6 +254,29 @@ class Validator:
         if not java_touched:
             return ""
 
+        for result in reversed(state.tool_results):
+            if result.tool not in ("create_file", "write_file", "edit_file") or result.status != "ok":
+                continue
+            output = result.output or ""
+            if not isinstance(output, str):
+                continue
+            if not output.strip().startswith("{"):
+                continue
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                continue
+            path = payload.get("file_modified") or payload.get("path")
+            if not path:
+                continue
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+                from tools.local.file_tools import _java_structural_check
+                warning = _java_structural_check(path, content)
+                if warning:
+                    return warning
+
         working_dir = os.environ.get("CODI_WORKING_DIR")
         if not working_dir or not os.path.exists(os.path.join(working_dir, "pom.xml")):
             return ""

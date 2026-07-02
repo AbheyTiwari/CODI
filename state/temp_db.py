@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -93,10 +94,14 @@ class RunState:
     iteration:       int = 0
     max_iterations:  int = 8
     tool_results:    list[ToolResult] = field(default_factory=list)
+    files_written:   set[str] = field(default_factory=set)
+    step_attempts:   dict[str, int] = field(default_factory=dict)
+    project_manifest: dict[str, Any] = field(default_factory=lambda: {"package": None, "files_created": {}})
 
     # ── Validation ────────────────────────────────────────────────────────────
     validation_passed: bool = False
     validation_notes:  str  = ""
+    validation_requires_correction: bool = True
 
     # ── Final output ──────────────────────────────────────────────────────────
     final_output: str = ""
@@ -110,6 +115,23 @@ class RunState:
     def add_tool_result(self, tool: str, status: str, output: str):
         self.tool_results.append(ToolResult(tool=tool, status=status, output=output))
         self._compress_tool_history_if_needed()
+
+    @staticmethod
+    def _normalize_path(path: str | os.PathLike[str]) -> str:
+        if path is None:
+            return ""
+        candidate = os.path.abspath(str(path))
+        return os.path.normcase(candidate)
+
+    def mark_written(self, path: str | os.PathLike[str]) -> str:
+        normalized = self._normalize_path(path)
+        if normalized:
+            self.files_written.add(normalized)
+        return normalized
+
+    def already_written(self, path: str | os.PathLike[str]) -> bool:
+        normalized = self._normalize_path(path)
+        return bool(normalized and normalized in self.files_written)
 
     def _compress_tool_history_if_needed(self, threshold: int = 10):
         """Collapse older tool results into a summary once history becomes too long."""

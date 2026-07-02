@@ -1,0 +1,2 @@
+class Broken {
+    void method() {

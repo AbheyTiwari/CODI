@@ -9,6 +9,7 @@
 # The Dispatcher normalizes malformed LLM output before routing.
 # ─────────────────────────────────────────────────────────────────────────────
 
+import json
 import os
 import re
 import time
@@ -81,6 +82,9 @@ Task: {step}
 
 Requirements:
 {requirements}
+
+Project manifest:
+{project_manifest}
 
 Context from project:
 {context}
@@ -268,6 +272,12 @@ class Executor:
         This means the LLM's full output window goes to content quality,
         not to JSON escaping.
         """
+        if state.already_written(path):
+            message = f"skip_duplicate_write:{path}"
+            log("executor_duplicate_write", {"path": path, "step": step[:80]})
+            state.add_tool_result("dispatcher", "ok", message)
+            return {"status": "success", "results": [{"tool": "dispatcher", "status": "ok", "output": message}]}
+
         log("executor_content_first", {"tool": tool, "path": path, "step": step[:80]})
         _cli_status(f"Generating file content for {path} using markdown protocol.")
 
@@ -275,10 +285,14 @@ class Executor:
             "\n".join(state.recent_tool_outputs(4)) or "(none yet)",
             max_tokens=800,
         )
+        project_manifest = state.project_manifest or {"package": None, "files_created": {}}
+        package_hint = f"MUST use this exact package declaration: {project_manifest.get('package')}" if project_manifest.get('package') else "(no package lock)"
+        manifest_text = f"package: {project_manifest.get('package') or 'none'}\nfiles_created: {json.dumps(project_manifest.get('files_created', {}), ensure_ascii=True)}\npackage_instruction: {package_hint}"
         prompt = _CONTENT_PROMPT.format(
             path=path,
             step=step,
             requirements=state.requirements.as_prompt_block(),
+            project_manifest=manifest_text,
             context=wrap_prompt_data(context_str, path=path),
             sentinel=_CONTENT_COMPLETE_SENTINEL,
         )
@@ -403,6 +417,9 @@ class Executor:
                 "continuation_attempts": continuation_attempts,
             },
         )
+        state.mark_written(path)
+        if isinstance(state.project_manifest, dict):
+            state.project_manifest.setdefault("files_created", {})[path] = content.splitlines()[0][:100] if content.splitlines() else "generated file"
         if dispatch_result.get("signal") in ("noop", "done"):
             signal = dispatch_result.get("signal", "noop")
             state.add_tool_result("dispatcher", "ok", signal)
@@ -425,6 +442,10 @@ class Executor:
             return False, "Response was not a valid action bundle.", []
 
         action = action_bundle.get("action")
+        if action in ("noop", "done", "control"):
+            log("executor_contract_check", {"step": step[:120], "passed": True, "reason": "noop_signal"})
+            return True, None, []
+
         tools = action_bundle.get("tools", [])
         if not isinstance(tools, list):
             log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "tools_not_list"})
@@ -531,141 +552,165 @@ class Executor:
         )
 
         # ── Ask Coder LLM ─────────────────────────────────────────────────────
-        try:
-            _cli_status("Asking coder to choose the next tool action.")
-            start_time = time.time()
-            resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
-            end_time = time.time()
-            raw = resp.content.strip()
-            _log_llm_metrics("executor_llm_call", prompt, resp, start_time, end_time)
-        except Exception as e:
-            error = f"Coder LLM error: {e}"
-            log("executor_llm_error", {"step": step[:100], "error": str(e)})
-            state.add_tool_result("coder", "error", error)
-            return {
-                "status":  "error",
-                "results": [{"tool": "coder", "status": "error", "output": error}],
-                "error":   error,
-            }
+        for attempt in range(2):
+            try:
+                _cli_status("Asking coder to choose the next tool action.")
+                start_time = time.time()
+                resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
+                end_time = time.time()
+                raw = resp.content.strip()
+                _log_llm_metrics("executor_llm_call", prompt, resp, start_time, end_time)
+            except Exception as e:
+                error = f"Coder LLM error: {e}"
+                log("executor_llm_error", {"step": step[:100], "error": str(e)})
+                state.add_tool_result("coder", "error", error)
+                return {
+                    "status":  "error",
+                    "results": [{"tool": "coder", "status": "error", "output": error}],
+                    "error":   error,
+                }
 
-        state.record_llm("coder", raw)
+            state.record_llm("coder", raw)
 
-        # ── Parse ─────────────────────────────────────────────────────────────
-        action_bundle = Dispatcher.parse_llm_json(raw)
-        repair_needed = False
+            # ── Parse ─────────────────────────────────────────────────────────
+            action_bundle = Dispatcher.parse_llm_json(raw)
+            repair_needed = False
 
-        # If parse failed, try once more with the repair prompt
-        if action_bundle is None:
-            action_bundle = self._repair_action_bundle(step, raw, state, "malformed_json")
-            repair_needed = True
+            # If parse failed, try once more with the repair prompt
+            if action_bundle is None:
+                action_bundle = self._repair_action_bundle(step, raw, state, "malformed_json")
+                repair_needed = True
 
-        # If STILL None and this looks like a truncated file-write, switch
-        # to content-first as a last resort (catches cases where the LLM
-        # produced partial JSON with a file path but no closing string)
-        if action_bundle is None:
-            tool_fb, path_fb = _detect_file_write_step(step)
-            if tool_fb and path_fb:
+            # If STILL None and this looks like a truncated file-write, switch
+            # to content-first as a last resort (catches cases where the LLM
+            # produced partial JSON with a file path but no closing string)
+            if action_bundle is None:
+                tool_fb, path_fb = _detect_file_write_step(step)
+                if tool_fb and path_fb:
+                    log("tool_routing", {
+                        "strategy": "json_fallback_content_first",
+                        "tool": tool_fb,
+                        "path": path_fb[:80],
+                        "repair": repair_needed,
+                    })
+                    return self._execute_content_first(step, tool_fb, path_fb, state)
+
+            if action_bundle is None:
+                error = f"Coder output was not valid JSON: {raw[:200]}"
                 log("tool_routing", {
-                    "strategy": "json_fallback_content_first",
-                    "tool": tool_fb,
-                    "path": path_fb[:80],
+                    "strategy": "json",
+                    "status": "parse_fail",
                     "repair": repair_needed,
                 })
-                return self._execute_content_first(step, tool_fb, path_fb, state)
+                state.add_tool_result("coder", "error", error)
+                return {
+                    "status":  "error",
+                    "results": [{"tool": "coder", "status": "error", "output": error}],
+                    "error":   error,
+                }
 
-        if action_bundle is None:
-            error = f"Coder output was not valid JSON: {raw[:200]}"
+            # Extract which tools will be called
+            tools_to_call = []
+            if isinstance(action_bundle, dict) and "tools" in action_bundle:
+                tools_to_call = [t.get("name", "unknown") for t in action_bundle.get("tools", [])]
+
+            log("tool_count", {"step": step[:160], "count": len(tools_to_call), "repair": repair_needed})
             log("tool_routing", {
                 "strategy": "json",
-                "status": "parse_fail",
+                "tools": tools_to_call,
                 "repair": repair_needed,
-            })
-            state.add_tool_result("coder", "error", error)
-            return {
-                "status":  "error",
-                "results": [{"tool": "coder", "status": "error", "output": error}],
-                "error":   error,
-            }
-
-        # Extract which tools will be called
-        tools_to_call = []
-        if isinstance(action_bundle, dict) and "tools" in action_bundle:
-            tools_to_call = [t.get("name", "unknown") for t in action_bundle.get("tools", [])]
-
-        log("tool_count", {"step": step[:160], "count": len(tools_to_call), "repair": repair_needed})
-        log("tool_routing", {
-            "strategy": "json",
-            "tools": tools_to_call,
-            "repair": repair_needed,
-            "action": action_bundle.get("action"),
-        })
-
-        contract_ok, contract_error, _ = self._validate_atomic_contract(step, action_bundle, raw, state)
-        if not contract_ok:
-            error = f"Executor rejected non-atomic response: {contract_error}"
-            log("executor_contract_check", {"step": step[:160], "passed": False, "reason": contract_error})
-            state.add_tool_result("dispatcher", "error", error)
-            return {
-                "status": "error",
-                "results": [{"tool": "dispatcher", "status": "error", "output": error}],
-                "error": error,
-            }
-
-        action = action_bundle.get("action")
-        if action in ("tool_call", "parallel") and not tools_to_call:
-            error = "Executor produced a tool_call action with no tools; no requested work could run."
-            log("tool_routing", {
-                "strategy": "json",
-                "status": "empty_tool_list",
-                "step": step[:160],
-                "repair": repair_needed,
-                "action_bundle": str(action_bundle)[:500],
-            })
-            state.add_tool_result("dispatcher", "error", error)
-            return {
-                "status":  "error",
-                "results": [{"tool": "dispatcher", "status": "error", "output": error}],
-                "error":   error,
-            }
-
-        violation = self._framework_violation(state, action_bundle)
-        if violation:
-            log("executor_framework_violation", {
-                "step": step[:80],
-                "reason": violation,
-            })
-            state.add_tool_result("coder", "error", violation)
-            return {
-                "status": "error",
-                "results": [{"tool": "coder", "status": "error", "output": violation}],
-                "error": violation,
-            }
-
-        # ── Dispatch ──────────────────────────────────────────────────────────
-        _cli_status(f"Dispatching tool action: {', '.join(tools_to_call) or 'none'}")
-        dispatch_result = self.dispatcher.dispatch(action_bundle)
-
-        # ── Store results in state ────────────────────────────────────────────
-        if dispatch_result.get("signal") in ("noop", "done"):
-            signal = dispatch_result.get("signal", "noop")
-            state.add_tool_result("dispatcher", "ok", signal)
-            log("executor_dispatch_signal", {
-                "signal": signal,
-                "step": step[:160],
                 "action": action_bundle.get("action"),
             })
 
-        results = dispatch_result.get("results", [])
-        if not results and dispatch_result.get("status") == "error":
-            state.add_tool_result(
-                "dispatcher", "error",
-                dispatch_result.get("error", "Dispatcher returned no results.")
-            )
+            contract_ok, contract_error, _ = self._validate_atomic_contract(step, action_bundle, raw, state)
+            if not contract_ok:
+                error = f"Executor rejected non-atomic response: {contract_error}"
+                log("executor_contract_check", {"step": step[:160], "passed": False, "reason": contract_error})
+                state.add_tool_result("dispatcher", "error", error)
+                return {
+                    "status": "error",
+                    "results": [{"tool": "dispatcher", "status": "error", "output": error}],
+                    "error": error,
+                }
 
-        for r in results:
-            state.add_tool_result(r["tool"], r["status"], r["output"])
+            action = action_bundle.get("action")
+            if action in ("tool_call", "parallel") and not tools_to_call:
+                error = "Executor produced a tool_call action with no tools; no requested work could run."
+                log("tool_routing", {
+                    "strategy": "json",
+                    "status": "empty_tool_list",
+                    "step": step[:160],
+                    "repair": repair_needed,
+                    "action_bundle": str(action_bundle)[:500],
+                })
+                state.add_tool_result("dispatcher", "error", error)
+                return {
+                    "status":  "error",
+                    "results": [{"tool": "dispatcher", "status": "error", "output": error}],
+                    "error":   error,
+                }
 
-        return dispatch_result
+            if action == "noop" and self._should_reject_noop(step, state):
+                attempt_num = state.step_attempts.get(step, 0) + 1
+                state.step_attempts[step] = attempt_num
+                if attempt_num >= 2:
+                    error = f"Executor rejected noop for implementation step after {attempt_num} attempts: {step}"
+                    log("executor_invalid_noop", {"step": step[:160], "attempt": attempt_num})
+                    state.add_tool_result("dispatcher", "error", error)
+                    return {"status": "error", "results": [{"tool": "dispatcher", "status": "error", "output": error}], "error": error}
+                error = "Executor rejected noop for implementation step; the coder must produce a tool_call for this step."
+                log("executor_invalid_noop", {"step": step[:160], "attempt": attempt_num})
+                state.add_tool_result("dispatcher", "error", error)
+                continue
+
+            violation = self._framework_violation(state, action_bundle)
+            if violation:
+                log("executor_framework_violation", {
+                    "step": step[:80],
+                    "reason": violation,
+                })
+                state.add_tool_result("coder", "error", violation)
+                return {
+                    "status": "error",
+                    "results": [{"tool": "coder", "status": "error", "output": violation}],
+                    "error": violation,
+                }
+
+            # ── Dispatch ──────────────────────────────────────────────────────
+            _cli_status(f"Dispatching tool action: {', '.join(tools_to_call) or 'none'}")
+            dispatch_result = self.dispatcher.dispatch(action_bundle)
+
+            # ── Store results in state ────────────────────────────────────────
+            if dispatch_result.get("signal") in ("noop", "done"):
+                signal = dispatch_result.get("signal", "noop")
+                state.add_tool_result("dispatcher", "ok", signal)
+                log("executor_dispatch_signal", {
+                    "signal": signal,
+                    "step": step[:160],
+                    "action": action_bundle.get("action"),
+                })
+
+            results = dispatch_result.get("results", [])
+            if not results and dispatch_result.get("status") == "error":
+                state.add_tool_result(
+                    "dispatcher", "error",
+                    dispatch_result.get("error", "Dispatcher returned no results.")
+                )
+
+            for r in results:
+                state.add_tool_result(r["tool"], r["status"], r["output"])
+
+            return dispatch_result
+
+        error = f"Executor rejected noop for implementation step after retries: {step}"
+        state.add_tool_result("dispatcher", "error", error)
+        return {"status": "error", "results": [{"tool": "dispatcher", "status": "error", "output": error}], "error": error}
+
+    def _should_reject_noop(self, step: str, state: RunState) -> bool:
+        lowered = (step or "").lower()
+        if not any(keyword in lowered for keyword in ("write", "create", "generate", "implement", "build")):
+            return False
+        return state.step_attempts.get(step, 0) < 2
 
     def _framework_violation(self, state: RunState, action_bundle: dict) -> str | None:
         forbidden = getattr(state, "requirements", None)

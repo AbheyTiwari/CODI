@@ -172,6 +172,17 @@ def _deterministic_requirements(task: str) -> TaskRequirements:
     return reqs
 
 
+def _derive_package(task: str, requirements: TaskRequirements) -> str | None:
+    lowered = (task or "").lower()
+    if "java" not in lowered and "package" not in lowered:
+        return None
+    if requirements.framework == "react":
+        return "com.example"
+    if "java" in lowered:
+        return "com.example.library"
+    return None
+
+
 def _files_from_tool_results(state: RunState) -> list[str]:
     files = []
     for result in state.tool_results:
@@ -294,9 +305,12 @@ class Improver:
         framework and file constraints for validators/executors.
         """
         state.requirements = _deterministic_requirements(state.user_input)
+        package_name = _derive_package(state.user_input, state.requirements)
+        state.project_manifest = {"package": package_name, "files_created": {}}
         log("improver_requirements", {
             "source": "deterministic",
             "requirements": state.requirements.to_dict(),
+            "project_manifest": state.project_manifest,
         })
 
     def create_plan(self, state: RunState, context: str) -> dict:
@@ -376,6 +390,13 @@ class Improver:
             index = state.iteration - 1
             if 0 <= index < len(state.plan_steps):
                 selected_step = state.plan_steps[index]
+                recent_outputs = [getattr(existing, "output", "") for existing in state.tool_results[-3:]]
+                if selected_step and any(
+                    isinstance(output, str) and "skip_duplicate_write" not in output and output.strip() == selected_step.strip()
+                    for output in recent_outputs
+                ):
+                    index = min(index + 1, len(state.plan_steps) - 1)
+                    selected_step = state.plan_steps[index]
                 log("step_selected", {
                     "step": trim_tool_output(selected_step, max_tokens=20),
                     "matched_plan": True,

@@ -107,6 +107,8 @@ def write_file(args: dict) -> str:
     log("tool_call", {"tool": "write_file", "path": path, "length": len(content)})
 
     syntax_warning = _python_syntax_check(path, content)
+    if not syntax_warning:
+        syntax_warning = _java_structural_check(path, content)
 
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -164,6 +166,8 @@ def edit_file(args: dict) -> str:
         return f"ERROR editing {path}: no edit operation was provided"
 
     syntax_warning = _python_syntax_check(path, content)
+    if not syntax_warning:
+        syntax_warning = _java_structural_check(path, content)
 
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -267,6 +271,17 @@ def _python_syntax_check(path: str, content: str) -> str:
         return ""
     except SyntaxError as e:
         return f"WARNING: SyntaxError in {path} (line {e.lineno}): {e.msg} — file was written, please fix."
+
+
+def _java_structural_check(path: str, content: str) -> str:
+    """Cheap Java brace-balance sanity check used before Maven is available."""
+    if not path.lower().endswith(".java"):
+        return ""
+    opens = content.count("{")
+    closes = content.count("}")
+    if opens == closes:
+        return ""
+    return f"WARNING: Unbalanced braces in {path} ({opens} opening, {closes} closing) — file was written, please fix."
 
 
 def _normalize_whitespace(text: str) -> str:
