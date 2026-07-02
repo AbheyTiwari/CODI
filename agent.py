@@ -25,6 +25,11 @@ from state.temp_db  import RunState
 from tools.registry import ToolRegistry, registry as _global_registry
 
 
+def _agent_status(message: str) -> None:
+    """Show high-level agent progress without exposing hidden model reasoning."""
+    print(f"  [Agent] {message}", flush=True)
+
+
 class CodiAgent:
     def __init__(self, registry: ToolRegistry = None):
         self.registry  = registry or _global_registry
@@ -46,6 +51,7 @@ class CodiAgent:
             history=inputs.get("history", ""),
         )
 
+        _agent_status(f"Received task: {state.user_input[:120]}")
         log("agent_start", {"input": state.user_input[:120]})
 
         try:
@@ -67,22 +73,29 @@ class CodiAgent:
 
         # ── Route: simple Q&A or full execution? ──────────────────────────────
         if not self.planner.needs_execution(state):
+            _agent_status("Answering directly; no tools needed.")
             log("agent_direct", {"input": state.user_input[:80]})
             state.status = "complete"
             return self.planner.direct_answer(state)
 
+        _agent_status("Checking for a fast file action.")
         fast_output = try_fast_file_task(state.user_input, self.registry, state)
         if fast_output:
+            _agent_status("Completed with fast file action.")
             log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
             state.status = "complete"
             return fast_output
 
         # ── Phase 1: Read context ──────────────────────────────────────────────
+        _agent_status("Reading project context.")
         context = self.improver.read_context(state)
         log("agent_context_ready", {"context_len": len(context)})
 
         # ── Phase 2: Create plan ───────────────────────────────────────────────
+        _agent_status("Creating an execution plan.")
         self.improver.create_plan(state, context)
+        if state.plan_steps:
+            _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
         log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan})
 
         state.status = "running"
@@ -93,11 +106,13 @@ class CodiAgent:
 
             # Hard cap
             if state.exceeds_max():
+                _agent_status("Reached max iterations; stopping.")
                 log("agent_max_iterations", {"iterations": state.iteration})
                 state.status = "complete"
                 break
 
             # Improver decides what to do next
+            _agent_status(f"Choosing next step for iteration {state.iteration}.")
             next_decision = self.improver.next_step(state)
             if not isinstance(next_decision, dict):
                 next_decision = {"step": str(next_decision), "done": False}
@@ -105,30 +120,36 @@ class CodiAgent:
             done = bool(next_decision.get("done", False))
 
             if done or not step:
+                _agent_status("Planner says the task is complete.")
                 log("agent_improver_done", {"iteration": state.iteration})
                 state.status = "complete"
                 break
 
+            _agent_status(f"Working on step {state.iteration}: {step[:120]}")
             log("agent_step", {"iteration": state.iteration, "step": step[:100]})
 
             # Executor runs the step
             self.executor.execute_step(step, state)
 
             # Validator checks if we're done
+            _agent_status("Validating the result.")
             is_valid = self.validator.validate(state)
 
             if is_valid:
+                _agent_status("Validation passed.")
                 state.status = "complete"
                 break
 
             # Validation failed — ask Improver to correct only real failures
             if not state.validation_passed and state.iteration < state.max_iterations and getattr(state, "validation_requires_correction", True):
+                _agent_status(f"Validation needs repair: {state.validation_notes[:120]}")
                 correction = str(self.improver.improve(state))
                 log("agent_correction", {"correction": correction[:100]})
                 # Inject correction as next step context
                 state.plan = f"{state.plan}\n[CORRECTION]: {correction}"
 
         # ── Phase 4: Final output ──────────────────────────────────────────────
+        _agent_status("Preparing final response.")
         output = self.improver.summarize(state)
         state.final_output = output
         
