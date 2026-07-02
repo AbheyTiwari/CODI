@@ -23,11 +23,12 @@ from core.validator import Validator
 from logger         import log
 from state.temp_db  import RunState
 from tools.registry import ToolRegistry, registry as _global_registry
+from status_stream import emit_status
 
 
 def _agent_status(message: str) -> None:
     """Show high-level agent progress without exposing hidden model reasoning."""
-    print(f"  [Agent] {message}", flush=True)
+    emit_status("agent", message)
 
 
 class CodiAgent:

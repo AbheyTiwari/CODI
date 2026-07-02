@@ -39,6 +39,7 @@ from core.planner import Planner as _Planner
 from agent import create_agent
 from logger import log
 from context_trimmer import trim_context_for_llm, estimate_tokens
+from status_stream import register_status_callback, get_status_snapshot
 import config
 
 _planner_instance = None
@@ -49,6 +50,36 @@ def refine_prompt(text: str) -> str:
     return _planner_instance.refine_input(text)
 
 console = Console()
+_STATUS_MAX_LINES = 8
+_STATUS_LIVE = None
+_STATUS_LINES: list[str] = []
+
+
+def _build_status_panel() -> Panel:
+    t = _t()
+    lines = get_status_snapshot() or _STATUS_LINES or ["ready"]
+    body = Text()
+    for index, line in enumerate(lines[-_STATUS_MAX_LINES:], start=1):
+        style = t["accent"] if index == len(lines[-_STATUS_MAX_LINES:]) else "dim"
+        body.append(f"• {line}\n", style=style)
+    return Panel(body, title=Text("status", style=t["accent"]), border_style=t["dim"], padding=(0, 1))
+
+
+def _refresh_status_panel() -> None:
+    global _STATUS_LIVE
+    if _STATUS_LIVE is None:
+        _STATUS_LIVE = Live(_build_status_panel(), console=console, refresh_per_second=6, transient=True)
+        _STATUS_LIVE.start()
+    else:
+        _STATUS_LIVE.update(_build_status_panel())
+
+
+def _status_callback(line: str) -> None:
+    global _STATUS_LINES
+    _STATUS_LINES.append(line)
+    if len(_STATUS_LINES) > _STATUS_MAX_LINES:
+        _STATUS_LINES.pop(0)
+    _refresh_status_panel()
 
 THEME = {
     "local":  {"accent": "bright_green",   "label": "LOCAL",  "dim": "green"},
@@ -312,6 +343,8 @@ def _pt_style():
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print_banner()
+    register_status_callback(_status_callback)
+    _refresh_status_panel()
     startup_sequence()
     _auto_index_background()
 
@@ -476,6 +509,7 @@ def main():
             session_memory.add("user", refined)
             renderer = LiveRenderer(refined)
             renderer.start()
+            console.print()
 
             try:
                 log("agent_start", {"input": refined[:200], "mode": config.MODE})
@@ -491,6 +525,8 @@ def main():
 
                 log("agent_end", {"output": output[:200], "mode": config.MODE})
                 renderer.stop()
+                console.print()
+                _refresh_status_panel()
                 render_response(output, tool_outputs)
                 session_memory.add("assistant", output)
 

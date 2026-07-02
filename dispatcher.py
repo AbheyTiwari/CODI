@@ -79,7 +79,14 @@ class Dispatcher:
         action = bundle.get("action", "tool_call")
 
         if action in ("tool_call", "parallel"):
-            return self._execute_tools(bundle.get("tools", []))
+            tools = bundle.get("tools", [])
+            if not isinstance(tools, list):
+                tools = []
+            if not tools and isinstance(bundle, dict):
+                direct_name = bundle.get("name")
+                if isinstance(direct_name, str) and direct_name:
+                    tools = [{"name": direct_name, "args": bundle.get("args", {}) or {}}]
+            return self._execute_tools(tools)
 
         if action in ("noop", "done", "control"):
             signal = bundle.get("signal", "noop")
@@ -217,6 +224,23 @@ class Dispatcher:
         log("dispatcher_call", {"tool": name, "args": str(args)[:500]})
 
         handler = self.registry.get(name)
+        if handler is None and name:
+            alias_map = {
+                "list_directory": "list_files",
+                "create_directory": "create_directory",
+                "create_file": "create_file",
+                "write_file": "write_file",
+                "edit_file": "edit_file",
+                "read_file": "read_file",
+                "search": "search_codebase",
+                "search_codebase": "search_codebase",
+                "run_shell_command": "run_command",
+                "run_command": "run_command",
+                "shell": "run_command",
+            }
+            alias = alias_map.get(name)
+            if alias:
+                handler = self.registry.get(alias)
         if handler is None:
             available = self.registry.list_names()
             log("dispatcher_not_found", {"tool": name, "available": available})

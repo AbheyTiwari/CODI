@@ -21,6 +21,7 @@ from logger import log
 from core.prompts import executor_system_prompt
 from state.temp_db import RunState
 from tools.registry import ToolRegistry
+from status_stream import emit_status
 
 
 # ── Step prompt ───────────────────────────────────────────────────────────────
@@ -197,7 +198,7 @@ def _should_use_content_first(step: str, path: str) -> bool:
 
 def _cli_status(message: str) -> None:
     """Show high-level progress in the CLI without exposing hidden reasoning."""
-    print(f"  [Executor] {message}", flush=True)
+    emit_status("executor", message)
 
 
 def _has_completion_sentinel(text: str) -> bool:
