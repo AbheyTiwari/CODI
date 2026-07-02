@@ -2,14 +2,22 @@
 # Returns the right LLM instance based on MODE in config.py
 # Supports: local (Ollama) | cloud (Groq/Anthropic/OpenAI/Gemini) | air (Air LLM) | hybrid
 
+import copy
+import re
+
 import requests
 from config import (
     MODE, CLOUD_PROVIDER,
     REFINER_MODEL_LOCAL, CODER_MODEL_LOCAL,
     REFINER_MODEL_CLOUD, CODER_MODEL_CLOUD,
     AIR_LLM_URL, AIR_LLM_REFINER_MODEL, AIR_LLM_CODER_MODEL, AIR_LLM_TIMEOUT,
+    OLLAMA_BASE_URL, OLLAMA_THINK,
 )
 from config_loader import get_api_key
+from status_stream import emit_status
+
+
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
 class _FallbackLLM:
@@ -20,10 +28,42 @@ class _FallbackLLM:
         raise RuntimeError(self._error)
 
 
+def _strip_thinking_blocks(text: str) -> tuple[str, bool]:
+    """Remove Qwen-style raw reasoning blocks before parsing or display."""
+    cleaned, count = _THINK_BLOCK_RE.subn("", text or "")
+    return cleaned.strip(), count > 0
+
+
+class _ReasoningFilteredLLM:
+    """Adapter that keeps raw model reasoning out of CODI's UI and parsers."""
+
+    def __init__(self, llm):
+        self._llm = llm
+
+    def invoke(self, *args, **kwargs):
+        response = self._llm.invoke(*args, **kwargs)
+        content = getattr(response, "content", None)
+        if not isinstance(content, str):
+            return response
+
+        visible_content, had_reasoning = _strip_thinking_blocks(content)
+        if not had_reasoning:
+            return response
+
+        emit_status("model", "Reasoning complete; using concise final output.")
+        try:
+            filtered = copy.copy(response)
+            filtered.content = visible_content
+            return filtered
+        except Exception:
+            response.content = visible_content
+            return response
+
+
 # ── Ollama health check ───────────────────────────────────────────────────────
 def _ollama_is_running() -> bool:
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
+        r = requests.get(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=3)
         return r.status_code == 200
     except Exception:
         return False
@@ -81,7 +121,7 @@ def _resolve(role: str):
 
 def _local_llm(role: str):
     if not _ollama_is_running():
-        return _FallbackLLM("Ollama is not reachable on localhost:11434")
+        return _FallbackLLM(f"Ollama is not reachable on {OLLAMA_BASE_URL}")
 
     try:
         from langchain_ollama import ChatOllama
@@ -90,13 +130,15 @@ def _local_llm(role: str):
 
     model   = REFINER_MODEL_LOCAL if role == "refiner" else CODER_MODEL_LOCAL
     num_ctx = 4096 if role == "refiner" else 8192
-    return ChatOllama(
+    llm = ChatOllama(
         model=model,
+        base_url=OLLAMA_BASE_URL,
         temperature=0.2 if role == "refiner" else 0.1,
         num_ctx=num_ctx,
         timeout=300,
-        options={"think": False},
+        options={"think": OLLAMA_THINK},
     )
+    return _ReasoningFilteredLLM(llm)
 
 
 # ── Air LLM (llama.cpp-compatible HTTP server on your phone) ─────────────────

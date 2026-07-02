@@ -9,6 +9,8 @@
 #  "air"     — Use Air LLM server on your phone over local Wi-Fi.
 #
 # ─────────────────────────────────────────────────────────────────────────────
+import os
+
 MODE = "local"     # local | hybrid | cloud | air
 
 # ── Cloud provider (used when MODE="cloud" or hybrid escalates) ───────────────
@@ -68,6 +70,15 @@ AIR_LLM_TIMEOUT       = 180                          # phones are slower — be 
 #
 REFINER_MODEL_LOCAL = "qwen3:14b"           # fast planner / refiner
 CODER_MODEL_LOCAL = "qwen3:14b" # main coder — set to same as refiner for low-end machines
+
+# Ollama endpoint. Keep localhost when tunneling a remote AWS Ollama instance:
+#   ssh -L 11434:localhost:11434 user@your-aws-host
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+# Qwen3 can emit <think>...</think> reasoning. Leaving this False is faster and
+# easier on the machine. If you set it True, CODI strips the raw reasoning from
+# tool parsing/output and only shows a compact progress status in the fixed box.
+OLLAMA_THINK = os.getenv("OLLAMA_THINK", "0").lower() in {"1", "true", "yes", "on"}
 # ── Cloud models ──────────────────────────────────────────────────────────────
 #  Groq (free tier, very fast):
 REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"     # fast, cheap — good for planning

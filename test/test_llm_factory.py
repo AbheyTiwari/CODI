@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import llm_factory
@@ -14,6 +15,18 @@ class LLMFactoryTests(unittest.TestCase):
         llm = llm_factory._FallbackLLM("backend missing")
         with self.assertRaisesRegex(RuntimeError, "backend missing"):
             llm.invoke([])
+
+    def test_thinking_blocks_are_stripped_from_llm_response(self):
+        class DummyLLM:
+            def invoke(self, *_args, **_kwargs):
+                return SimpleNamespace(content="<think>private scratchpad</think>\nHello.")
+
+        llm = llm_factory._ReasoningFilteredLLM(DummyLLM())
+
+        with patch.object(llm_factory, "emit_status"):
+            response = llm.invoke([])
+
+        self.assertEqual(response.content, "Hello.")
 
 
 if __name__ == "__main__":
