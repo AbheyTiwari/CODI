@@ -305,6 +305,34 @@ class Improver:
         framework and file constraints for validators/executors.
         """
         state.requirements = _deterministic_requirements(state.user_input)
+        # Infer framework from existing files in the workspace/tool results.
+        if not state.requirements.framework:
+            # Detect from seen files
+            files_seen = _files_from_tool_results(state)
+            for f in files_seen:
+                if f.lower().endswith((".jsx", ".tsx")):
+                    state.requirements.framework = "react"
+                    state.requirements.must_not.extend(state.requirements.framework_lock())
+                    log("improver_framework_inferred", {"inferred": "react", "source_files": files_seen[:5]})
+                    break
+            # Also detect from package.json in working dir
+            if not state.requirements.framework:
+                working_dir = os.environ.get("CODI_WORKING_DIR") or os.getcwd()
+                pkg_path = os.path.join(working_dir, "package.json")
+                try:
+                    if os.path.exists(pkg_path):
+                        with open(pkg_path, "r", encoding="utf-8", errors="replace") as fh:
+                            pkg = json.load(fh)
+                        deps = {}
+                        for k in ("dependencies", "devDependencies", "peerDependencies"):
+                            if isinstance(pkg.get(k), dict):
+                                deps.update(pkg.get(k))
+                        if any(n.lower().startswith("react") or n.lower().startswith("react-dom") for n in deps.keys()):
+                            state.requirements.framework = "react"
+                            state.requirements.must_not.extend(state.requirements.framework_lock())
+                            log("improver_framework_inferred", {"inferred": "react", "source": "package.json"})
+                except Exception:
+                    pass
         package_name = _derive_package(state.user_input, state.requirements)
         state.project_manifest = {"package": package_name, "files_created": {}}
         log("improver_requirements", {
@@ -520,6 +548,18 @@ class Improver:
         files = _files_from_tool_results(state)
         successes = len([r for r in state.tool_results if r.status == "ok"])
         failures = len([r for r in state.tool_results if r.status == "error"])
+
+        # Special case: exited due to reaching max iterations with a known
+        # validation failure. Report this as a non-clean termination.
+        if state.exceeds_max() and not state.validation_passed and state.validation_notes:
+            output = (
+                "Stopped: reached max iterations without passing validation. "
+                f"Validation failure: {state.validation_notes}"
+            )
+            if files:
+                output += " Changed: " + ", ".join(files[:8]) + "."
+            log("improver_summary", {"source": "max_iteration", "output": output[:200]})
+            return output
 
         if files:
             output = "Done. Changed: " + ", ".join(files[:8]) + "."

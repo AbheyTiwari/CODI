@@ -96,6 +96,8 @@ class RunState:
     tool_results:    list[ToolResult] = field(default_factory=list)
     files_written:   set[str] = field(default_factory=set)
     step_attempts:   dict[str, int] = field(default_factory=dict)
+    # Per-step repair attempts counter to avoid repeated repair loops
+    repair_attempts:  dict[str, int] = field(default_factory=dict)
     project_manifest: dict[str, Any] = field(default_factory=lambda: {"package": None, "files_created": {}})
 
     # ── Validation ────────────────────────────────────────────────────────────

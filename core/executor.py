@@ -541,6 +541,12 @@ class Executor:
             return self._execute_content_first(step, tool, path, state)
 
         # ── Standard JSON path ────────────────────────────────────────────────
+        # Reset per-step repair attempts counter at the start of each step
+        try:
+            state.repair_attempts[step] = 0
+        except Exception:
+            state.repair_attempts = {step: 0}
+
         prompt = _STEP_PROMPT.format(
             step=step,
             requirements=state.requirements.as_prompt_block(),
@@ -576,8 +582,32 @@ class Executor:
             action_bundle = Dispatcher.parse_llm_json(raw)
             repair_needed = False
 
-            # If parse failed, try once more with the repair prompt
+            # If parse failed, try once more with the repair prompt (but cap attempts)
             if action_bundle is None:
+                attempts = state.repair_attempts.get(step, 0)
+                if attempts >= 1:
+                    # Repair exhausted for this step — fall back or fail
+                    log("repair_exhausted", {"step": step[:120], "attempts": attempts})
+                    tool_fb, path_fb = _detect_file_write_step(step)
+                    if tool_fb and path_fb:
+                        # fallback to content-first for file writes
+                        log("tool_routing", {
+                            "strategy": "repair_exhausted_content_first",
+                            "tool": tool_fb,
+                            "path": path_fb[:80],
+                        })
+                        return self._execute_content_first(step, tool_fb, path_fb, state)
+                    error = f"Coder output was not valid JSON and repair attempts exhausted: {raw[:200]}"
+                    state.add_tool_result("coder", "error", error)
+                    return {
+                        "status":  "error",
+                        "results": [{"tool": "coder", "status": "error", "output": error}],
+                        "error":   error,
+                    }
+
+                # Perform one repair attempt
+                state.repair_attempts[step] = attempts + 1
+                log("repair_attempt_counter", {"step": step[:120], "attempt": state.repair_attempts[step]})
                 action_bundle = self._repair_action_bundle(step, raw, state, "malformed_json")
                 repair_needed = True
 
@@ -733,6 +763,23 @@ class Executor:
                         return (
                             f"Forbidden framework content detected in tool args: '{pattern}'. "
                             f"This task is locked to {state.requirements.framework}."
+                        )
+            # Special-case: React-locked projects should not output large
+            # rendered HTML files. Allow minimal mount shells (small files
+            # containing a root div) but flag substantive rendered HTML.
+            if state.requirements and state.requirements.framework and state.requirements.framework.lower() == "react":
+                path = (args.get("path") or "")
+                ext = os.path.splitext(path)[1].lower()
+                if ext == ".html":
+                    content = (args.get("content") or "")
+                    # Heuristic: substantive HTML has >15 lines or contains semantic tags
+                    lines = content.splitlines()
+                    semantic_tags = ["<header", "<main", "<article", "<section", "<nav", "<footer", "<h1", "<h2", "<h3"]
+                    has_semantic = any(tag in content.lower() for tag in semantic_tags)
+                    if len(lines) > 15 or has_semantic:
+                        return (
+                            "Generated substantial HTML content detected in a React-locked project. "
+                            "For React projects prefer component files (.jsx/.tsx) and minimal HTML mount shells."
                         )
         return None
 

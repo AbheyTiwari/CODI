@@ -9,7 +9,6 @@
       "${CODI_WORKING_DIR}"
     ]
   },
-
   "sqlite": {
     "enabled": false,
     "description": "SQLite database queries (disabled: package not found on npm)",
@@ -21,7 +20,6 @@
       "${CODI_WORKING_DIR}"
     ]
   },
-
   "git": {
     "enabled": false,
     "description": "Git operations (disabled: requires a valid git repository)",
@@ -215,7 +213,7 @@
   },
   "stitch": {
     "enabled": false,
-    "description": "Google Stitch — UI/UX code via HTTP MCP (disabled: needs STITCH_API_KEY)",
+    "description": "Google Stitch \u00e2\u20ac\u201d UI/UX code via HTTP MCP (disabled: needs STITCH_API_KEY)",
     "type": "http",
     "url": "https://stitch.googleapis.com/mcp",
     "headers": {

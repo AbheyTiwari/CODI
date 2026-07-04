@@ -202,7 +202,6 @@ def print_help():
     for cmd, desc in [
         ("/index [path]",   "index a directory and set it as working dir"),
         ("/mode",           "show current mode"),
-        ("/mode <name>",    "switch mode: local | hybrid | cloud | air"),
         ("/mcp",            "list MCP servers"),
         ("/mcp on <name>",  "enable MCP server (restart to apply)"),
         ("/mcp off <name>", "disable MCP server (restart to apply)"),
@@ -282,16 +281,6 @@ def render_response(output: str, tool_outputs: list = None):
     console.print()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _set_mode(new_mode: str):
-    valid = {"local", "hybrid", "cloud", "air"}
-    if new_mode not in valid:
-        console.print(Text(f"  unknown mode '{new_mode}'. valid: {', '.join(valid)}", style="red"))
-        return
-    config.MODE = new_mode
-    t = _t()
-    console.print(Text(f"  ✓  mode → {t['label']}", style=t["accent"]))
-    log("mode_switch", {"mode": new_mode})
-
 def _mcp_toggle(name: str, enabled: bool):
     import json
     path = os.path.join(_REPO_ROOT, "mcp_servers.json")
@@ -442,7 +431,7 @@ def main():
 
         elif cmd == "/mode":
             rows = [
-                ("local",  "100% offline · Ollama only"),
+                ("local",  "100% offline · Ollama/llama.cpp"),
                 ("hybrid", "Ollama first · cloud fallback"),
                 ("cloud",  f"always cloud · {config.CLOUD_PROVIDER}"),
                 ("air",    f"Air LLM · {config.AIR_LLM_URL}"),
@@ -458,8 +447,6 @@ def main():
             console.print(Panel(table, title=Text("mode", style=t["accent"]),
                                 border_style=t["dim"]))
 
-        elif cmd.startswith("/mode "):
-            _set_mode(user_input.split(maxsplit=1)[1].strip().lower())
 
         elif cmd == "/mcp":
             import json

@@ -155,6 +155,17 @@ class Validator:
             })
             return False
 
+        # ── Structural validation gate (run only when plan steps appear complete)
+        structural_reason = self._structural_validation_check(state)
+        if structural_reason:
+            self._fail(state, structural_reason)
+            log("validation_decision", {
+                "layer": "structural",
+                "passed": False,
+                "reason": trim_tool_output(structural_reason, max_tokens=15),
+            })
+            return False
+
         # ── LLM semantic check ────────────────────────────────────────────────
         return self._llm_check(state)
 
@@ -362,6 +373,68 @@ class Validator:
         if text:
             return text.splitlines()[0][:120]
         return "empty_error"
+
+    def _structural_validation_check(self, state: RunState) -> str:
+        """Additional deterministic structural checks for framework-specific projects.
+
+        Only run this gate when the plan steps are effectively complete to avoid
+        premature failures during multi-step plans.
+        """
+        try:
+            if not state.requirements:
+                return ""
+            # Only run structural gate when we've progressed through plan steps
+            if state.plan_steps and state.iteration < len(state.plan_steps):
+                return ""
+
+            req = state.requirements
+            # React-specific checks: require a package manifest and either
+            # a react dependency or a jsx/tsx entry file
+            if req.framework and req.framework.lower() == "react":
+                working_dir = os.environ.get("CODI_WORKING_DIR") or os.getcwd()
+                pkg_path = os.path.join(working_dir, "package.json")
+                if not os.path.exists(pkg_path):
+                    return "React project missing package.json manifest."
+                try:
+                    with open(pkg_path, "r", encoding="utf-8", errors="replace") as fh:
+                        pkg = json.load(fh)
+                except Exception:
+                    return "Could not read package.json for React project."
+
+                deps = {}
+                for k in ("dependencies", "devDependencies", "peerDependencies"):
+                    if isinstance(pkg.get(k), dict):
+                        deps.update(pkg.get(k))
+
+                has_react_dep = any(n.lower().startswith("react") or n.lower().startswith("react-dom") for n in deps.keys())
+                # Also detect common React toolchains via scripts (create-react-app, vite, next)
+                scripts = pkg.get("scripts", {}) if isinstance(pkg.get("scripts"), dict) else {}
+                script_text = " ".join(scripts.values()) if scripts else ""
+                has_react_tooling = any(k in script_text.lower() for k in ("react-scripts", "vite", "next", "create-react-app"))
+                # Look for common React entry files
+                found_entry = False
+                for root, dirs, files in os.walk(working_dir):
+                    for f in files:
+                        if f.lower().endswith((".jsx", ".tsx", ".js", ".ts")):
+                            # shallow heuristic: presence of .jsx/.tsx suggests React code
+                            if f.lower().endswith((".jsx", ".tsx")):
+                                found_entry = True
+                                break
+                    if found_entry:
+                        break
+
+                if not (has_react_dep or has_react_tooling) and not found_entry:
+                    return (
+                        "React project appears incomplete: no React dependency in package.json "
+                        "and no .jsx/.tsx entry files detected."
+                    )
+
+            # For other frameworks, reuse existing contamination checks rather
+            # than inventing new heuristics here.
+            return ""
+        except Exception as e:
+            log("structural_validation_error", {"error": str(e)[:200]})
+            return ""
 
     def _is_stalled(self, state: RunState) -> bool:
         """True when the last 4 consecutive results share the same failure signature."""
