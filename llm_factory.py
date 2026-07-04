@@ -67,6 +67,16 @@ def _ollama_is_running() -> bool:
         return r.status_code == 200
     except Exception:
         return False
+    
+
+# ── llama.cpp health check ────────────────────────────────────────────────────
+def _llamacpp_is_running() -> bool:
+    from config import LLAMACPP_URL
+    try:
+        r = requests.get(f"{LLAMACPP_URL.rstrip('/')}/health", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 # ── Air LLM health check ──────────────────────────────────────────────────────
@@ -97,6 +107,9 @@ def _resolve(role: str):
     """
     if MODE == "local":
         return _local_llm(role)
+    
+    if MODE == "llamacpp":
+        return _llamacpp_llm(role)
 
     if MODE == "air":
         return _air_llm(role)
@@ -105,17 +118,33 @@ def _resolve(role: str):
         return _cloud_llm(role)
 
     if MODE == "hybrid":
-        # Try local first; fall back to Air LLM, then cloud
         if _ollama_is_running():
             return _local_llm(role)
+        if _llamacpp_is_running():
+            print(f"  [LLM] Ollama offline — falling back to llama.cpp (localhost)")
+            return _llamacpp_llm(role)
         if _air_llm_is_running():
-            print(f"  [LLM] Ollama offline — falling back to Air LLM ({AIR_LLM_URL})")
+            print(f"  [LLM] Ollama + llama.cpp offline — falling back to Air LLM ({AIR_LLM_URL})")
             return _air_llm(role)
-        print(f"  [LLM] Ollama + Air LLM offline — escalating to cloud ({CLOUD_PROVIDER})")
+        print(f"  [LLM] All local backends offline — escalating to cloud ({CLOUD_PROVIDER})")
         return _cloud_llm(role)
 
     raise ValueError(f"Unknown MODE: {MODE}. Use local | hybrid | cloud | air")
 
+# ── Local (llama.cpp) ────────────────────────────────────────────────────────────
+
+def _llamacpp_llm(role: str):
+    from langchain_openai import ChatOpenAI
+    from config import LLAMACPP_URL, LLAMACPP_REFINER_MODEL, LLAMACPP_CODER_MODEL, LLAMACPP_TIMEOUT
+    model = LLAMACPP_REFINER_MODEL if role == "refiner" else LLAMACPP_CODER_MODEL
+    return ChatOpenAI(
+        model=model,
+        base_url=f"{LLAMACPP_URL.rstrip('/')}/v1",
+        api_key="not-needed",
+        temperature=0.2 if role == "refiner" else 0.1,
+        timeout=LLAMACPP_TIMEOUT,
+        max_retries=1,
+    )
 
 # ── Local (Ollama) ────────────────────────────────────────────────────────────
 

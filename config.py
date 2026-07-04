@@ -11,7 +11,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 import os
 
-MODE = "local"     # local | hybrid | cloud | air
+MODE = "llamacpp"    # local | hybrid | cloud | air | llamacpp
 
 # ── Cloud provider (used when MODE="cloud" or hybrid escalates) ───────────────
 # Options: "groq" | "anthropic" | "openai" | "gemini"
@@ -71,6 +71,13 @@ AIR_LLM_TIMEOUT       = 180                          # phones are slower — be 
 REFINER_MODEL_LOCAL = "qwen3:14b"           # fast planner / refiner
 CODER_MODEL_LOCAL = "qwen3:14b" # main coder — set to same as refiner for low-end machines
 
+#local model LLAMA
+#
+# 
+LLAMACPP_URL = "http://127.0.0.1:8080"
+LLAMACPP_REFINER_MODEL = "qwen2.5-coder-7b"   # name doesn't matter to llama-server, it ignores it
+LLAMACPP_CODER_MODEL   = "qwen2.5-coder-7b"
+LLAMACPP_TIMEOUT       = 120
 # Ollama endpoint. Keep localhost when tunneling a remote AWS Ollama instance:
 #   ssh -L 11434:localhost:11434 user@your-aws-host
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
