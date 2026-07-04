@@ -4,6 +4,8 @@ import time
 import hashlib
 import threading
 import re
+import truststore
+truststore.inject_into_ssl()
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -78,11 +80,12 @@ def _status_callback(line: str) -> None:
     _refresh_status_panel()
 
 THEME = {
-    "local":  {"accent": "bright_green",   "label": "LOCAL",  "dim": "green"},
-    "hybrid": {"accent": "bright_cyan",    "label": "HYBRID", "dim": "cyan"},
-    "cloud":  {"accent": "bright_magenta", "label": "CLOUD",  "dim": "magenta"},
-    "air":    {"accent": "bright_yellow",  "label": "AIR",    "dim": "yellow"},
-}
+    "local":     {"accent": "bright_green",   "label": "LOCAL",     "dim": "green"},
+    "hybrid":    {"accent": "bright_cyan",    "label": "HYBRID",    "dim": "cyan"},
+    "cloud":     {"accent": "bright_magenta", "label": "CLOUD",     "dim": "magenta"},
+    "air":       {"accent": "bright_yellow",  "label": "AIR",       "dim": "yellow"},
+    "llamacpp":  {"accent": "bright_blue",    "label": "LLAMACPP",  "dim": "blue"},
+}   
 
 def _t():
     return THEME.get(config.MODE, THEME["hybrid"])
@@ -103,7 +106,8 @@ def print_banner():
         console.print(Text(line, style=f"bold {t['accent']}"), justify="center")
     console.print()
     console.print(Rule(style=t["dim"]))
-    provider = "ollama" if config.MODE == "local" else config.CLOUD_PROVIDER
+    provider = "ollama" if config.MODE == "local" else (
+    "llama.cpp" if config.MODE == "llamacpp" else config.CLOUD_PROVIDER)
     status = Text()
     status.append(f" {t['label']} ", style=f"bold reverse {t['accent']}")
     status.append(f"  {provider}  ·  {_LAUNCH_DIR}", style="dim")
