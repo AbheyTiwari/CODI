@@ -16,7 +16,30 @@ from llm_factory import get_refiner_llm, _FallbackLLM
 from logger import log
 from state.temp_db import RunState
 from core.validation_utils import build_framework_contamination_errors
+import re
 
+_STOPWORDS = {
+    "a", "an", "the", "to", "with", "for", "and", "or", "of", "in", "on",
+    "add", "adds", "adding", "create", "creates", "creating", "edit", "edits",
+    "editing", "make", "makes", "making", "update", "updates", "updating",
+    "include", "includes", "including", "write", "writes", "writing",
+    "file", "using", "so", "that", "it", "this",
+}
+
+
+def _extract_step_keywords(step: str) -> list[str]:
+    """Pull 1-3 concrete nouns/adjectives out of a step description."""
+    words = re.findall(r"[a-zA-Z]{4,}", step.lower())
+    keywords = [w for w in words if w not in _STOPWORDS]
+    return keywords[-3:] if keywords else []
+
+
+def _detect_step_target_file(step: str) -> str | None:
+    match = re.search(
+        r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt))",
+        step,
+    )
+    return match.group(1).strip("'\"` ") if match else None
 
 # Validate prompt — tight JSON-only output expected.
 _VALIDATE_PROMPT = """
@@ -73,6 +96,41 @@ class Validator:
         # ── noop / done signal from Dispatcher means Executor decided it's done
         last = state.tool_results[-1] if state.tool_results else None
         if last and last.tool == "dispatcher" and last.output in ("noop", "done"):
+            current_step = getattr(state, "current_step", "") or ""
+            keywords = _extract_step_keywords(current_step)
+            target_file = _detect_step_target_file(current_step)
+
+            if keywords and target_file:
+                resolved = target_file
+                if not os.path.isabs(resolved):
+                    resolved = os.path.join(
+                        os.environ.get("CODI_WORKING_DIR", os.getcwd()), resolved
+                    )
+                try:
+                    with open(resolved, "r", encoding="utf-8", errors="replace") as f:
+                        file_content = f.read().lower()
+                    found = any(kw in file_content for kw in keywords)
+                except Exception:
+                    found = True  # can't read the file — don't block on I/O failure
+
+                if not found:
+                    reason = (
+                        f"Step claimed completion via noop but keyword(s) "
+                        f"{keywords} not found in {target_file}."
+                    )
+                    self._fail(state, reason)
+                    log("validation_decision", {
+                        "layer": "noop_content_check",
+                        "passed": False,
+                        "reason": reason,
+                    })
+                    return False
+            elif keywords and not target_file:
+                log("validation_noop_unverifiable", {
+                    "step": current_step[:120],
+                    "reason": "no target file detected, cannot verify noop",
+                })
+
             self._pass(state, "Executor signalled completion.")
             log("validation_decision", {
                 "layer": "noop_signal",

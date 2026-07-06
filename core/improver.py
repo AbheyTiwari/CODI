@@ -415,32 +415,36 @@ class Improver:
         done_count = max(0, state.iteration - 1)
 
         if state.plan_steps and "[CORRECTION]" not in (state.plan or ""):
-            index = state.iteration - 1
-            if 0 <= index < len(state.plan_steps):
-                selected_step = state.plan_steps[index]
-                recent_outputs = [getattr(existing, "output", "") for existing in state.tool_results[-3:]]
-                if selected_step and any(
-                    isinstance(output, str) and "skip_duplicate_write" not in output and output.strip() == selected_step.strip()
-                    for output in recent_outputs
-                ):
-                    index = min(index + 1, len(state.plan_steps) - 1)
-                    selected_step = state.plan_steps[index]
+            remaining = [s for s in state.plan_steps if s not in state.completed_steps]
+
+            if not remaining:
                 log("step_selected", {
-                    "step": trim_tool_output(selected_step, max_tokens=20),
+                    "step": "",
                     "matched_plan": True,
                     "iteration": state.iteration,
-                    "done": False,
-                    "plan_steps_remaining": max(0, len(state.plan_steps) - done_count),
-                    "source": "plan_index",
+                    "done": True,
+                    "plan_steps_remaining": 0,
+                    "source": "plan_index_exhausted",
                 })
-                return {"step": selected_step, "done": False}
+                return {"step": "", "done": True}
+
+            selected_step = remaining[0]
+            log("step_selected", {
+                "step": trim_tool_output(selected_step, max_tokens=20),
+                "matched_plan": True,
+                "iteration": state.iteration,
+                "done": False,
+                "plan_steps_remaining": len(remaining),
+                "source": "plan_index",
+            })
+            return {"step": selected_step, "done": False}
 
         prompt = _NEXT_STEP_PROMPT.format(
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
             plan=state.plan,
             plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
-            done_steps=f"{done_count} of {len(state.plan_steps)}",
+            done_steps="\n".join(state.completed_steps) if state.completed_steps else "(none yet)",
             tool_results=wrap_prompt_data(trim_tool_output(state.context_snapshot(max_recent=3), max_tokens=900)),
         )
         raw = self._call(prompt)

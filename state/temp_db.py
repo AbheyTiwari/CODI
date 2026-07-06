@@ -99,6 +99,7 @@ class RunState:
     # Per-step repair attempts counter to avoid repeated repair loops
     repair_attempts:  dict[str, int] = field(default_factory=dict)
     project_manifest: dict[str, Any] = field(default_factory=lambda: {"package": None, "files_created": {}})
+    plan_confirmed:  bool = True
 
     # ── Validation ────────────────────────────────────────────────────────────
     validation_passed: bool = False
@@ -111,6 +112,10 @@ class RunState:
 
     # ── Raw LLM JSON exchanges (for debugging) ────────────────────────────────
     llm_exchanges: list[dict] = field(default_factory=list)
+
+    # ── Completed steps (ground truth, not iteration count) ───────────────────
+    completed_steps: list[str] = field(default_factory=list)
+    current_step: str = ""
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -205,6 +210,10 @@ class RunState:
 
     def record_llm(self, role: str, content: str):
         self.llm_exchanges.append({"role": role, "content": content})
+
+    def mark_step_complete(self, step: str):
+        if step and step not in self.completed_steps:
+            self.completed_steps.append(step)
 
     def is_done(self) -> bool:
         return self.status in ("complete", "failed")

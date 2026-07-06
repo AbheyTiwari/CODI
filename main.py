@@ -358,6 +358,7 @@ def main():
         history=FileHistory(os.path.join(_REPO_ROOT, ".agent_history")),
         style=_pt_style(),
     )
+    pending_plan_state = {"awaiting": False, "state": None}
 
     while True:
         t = _t()
@@ -488,7 +489,45 @@ def main():
             subprocess.run([sys.executable, os.path.join(_REPO_ROOT, "log_viewer.py")])
 
         # ── Natural language ──────────────────────────────────────────────────
+        # ── Natural language ──────────────────────────────────────────────────
         else:
+            # If we're sitting on an unconfirmed plan, this input is either a
+            # confirmation ("y"/"yes") or a brand new instruction that replaces
+            # the pending plan entirely.
+            if pending_plan_state["awaiting"]:
+                if user_input.strip().lower() in ("y", "yes"):
+                    confirmed_state = pending_plan_state["state"]
+                    pending_plan_state["awaiting"] = False
+                    pending_plan_state["state"] = None
+ 
+                    console.print(Text(f"  → resuming confirmed plan", style="dim"))
+                    renderer = LiveRenderer(confirmed_state.user_input)
+                    renderer.start()
+                    console.print()
+ 
+                    try:
+                        response = agent_executor.invoke({}, resume_state=confirmed_state)
+                        output       = response.get("output") or "No output returned."
+                        tool_outputs = response.get("tool_outputs", [])
+ 
+                        renderer.stop()
+                        console.print()
+                        _refresh_status_panel()
+                        render_response(output, tool_outputs)
+                        session_memory.add("assistant", output)
+                    except Exception as e:
+                        renderer.stop()
+                        console.print(Panel(Text(str(e), style="red"),
+                                            title=Text("error", style="red"),
+                                            border_style="red", padding=(0, 2)))
+                    continue
+                else:
+                    # Not a confirmation — drop the pending plan and treat this
+                    # input as a brand new task instead. Fall through below.
+                    pending_plan_state["awaiting"] = False
+                    pending_plan_state["state"] = None
+                    console.print(Text("  → discarded previous plan, starting new task", style="dim"))
+ 
             # Fast path for simple read/list commands — no LLM needed
             fast_result = _try_fast_path(user_input)
             if fast_result is not None:
@@ -496,7 +535,7 @@ def main():
                 session_memory.add("user", user_input)
                 session_memory.add("assistant", fast_result)
                 continue
-
+ 
             # Only refine action-oriented longer inputs — skip for short/simple
             if len(user_input) > 60:
                 refined = refine_prompt(user_input)
@@ -504,31 +543,40 @@ def main():
                     console.print(Text(f"  → {refined}", style="dim"))
             else:
                 refined = user_input
-
+ 
             session_memory.add("user", refined)
             renderer = LiveRenderer(refined)
             renderer.start()
             console.print()
-
+ 
             try:
                 log("agent_start", {"input": refined[:200], "mode": config.MODE})
                 history_str = get_trimmed_history()
                 token_est   = estimate_tokens(refined + history_str)
-
+ 
                 if token_est > 3000 and config.MODE in ("local", "air"):
                     renderer.push(f"⚠ context ~{token_est} tokens — consider /clear")
-
+ 
                 response     = agent_executor.invoke({"input": refined, "history": history_str})
                 output       = response.get("output") or "No output returned."
                 tool_outputs = response.get("tool_outputs", [])
-
+                run_state    = response.get("state")
+ 
                 log("agent_end", {"output": output[:200], "mode": config.MODE})
                 renderer.stop()
                 console.print()
                 _refresh_status_panel()
+ 
+                if run_state is not None and run_state.status == "awaiting_plan_confirmation":
+                    pending_plan_state["awaiting"] = True
+                    pending_plan_state["state"] = run_state
+                    console.print(Panel(Markdown(output), border_style=t["dim"], padding=(0, 2)))
+                    session_memory.add("assistant", output)
+                    continue
+ 
                 render_response(output, tool_outputs)
                 session_memory.add("assistant", output)
-
+ 
             except Exception as e:
                 renderer.stop()
                 err = str(e)
@@ -545,6 +593,7 @@ def main():
                     console.print(Panel(Text(str(e), style="red"),
                                         title=Text("error", style="red"),
                                         border_style="red", padding=(0,2)))
+ 
 
 
 if __name__ == "__main__":

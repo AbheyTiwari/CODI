@@ -11,10 +11,19 @@
 #           correction = improver.improve(state)
 #           → retry with correction
 #   output = improver.summarize(state)
+#
+# Plan confirmation gate:
+#   - On a FRESH task, plan_confirmed is forced to False. After create_plan()
+#     runs, if plan_confirmed is still False, we write plan.md and return
+#     immediately WITHOUT executing anything, along with the RunState object
+#     itself so the caller (main.py) can hold onto it.
+#   - To actually execute, the caller must call invoke() again passing that
+#     same RunState back in via resume_state=. That call skips planning
+#     entirely and goes straight into the execution loop.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import traceback
-
+import os
 from core.executor  import Executor
 from core.improver  import Improver
 from core.planner   import Planner
@@ -39,65 +48,109 @@ class CodiAgent:
         self.executor  = Executor(self.registry)
         self.validator = Validator()
 
-    def invoke(self, inputs: dict) -> dict:
+    def invoke(self, inputs: dict, resume_state: RunState = None) -> dict:
         """
-        Main entry point. Mirrors the old CodiGraphAgent.invoke() interface
-        so main.py needs minimal changes.
+        Main entry point.
 
-        inputs: {"input": str, "history": str}
-        returns: {"output": str, "tool_outputs": list[str]}
+        inputs: {"input": str, "history": str}   — ignored if resume_state is given
+        resume_state: a RunState previously returned with status
+                      "awaiting_plan_confirmation", after the user confirmed it.
+
+        returns: {"output": str, "tool_outputs": list[str], "state": RunState}
+
+        The "state" key is always present now. Callers (main.py) must check
+        state.status == "awaiting_plan_confirmation" to know whether to hold
+        onto it and prompt the user for confirmation instead of treating the
+        output as a finished answer.
         """
-        state = RunState(
-            user_input=inputs.get("input", ""),
-            history=inputs.get("history", ""),
-        )
+        resuming = resume_state is not None
+
+        if resuming:
+            state = resume_state
+            state.plan_confirmed = True
+        else:
+            state = RunState(
+                user_input=inputs.get("input", ""),
+                history=inputs.get("history", ""),
+            )
+            # Every fresh task starts unconfirmed. Fast-path / direct-answer
+            # tasks never reach the gate check, so this is safe to force here.
+            state.plan_confirmed = False
 
         _agent_status(f"Received task: {state.user_input[:120]}")
-        log("agent_start", {"input": state.user_input[:120]})
+        log("agent_start", {"input": state.user_input[:120], "resuming": resuming})
 
         try:
-            output = self._run(state)
+            output = self._run(state, resuming=resuming)
         except Exception as e:
             log("agent_crash", {"error": str(e), "traceback": traceback.format_exc()[:4000]})
             output = f"Agent error: {e}"
+            state.status = "failed"
 
-        log("agent_end", {"output": output[:120], "iterations": state.iteration})
+        log("agent_end", {
+            "output": (output or "")[:120],
+            "iterations": state.iteration,
+            "status": state.status,
+        })
 
         return {
             "output":       output,
             "tool_outputs": state.recent_tool_outputs(n=10),
+            "state":        state,
         }
 
     # ── Core loop ─────────────────────────────────────────────────────────────
 
-    def _run(self, state: RunState) -> str:
+    def _run(self, state: RunState, resuming: bool = False) -> str:
 
-        # ── Route: simple Q&A or full execution? ──────────────────────────────
-        if not self.planner.needs_execution(state):
-            _agent_status("Answering directly; no tools needed.")
-            log("agent_direct", {"input": state.user_input[:80]})
-            state.status = "complete"
-            return self.planner.direct_answer(state)
+        if not resuming:
+            # ── Route: simple Q&A or full execution? ───────────────────────────
+            if not self.planner.needs_execution(state):
+                _agent_status("Answering directly; no tools needed.")
+                log("agent_direct", {"input": state.user_input[:80]})
+                state.status = "complete"
+                return self.planner.direct_answer(state)
 
-        _agent_status("Checking for a fast file action.")
-        fast_output = try_fast_file_task(state.user_input, self.registry, state)
-        if fast_output:
-            _agent_status("Completed with fast file action.")
-            log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
-            state.status = "complete"
-            return fast_output
+            _agent_status("Checking for a fast file action.")
+            fast_output = try_fast_file_task(state.user_input, self.registry, state)
+            if fast_output:
+                _agent_status("Completed with fast file action.")
+                log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
+                state.status = "complete"
+                return fast_output
 
-        # ── Phase 1: Read context ──────────────────────────────────────────────
-        _agent_status("Reading project context.")
-        context = self.improver.read_context(state)
-        log("agent_context_ready", {"context_len": len(context)})
+            # ── Phase 1: Read context ──────────────────────────────────────────
+            _agent_status("Reading project context.")
+            context = self.improver.read_context(state)
+            log("agent_context_ready", {"context_len": len(context)})
 
-        # ── Phase 2: Create plan ───────────────────────────────────────────────
-        _agent_status("Creating an execution plan.")
-        self.improver.create_plan(state, context)
-        if state.plan_steps:
-            _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
-        log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan})
+            # ── Phase 2: Create plan ────────────────────────────────────────────
+            _agent_status("Creating an execution plan.")
+            self.improver.create_plan(state, context)
+            if state.plan_steps:
+                _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
+            log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan})
+
+            # ── Plan confirmation gate ───────────────────────────────────────────
+            if not state.plan_confirmed:
+                plan_path = os.path.join(
+                    os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
+                )
+                lines = [f"# Plan: {state.plan}", ""]
+                for i, s in enumerate(state.plan_steps, 1):
+                    lines.append(f"{i}. {s}")
+                try:
+                    with open(plan_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines) + "\n")
+                except Exception as e:
+                    log("plan_md_write_error", {"error": str(e)})
+
+                state.status = "awaiting_plan_confirmation"
+                _agent_status("Plan ready — waiting for user confirmation.")
+                return (
+                    f"Plan written to {plan_path}. Review it, then type 'y' to run it, "
+                    f"or give me a new instruction to replan."
+                )
 
         state.status = "running"
 
@@ -129,7 +182,9 @@ class CodiAgent:
             _agent_status(f"Working on step {state.iteration}: {step[:120]}")
             log("agent_step", {"iteration": state.iteration, "step": step[:100]})
 
-            # Executor runs the step
+            state.current_step = step
+
+            # Executor runs the step — ONCE. (Previously called twice — fixed.)
             self.executor.execute_step(step, state)
 
             # Validator checks if we're done
@@ -137,6 +192,7 @@ class CodiAgent:
             is_valid = self.validator.validate(state)
 
             if is_valid:
+                state.mark_step_complete(step)
                 _agent_status("Validation passed.")
                 state.status = "complete"
                 break
@@ -153,10 +209,10 @@ class CodiAgent:
         _agent_status("Preparing final response.")
         output = self.improver.summarize(state)
         state.final_output = output
-        
+
         # ── Log decision trace for observability ────────────────────────────────
         log("task_complete_trace", state.to_decision_trace())
-        
+
         return output
 
 
