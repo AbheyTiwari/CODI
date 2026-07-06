@@ -49,7 +49,14 @@ class TaskRequirements:
             "flask":   ["from fastapi", "import fastapi", "from django"],
             "django":  ["from fastapi", "import fastapi", "from flask", "import flask"],
             "react":   ["import vue", "import angular"],
-            "vanilla": ["import react", "import vue", "import angular"],
+            "vanilla": [
+                "import react", "import vue", "import angular",
+                "from react", "from vue", "from angular",
+                "create-react-app", "create react app",
+                "npx create-react-app", "npm create vite",
+                "vue-cli", "vue create", "ng new",
+                "jsx", "tsx",
+            ],
         }
         if self.framework and self.framework.lower() in locks:
             return locks[self.framework.lower()]

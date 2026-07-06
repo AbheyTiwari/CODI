@@ -153,9 +153,40 @@ def _extract_file_refs(text: str) -> list[str]:
     pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|svg))"
     return _unique([m.group(1).strip("'\"` ") for m in re.finditer(pattern, text or "")])
 
+_NEGATION_TRIGGERS = (
+    "no framework", "no frameworks", "without a framework", "without frameworks",
+    "not use", "don't use", "do not use", "excluding", "except for", "except",
+    "never use", "forbidden", "avoid using", "avoid",
+)
+
+
+def _strip_negated_clauses(text: str) -> str:
+    """
+    Truncate the task text at the first negation trigger, so anything named
+    inside a 'no X, Y, Z' / 'without X' / 'excluding X' clause is excluded
+    from framework/keyword detection entirely.
+
+    This is deliberately blunt: it cuts the rest of the sentence off rather
+    than trying to parse clause boundaries. A forbidden-frameworks list is
+    almost always the LAST thing named in a requirements sentence, so this
+    works for the common case without needing real NLP. If it ever proves too
+    aggressive (cutting off something needed after the negation), that's a
+    sign this needs real clause-boundary detection instead of truncation —
+    don't patch around it with more special-casing.
+    """
+    lowered = text.lower()
+    cut_positions = [
+        lowered.find(trigger)
+        for trigger in _NEGATION_TRIGGERS
+        if trigger in lowered
+    ]
+    if not cut_positions:
+        return text
+    return text[: min(cut_positions)]
 
 def _deterministic_requirements(task: str) -> TaskRequirements:
-    lowered = (task or "").lower()
+    positive_text = _strip_negated_clauses(task or "")
+    lowered = positive_text.lower()
     framework = None
     for candidate in ("fastapi", "flask", "django", "react"):
         if candidate in lowered:
@@ -341,6 +372,26 @@ class Improver:
             "project_manifest": state.project_manifest,
         })
 
+    def _plan_contamination_check(self, state: RunState) -> list[str]:
+        """
+        Scan the generated plan steps (not yet executed) for forbidden
+        framework mentions. Returns a list of offending step strings.
+        Runs immediately after create_plan(), before the plan is written
+        to plan.md or shown to the user.
+        """
+        forbidden = state.requirements.framework_lock()
+        if not forbidden:
+            return []
+
+        offending = []
+        for step in state.plan_steps:
+            lowered_step = step.lower()
+            for pattern in forbidden:
+                if pattern.lower() in lowered_step:
+                    offending.append(step)
+                    break
+        return offending
+    
     def create_plan(self, state: RunState, context: str) -> dict:
         """
         Extract requirements first, then ask the LLM to produce a plan.
@@ -395,7 +446,7 @@ class Improver:
             if line:
                 steps.append(line)
         state.plan       = raw[:200]
-        state.plan_steps = steps[:5]
+        state.plan_steps = steps[:500]  # cap to avoid runaway memory usage
         
         log("plan_created", {
             "plan_source": "fallback",
@@ -404,6 +455,25 @@ class Improver:
             "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
             "raw_sample": trim_tool_output(raw, max_tokens=30),
         })
+
+        offending_steps = self._plan_contamination_check(state)
+        if offending_steps:
+            log("plan_contamination_detected", {
+                "offending_steps": offending_steps,
+                "framework": state.requirements.framework,
+            })
+            # Strip the offending steps and replace with a single explicit
+            # instruction step instead of silently letting them through.
+            state.plan_steps = [
+                s for s in state.plan_steps if s not in offending_steps
+            ]
+            state.plan_steps.insert(
+                0,
+                f"Do NOT use {', '.join(offending_steps[:1])[:0] or 'any forbidden framework'}. "
+                f"Task is locked to {state.requirements.framework}. Rewrite using "
+                f"{state.requirements.framework} only.",
+            )
+        
         return {"plan": state.plan, "steps": state.plan_steps}
 
     # ── Phase 3: Decide next step ─────────────────────────────────────────────
