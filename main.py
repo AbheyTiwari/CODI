@@ -330,6 +330,22 @@ def _set_working_dir(target: str):
     log("working_dir_changed", {"path": target})
     console.print(Text(f"  cwd → {target}", style=_t()["accent"]))
 
+def _cleanup_session_on_exit():
+    """
+    Clear in-memory session state and remove the stale plan.md so the next
+    launch in this directory doesn't inherit a leftover plan or history from
+    a previous, unrelated run.
+    """
+    session_memory.clear()
+    working_dir = os.environ.get("CODI_WORKING_DIR", _LAUNCH_DIR)
+    plan_path = os.path.join(working_dir, "plan.md")
+    try:
+        if os.path.exists(plan_path):
+            os.remove(plan_path)
+            log("plan_md_cleared_on_exit", {"path": plan_path})
+    except Exception as e:
+        log("plan_md_cleanup_error", {"error": str(e)})
+
 def get_trimmed_history() -> str:
     full = session_memory.as_text()
     return trim_context_for_llm(
@@ -367,6 +383,7 @@ def main():
                 [("class:prompt", "❯ ")], style=_pt_style()
             ).strip()
         except (KeyboardInterrupt, EOFError):
+            _cleanup_session_on_exit()
             console.print(Text("\n  goodbye\n", style="dim"))
             break
 
@@ -387,6 +404,7 @@ def main():
 
         # ── Commands ──────────────────────────────────────────────────────────
         if cmd in ("/quit", "/exit"):
+            _cleanup_session_on_exit()
             console.print(Text("\n  goodbye\n", style="dim"))
             break
 

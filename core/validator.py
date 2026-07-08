@@ -201,15 +201,22 @@ class Validator:
             return True
 
         # ── Plan progress guard ────────────────────────────────────────────────
-        if state.plan_steps and state.iteration < len(state.plan_steps):
-            reason = "Task has remaining plan steps."
+        # ── Plan progress guard ────────────────────────────────────────────────
+        # Only block overall completion if there are steps NOT YET marked
+        # complete. A step succeeding does not mean the whole task is done —
+        # but it also must not be reported as a failure. Step-level success
+        # is already recorded via state.completed_steps by agent.py, BEFORE
+        # this function runs. This guard only decides "is everything done."
+        remaining = [s for s in state.plan_steps if s not in state.completed_steps]
+        if remaining:
+            reason = f"{len(remaining)} plan step(s) not yet completed."
             self._fail(state, reason, requires_correction=False)
             log("validation_decision", {
                 "layer": "plan_progress",
                 "passed": False,
                 "reason": reason,
                 "iteration": state.iteration,
-                "plan_steps": len(state.plan_steps),
+                "remaining_steps": len(remaining),
             })
             return False
 

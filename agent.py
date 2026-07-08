@@ -34,6 +34,25 @@ from state.temp_db  import RunState
 from tools.registry import ToolRegistry, registry as _global_registry
 from status_stream import emit_status
 
+def _step_succeeded(state: RunState) -> bool:
+    """
+    Deterministic check: did the most recent tool action succeed?
+    A step counts as done if the last tool result recorded is 'ok', OR if
+    the executor explicitly signalled a duplicate-write skip (the file was
+    already correctly written by an earlier identical step) or a noop
+    (nothing needed doing). Does NOT consult the LLM semantic validator —
+    that answers a different question (is the whole task done).
+    """
+    if not state.tool_results:
+        return False
+    last = state.tool_results[-1]
+    if last.status == "ok":
+        return True
+    # dispatcher noop/duplicate-write signals also count as step success —
+    # they mean "nothing left to do here," not "this failed"
+    if last.tool == "dispatcher" and last.output in ("noop", "done"):
+        return True
+    return False
 
 def _agent_status(message: str) -> None:
     """Show high-level agent progress without exposing hidden model reasoning."""
@@ -184,15 +203,23 @@ class CodiAgent:
 
             state.current_step = step
 
-            # Executor runs the step — ONCE. (Previously called twice — fixed.)
-            self.executor.execute_step(step, state)
+            # Executor runs the step — once.
+            dispatch_result = self.executor.execute_step(step, state)
 
-            # Validator checks if we're done
+            # Step-level completion is a deterministic fact: did the most
+            # recent tool action for THIS step succeed? This is independent
+            # of whether the overall task is finished — do not let the
+            # semantic validator gate this.
+            if _step_succeeded(state):
+                state.mark_step_complete(step)
+                log("step_marked_complete", {"step": step[:120], "completed_count": len(state.completed_steps)})
+
+            # Validator now answers ONLY "is the overall task done?" —
+            # not "did this step succeed" (that's already been decided above).
             _agent_status("Validating the result.")
             is_valid = self.validator.validate(state)
 
             if is_valid:
-                state.mark_step_complete(step)
                 _agent_status("Validation passed.")
                 state.status = "complete"
                 break
@@ -202,18 +229,7 @@ class CodiAgent:
                 _agent_status(f"Validation needs repair: {state.validation_notes[:120]}")
                 correction = str(self.improver.improve(state))
                 log("agent_correction", {"correction": correction[:100]})
-                # Inject correction as next step context
                 state.plan = f"{state.plan}\n[CORRECTION]: {correction}"
-
-        # ── Phase 4: Final output ──────────────────────────────────────────────
-        _agent_status("Preparing final response.")
-        output = self.improver.summarize(state)
-        state.final_output = output
-
-        # ── Log decision trace for observability ────────────────────────────────
-        log("task_complete_trace", state.to_decision_trace())
-
-        return output
 
 
 def create_agent(mode: str = None) -> CodiAgent:
