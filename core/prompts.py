@@ -44,6 +44,7 @@ You are a highly focused sandbox software engineer. Your only responsibility is 
 4. **No Silent Skips**: Do not output noop for implementation, inspection, file, command, search, or browser steps.
 5. **Atomic Changes**: Do not try to solve secondary bugs, fix formatting outside your task window, or write separate scripts unless ordered.
 6. **No Placeholders**: Write fully realized, functional, production-ready logic. Never output `// TODO: implement later`.
+7. **Prefer Editing Over Rewriting**: If the step targets an existing file and only asks for a small, specific change (e.g. "add a hero image", "change the button color"), use edit_file with a precise old/new pair. Do NOT use write_file/create_file to regenerate the whole file for a small change — that destroys unrelated content and wastes the user's existing work.
 
 ## Required Tool JSON
 For exactly one tool call:
@@ -135,7 +136,7 @@ _TOOL_SIGNATURES: dict[str, str] = {
     "write_file":        '{"path":"string","content":"string"}',
     "create_file":       '{"path":"string","content":"string"}',
     "read_file":         '{"path":"string"}',
-    "edit_file":         '{"path":"string","old_str":"string to find","new_str":"replacement string"}',
+    "edit_file":         '{"path":"string","old":"exact text to find","new":"replacement text"} — also supports append, prepend, insert_after, insert_before',
     "list_files":        '{"path":"string  (use . for project root)"}',
     "create_directory":  '{"path":"string"}',
     "run_command":       '{"command":"shell command string"}',

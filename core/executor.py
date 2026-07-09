@@ -9,10 +9,8 @@
 # The Dispatcher normalizes malformed LLM output before routing.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import json
 import os
 import re
-import time
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from context_trimmer import trim_tool_output
@@ -22,7 +20,6 @@ from logger import log
 from core.prompts import executor_system_prompt
 from state.temp_db import RunState
 from tools.registry import ToolRegistry
-from status_stream import emit_status
 
 
 # ── Step prompt ───────────────────────────────────────────────────────────────
@@ -38,7 +35,6 @@ Available tools:
 Previous tool results (for context):
 {context}
 
-Protocol: choose exactly one atomic tool action for this step. Do not emit a batch of tool calls.
 Output the JSON action bundle now. JSON only — no prose, no fences."""
 
 
@@ -63,19 +59,12 @@ JSON only:"""
 
 
 # ── Content-first prompt ──────────────────────────────────────────────────────
-# Used when the step involves writing a file.
-# The LLM outputs markdown-wrapped file content, not a JSON tool bundle, so it
-# can use its full context window for content instead of JSON escaping overhead.
+# Used when the step involves writing a file with substantial content.
+# The LLM outputs the file content directly (no JSON wrapper) so it can
+# use its full context window for content instead of JSON escaping overhead.
 _CONTENT_PROMPT = """\
-You are writing the full content of a file.
-Do not output JSON. Do not describe your reasoning.
-
-Output format:
-1. A single markdown code fence containing the complete file content.
-2. After the closing fence, output this exact sentinel on its own line:
-{sentinel}
-
-The sentinel is not part of the file. It tells the executor that generation finished.
+You are writing the full content of a file. Output ONLY the raw file content.
+No JSON. No markdown fences. No explanation. Just the file content itself.
 
 File to write: {path}
 Task: {step}
@@ -83,122 +72,155 @@ Task: {step}
 Requirements:
 {requirements}
 
-Project manifest:
-{project_manifest}
-
-Existing content of this file (empty if the file does not exist yet):
-{existing_content}
-
-IMPORTANT: write_file overwrites the ENTIRE file. If existing content is shown
-above, your output must be the COMPLETE file — the existing content PLUS this
-step's addition merged together — not just the new section. Never drop
-previously-written content when adding to a file that already exists.
-
 Context from project:
 {context}
 
 Output the complete file content now:"""
 
 
-_CONTENT_CONTINUATION_PROMPT = """\
-The previous file generation for {path} ended before the required sentinel.
-Continue from the exact next character after the current partial content.
-Do not repeat content that is already present. Do not output JSON. Do not explain.
+# ── Edit-first prompts (REPLACE semantics) ─────────────────────────────────────
+# Used when the step is a targeted replace-style edit to an existing file.
+# Injects the ACTUAL current file content (read deterministically via the
+# read_file tool, not pulled from stale/trimmed tool_results) so the model
+# can copy "old" verbatim instead of inventing text that was never there.
+_EDIT_PROMPT = """\
+You must edit an EXISTING file by specifying an exact old/new text pair.
 
-When the file is complete, close any markdown fence you opened and output this exact sentinel on its own line:
-{sentinel}
+File to edit: {path}
+
+CURRENT FULL CONTENT OF THE FILE (copy "old" from here EXACTLY — same
+whitespace, same indentation, same line breaks. Do not paraphrase or
+reformat it):
+{file_content}
 
 Task: {step}
 
-Tail of current partial content:
-{tail}
+Requirements:
+{requirements}
 
-Output only the remaining file content:"""
+Output ONLY this JSON — no prose, no fences:
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+
+Rules:
+- "old" MUST be a contiguous substring that appears character-for-character in the file content shown above.
+- Keep "old" as SHORT as possible while still being unique — a few lines is usually enough. Do not paste the whole file.
+- If you are adding something new (not replacing), pick a short unique anchor line as "old" and include that same anchor line at the start or end of "new".
+
+JSON only:"""
+
+_EDIT_REPAIR_PROMPT = """\
+Your previous edit_file call FAILED because "old" was not found in the file,
+even after whitespace normalization. This means you did not copy it exactly.
+
+File to edit: {path}
+
+CURRENT FULL CONTENT OF THE FILE (this is the ONLY valid source for "old"):
+{file_content}
+
+Your previous (failed) "old" value was:
+{failed_old}
+
+Task: {step}
+
+Look at the file content above character by character and pick a short
+substring that ACTUALLY EXISTS in it. Output ONLY this JSON:
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM FILE ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+
+JSON only:"""
 
 
-_CONTENT_COMPLETE_SENTINEL = "CODI_FILE_WRITE_COMPLETE"
-_MAX_CONTENT_CONTINUATIONS = 3
+# ── Additive-append prompt (no replace anchor needed) ──────────────────────────
+# Used for tasks that ADD new capability (new function, new listener, new
+# block) rather than modify existing text. There's no reliable "old" anchor
+# for these — forcing old/new replace semantics on them is what causes
+# repeated "text not found" failures on tasks like "add dark mode toggle".
+# append has no search step at all, so it structurally cannot fail that way.
+_ADDITIVE_APPEND_PROMPT = """\
+You are adding new functionality to an existing file. Output ONLY the new
+code to append to the end of the file. Do not repeat existing code. No
+prose, no markdown fences — just the new code block.
 
+File: {path}
+
+CURRENT FULL CONTENT (for context — do not repeat this, just add what's new):
+{file_content}
+
+Task: {step}
+
+Requirements:
+{requirements}
+
+Output only the new code to append:"""
+
+
+# ── Token threshold for switching to content-first mode ───────────────────────
+# If a step mentions writing a file and the expected content is likely large
+# (HTML/CSS with design requirements, full scripts, etc.), bypass JSON entirely.
+_LARGE_CONTENT_TRIGGERS = (
+    "modern", "sleek", "design", "website", "webpage", "landing", "dashboard",
+    "terminal", "portal", "app", "full", "complete", "entire", "whole",
+    "beautiful", "styled", "animated", "responsive", "interactive",
+    "dark", "light", "theme", "glass", "gradient", "shadow", "effect",
+    "layout", "component", "feature", "section", "header", "footer",
+    "nav", "card", "modal", "form", "button", "style", "color", "font",
+)
+
+# Extensions that commonly produce large content
+_LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg")
 
 # File write tool names
 _WRITE_TOOLS = {"write_file", "create_file"}
 
+# Keywords that signal a targeted edit rather than a full file (re)write.
+# When the target path already exists on disk, these force edit_file so a
+# request like "add a hero image" can't degrade into a full-file rewrite.
+_EDIT_KEYWORDS = ("edit", "update", "add", "modify", "insert", "append", "change", "fix", "remove")
 
-def _estimate_token_count(text: str) -> int:
-    """Rough token estimate used when the LLM client does not expose usage metadata."""
-    if not text:
-        return 0
-    return max(1, len(re.findall(r"\S+", text)))
-
-
-def _extract_token_metrics(response: object) -> dict[str, int]:
-    """Extract prompt/output/total token metrics from a LangChain response if available."""
-    usage = getattr(response, "usage_metadata", None)
-    if isinstance(usage, dict):
-        prompt_tokens = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
-        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens") or 0
-        total_tokens = usage.get("total_tokens") or (prompt_tokens + output_tokens) or 0
-        return {
-            "prompt_tokens": int(prompt_tokens),
-            "output_tokens": int(output_tokens),
-            "total_tokens": int(total_tokens),
-        }
-    return {"prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-
-def _log_llm_metrics(stage: str, prompt: str, response: object, start_time: float, end_time: float) -> None:
-    """Emit concise performance metrics about the LLM call."""
-    content = getattr(response, "content", "") or ""
-    if not isinstance(content, str):
-        content = str(content)
-    metrics = _extract_token_metrics(response)
-    raw_response_len = len(content)
-    raw_response_tokens = metrics.get("output_tokens") or _estimate_token_count(content)
-    log(stage, {
-        "prompt_build_s": round((end_time - start_time), 3),
-        "prompt_tokens": metrics.get("prompt_tokens", 0),
-        "generation_started": True,
-        "first_token_s": round((time.time() - start_time), 3),
-        "generation_finished_s": round((end_time - start_time), 3),
-        "output_tokens": metrics.get("output_tokens", 0),
-        "raw_response_length_characters": raw_response_len,
-        "raw_response_tokens": raw_response_tokens,
-    })
+# Additive vs. replace sub-classification (both are subsets of edit-intent).
+# Additive tasks have no reliable "old" text to anchor a replace on — they
+# introduce something that doesn't exist yet. Replace-specific verbs win
+# when both appear (e.g. "change the add-to-cart button" is a replace).
+_ADDITIVE_KEYWORDS = ("add", "insert", "implement", "introduce")
+_REPLACE_KEYWORDS = ("change", "replace", "update", "fix", "modify", "remove", "rename")
 
 
 def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     """
-    If this step is clearly a file-write operation, return (tool_name, path).
+    If this step is clearly a file write/edit operation, return (tool_name, path).
     Otherwise return (None, None).
 
     Detects patterns like:
       - "Write index.html with ..."
       - "Create codi.html using create_file ..."
       - "Use write_file to save styles.css ..."
+      - "Edit index.html to add a hero image"     -> edit_file (if file exists)
+      - "Add a hero image to index.html"          -> edit_file (if file exists)
+
+    Edit-intent language on a file that already exists on disk always takes
+    priority over create/write detection. This is what stops "add a hero
+    image" from being routed to a full-file write/rewrite.
     """
     step_lower = step.lower()
 
-    # Must mention a write/create/incremental-edit action. "add"/"append"/
-    # "insert"/"update"/"edit" are included because planner steps commonly
-    # read "Add hero section...in index.html" — without these, such steps
-    # never reached content-first at all, fell through to the JSON tool-call
-    # path, and a coder noop for them was silently accepted as "done" (see
-    # _should_reject_noop below), so the described content was never written.
-    write_keywords = (
-        "write", "create", "save", "generate", "produce", "output",
-        "add", "append", "insert", "update", "edit",
-    )
-    if not any(kw in step_lower for kw in write_keywords):
-        return None, None
-
-    # Extract file path — look for common source, config, and document extensions
-    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|c|cpp|h|hpp|go|rs|rb|php|graphql|svg))"
+    # Extract file path — look for known extensions
+    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))"
     match = re.search(ext_pattern, step)
     if not match:
         return None, None
 
     path = match.group(1).strip("'\"` ")
-    ext  = os.path.splitext(path)[1].lower()
+
+    # ── Edit intent + file already exists on disk → force edit_file ──────────
+    if any(kw in step_lower for kw in _EDIT_KEYWORDS):
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        abs_path = path if os.path.isabs(path) else os.path.join(working_dir, path)
+        if os.path.exists(abs_path):
+            return "edit_file", path
+
+    # ── Fall back to create/write detection ───────────────────────────────────
+    write_keywords = ("write", "create", "save", "generate", "produce", "output")
+    if not any(kw in step_lower for kw in write_keywords):
+        return None, None
 
     # Determine which write tool to use
     tool = "create_file" if "create" in step_lower else "write_file"
@@ -206,34 +228,71 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     return tool, path
 
 
-def _should_use_content_first(step: str, path: str) -> bool:
-    """Use content-first for any clear file-write step to avoid JSON repair loops."""
-    tool, detected_path = _detect_file_write_step(step)
-    if not tool or not detected_path:
-        return False
-    if path and detected_path != path:
-        return False
-    return True
-
-
-def _cli_status(message: str) -> None:
-    """Show high-level progress in the CLI without exposing hidden reasoning."""
-    emit_status("executor", message)
-
-
-def _has_completion_sentinel(text: str) -> bool:
-    return _CONTENT_COMPLETE_SENTINEL in (text or "")
-
-
-def _extract_markdown_file_content(text: str) -> tuple[str, bool]:
+def _is_additive_edit(step: str) -> bool:
     """
-    Extract generated file content from the markdown content protocol.
-    Returns (content_without_sentinel, complete).
+    True if the step is asking to ADD new capability rather than modify
+    existing text. Additive steps have no reliable 'old' anchor to replace —
+    forcing old/new replace semantics on them causes the model to invent
+    text that was never in the file, producing repeated "text not found"
+    failures (e.g. "add dark/light mode toggle" — there's no existing code
+    to anchor a replace on).
+
+    A replace-specific verb co-occurring with an additive verb wins, since
+    that usually means an existing thing is being swapped out
+    (e.g. "change the add-to-cart button color" is a replace, not additive).
     """
-    raw = text or ""
-    complete = _has_completion_sentinel(raw)
-    before_sentinel = raw.split(_CONTENT_COMPLETE_SENTINEL, 1)[0] if complete else raw
-    return _strip_fences(before_sentinel), complete
+    step_lower = step.lower()
+    has_additive = any(kw in step_lower for kw in _ADDITIVE_KEYWORDS)
+    has_replace = any(kw in step_lower for kw in _REPLACE_KEYWORDS)
+    return has_additive and not has_replace
+
+
+def _is_large_content_step(step: str, path: str, tool: str | None = None) -> bool:
+    """
+    True if the step is likely to require more content than a 7B model
+    can safely JSON-serialize without truncating.
+
+    IMPORTANT: edit_file must NEVER go through content-first mode. Content-
+    first only knows how to dump a full replacement file — routing an edit
+    through it is exactly how "add a hero image" turned into a full
+    index.html rewrite. So if the detected tool is edit_file, this always
+    returns False regardless of the other heuristics below. (In practice
+    edit_file steps are now routed to _execute_edit_first before this
+    function is ever consulted — this guard stays as defense in depth.)
+
+    Heuristics (write_file/create_file only):
+      1. All HTML files — always large (even "simple.html" needs boilerplate)
+      2. CSS/JS/TS with design keywords
+      3. CSS/JS/TS step contains "with" — means caller described content
+      4. Step is longer than 60 chars — enough description = enough content
+    """
+    if tool == "edit_file":
+        return False
+
+    ext = os.path.splitext(path)[1].lower()
+    step_lower = step.lower()
+
+    if ext not in _LARGE_CONTENT_EXTS:
+        return False
+
+    # Always use content-first for HTML — it's almost always large
+    if ext == ".html":
+        return True
+
+    # For CSS/JS/TS: trigger on design keywords
+    if any(trigger in step_lower for trigger in _LARGE_CONTENT_TRIGGERS):
+        return True
+
+    # "with" in the step means the caller described what goes in the file
+    # e.g. "write styles.css with dark theme" — content will be substantial
+    if " with " in step_lower:
+        return True
+
+    # Long step description = complex requirements = large output
+    if len(step) > 60:
+        return True
+
+    return False
 
 
 class Executor:
@@ -248,96 +307,60 @@ class Executor:
             tool_names=self.registry.list_names(),
         ))
 
-    def _repair_action_bundle(self, step: str, raw: str, state: RunState, reason: str) -> dict | None:
-        """Send the broken output back to the LLM with a tighter repair prompt."""
+    def _repair_action_bundle(self, step: str, raw: str, state: RunState) -> dict | None:
+        """Second attempt: send the broken output back to the LLM with a tighter repair prompt."""
         prompt = _REPAIR_PROMPT.format(
             step=step,
             tools=self.registry.summary(),
             raw=raw[:2000],
         )
         try:
-            start_time = time.time()
-            resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
-            end_time = time.time()
+            resp     = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
             repaired = resp.content.strip()
-            _log_llm_metrics("executor_repair_llm", prompt, resp, start_time, end_time)
         except Exception as e:
             log("executor_repair_error", {"step": step[:100], "error": str(e)})
             return None
 
         state.record_llm("coder_repair", repaired)
         log("executor_repair_raw", {"step": step[:80], "raw": repaired[:300]})
-        log("repair_reason", {"reason": reason, "step": step[:120]})
-        log("repair_attempt", {"step": step[:120], "attempt": True})
         return Dispatcher.parse_llm_json(repaired)
 
-    # ── Content-first strategy ────────────────────────────────────────────────
+    # ── Content-first strategy (write_file / create_file only) ────────────────
 
     def _execute_content_first(
         self, step: str, tool: str, path: str, state: RunState
     ) -> dict:
         """
-        Bypass LLM JSON entirely for file writes.
+        Bypass JSON entirely for large file writes.
 
         Strategy:
-          1. Ask the coder LLM to output markdown-wrapped file content.
-          2. Require an explicit completion sentinel after the content.
-          3. If the sentinel is missing, ask only for the remaining content.
-          4. Send the final content through a direct dispatcher write path.
+          1. Ask the coder LLM to output ONLY the raw file content.
+          2. Take that raw output and call write_file/create_file directly.
 
         This means the LLM's full output window goes to content quality,
-        not to JSON escaping.
+        not to JSON escaping. No truncation. No parse failures.
+
+        NOTE: This path must only ever be entered with tool in
+        {"write_file", "create_file"}. _is_large_content_step guarantees this
+        by always returning False when tool == "edit_file", and edit_file
+        steps are routed to _execute_edit_first before this is ever reached.
         """
-        if state.already_handled_step(path, step):
-            message = f"skip_duplicate_write:{path}"
-            log("executor_duplicate_write", {"path": path, "step": step[:80]})
-            state.add_tool_result("dispatcher", "ok", message)
-            return {"status": "success", "results": [{"tool": "dispatcher", "status": "ok", "output": message}]}
-
         log("executor_content_first", {"tool": tool, "path": path, "step": step[:80]})
-        _cli_status(f"Generating file content for {path} using markdown protocol.")
-
-        # If a PRIOR, different step already wrote this file, read its
-        # current on-disk content so the model can merge its addition into
-        # the whole file rather than clobbering earlier sections. write_file
-        # always overwrites the entire file, so skipping this would silently
-        # discard whatever an earlier step already produced.
-        existing_content = "(file does not exist yet — this is a new file)"
-        if state.already_written(path):
-            working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
-            resolved_path = path if os.path.isabs(path) else os.path.join(working_dir, path)
-            try:
-                with open(resolved_path, "r", encoding="utf-8", errors="replace") as f:
-                    existing_content = f.read()
-                if not existing_content.strip():
-                    existing_content = "(file exists but is currently empty)"
-            except Exception as e:
-                log("executor_content_first_read_existing_error", {"path": path, "error": str(e)})
-                existing_content = "(file exists but could not be read — proceed carefully, avoid clobbering it)"
 
         context_str = trim_tool_output(
             "\n".join(state.recent_tool_outputs(4)) or "(none yet)",
             max_tokens=800,
         )
-        project_manifest = state.project_manifest or {"package": None, "files_created": {}}
-        package_hint = f"MUST use this exact package declaration: {project_manifest.get('package')}" if project_manifest.get('package') else "(no package lock)"
-        manifest_text = f"package: {project_manifest.get('package') or 'none'}\nfiles_created: {json.dumps(project_manifest.get('files_created', {}), ensure_ascii=True)}\npackage_instruction: {package_hint}"
         prompt = _CONTENT_PROMPT.format(
             path=path,
             step=step,
             requirements=state.requirements.as_prompt_block(),
-            project_manifest=manifest_text,
-            existing_content=wrap_prompt_data(trim_tool_output(existing_content, max_tokens=1500), path=path),
             context=wrap_prompt_data(context_str, path=path),
-            sentinel=_CONTENT_COMPLETE_SENTINEL,
         )
 
         try:
-            start_time = time.time()
-            resp = self.llm.invoke([HumanMessage(content=prompt)])
-            end_time = time.time()
-            raw_content = resp.content.strip()
-            _log_llm_metrics("executor_content_first_llm", prompt, resp, start_time, end_time)
+            resp    = self.llm.invoke([HumanMessage(content=prompt)])
+            content = resp.content.strip()
         except Exception as e:
             error = f"Coder LLM error (content-first): {e}"
             log("executor_content_first_error", {"error": str(e)})
@@ -348,71 +371,11 @@ class Executor:
                 "error":   error,
             }
 
-        state.record_llm("coder_content_first", raw_content[:200])
-        log("executor_content_first_raw", {"path": path, "content_len": len(raw_content)})
+        state.record_llm("coder_content_first", content[:200])
+        log("executor_content_first_raw", {"path": path, "content_len": len(content)})
 
-        complete = _has_completion_sentinel(raw_content)
-        continuation_attempts = 0
-        while not complete and continuation_attempts < _MAX_CONTENT_CONTINUATIONS:
-            continuation_attempts += 1
-            _cli_status(
-                f"Generation for {path} is missing the completion marker; requesting continuation "
-                f"{continuation_attempts}/{_MAX_CONTENT_CONTINUATIONS}."
-            )
-            log("executor_content_continuation", {
-                "path": path,
-                "attempt": continuation_attempts,
-                "current_len": len(raw_content),
-            })
-            continuation_prompt = _CONTENT_CONTINUATION_PROMPT.format(
-                path=path,
-                step=step,
-                sentinel=_CONTENT_COMPLETE_SENTINEL,
-                tail=wrap_prompt_data(raw_content[-2000:], path=path),
-            )
-            try:
-                start_time = time.time()
-                resp = self.llm.invoke([HumanMessage(content=continuation_prompt)])
-                end_time = time.time()
-                continuation = resp.content.strip()
-                _log_llm_metrics(
-                    "executor_content_continuation_llm",
-                    continuation_prompt,
-                    resp,
-                    start_time,
-                    end_time,
-                )
-            except Exception as e:
-                error = f"Coder LLM error during content continuation: {e}"
-                log("executor_content_continuation_error", {"error": str(e), "path": path})
-                state.add_tool_result(tool, "error", error)
-                return {
-                    "status": "error",
-                    "results": [{"tool": tool, "status": "error", "output": error}],
-                    "error": error,
-                }
-
-            state.record_llm("coder_content_continuation", continuation[:200])
-            raw_content += continuation
-            complete = _has_completion_sentinel(raw_content)
-
-        content, complete = _extract_markdown_file_content(raw_content)
-        if not complete:
-            error = (
-                f"{_CONTENT_COMPLETE_SENTINEL} missing after {continuation_attempts} continuation attempts; "
-                "generated content may be truncated. Ask the coder to regenerate only the remaining portion."
-            )
-            log("executor_content_incomplete", {
-                "path": path,
-                "attempts": continuation_attempts,
-                "content_len": len(content),
-            })
-            state.add_tool_result(tool, "error", error)
-            return {
-                "status": "error",
-                "results": [{"tool": tool, "status": "error", "output": error}],
-                "error": error,
-            }
+        # Strip any accidental markdown fences the model adds anyway
+        content = _strip_fences(content)
 
         if not content:
             error = "Coder returned empty content for file write."
@@ -424,8 +387,10 @@ class Executor:
                 "error":   error,
             }
 
-        _cli_status(f"Completion marker found for {path}; writing {len(content)} characters.")
-        action_bundle = {"tools": [{"name": tool, "args": {"path": path, "content": content}}]}
+        action_bundle = {
+            "action": "tool_call",
+            "tools":  [{"name": tool, "args": {"path": path, "content": content}}],
+        }
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -442,27 +407,14 @@ class Executor:
             }
 
         # Dispatch directly — no LLM JSON round-trip
-        dispatch_result = self.dispatcher.dispatch_file_write(
-            tool,
-            path,
-            content,
-            {
-                "code_generation_complete": True,
-                "completion_sentinel": _CONTENT_COMPLETE_SENTINEL,
-                "continuation_attempts": continuation_attempts,
-            },
-        )
-        state.mark_written(path)
-        state.mark_step_handled(path, step)
-        if isinstance(state.project_manifest, dict):
-            state.project_manifest.setdefault("files_created", {})[path] = content.splitlines()[0][:100] if content.splitlines() else "generated file"
+        dispatch_result = self.dispatcher.dispatch(action_bundle)
         if dispatch_result.get("signal") in ("noop", "done"):
             signal = dispatch_result.get("signal", "noop")
             state.add_tool_result("dispatcher", "ok", signal)
             log("executor_dispatch_signal", {
                 "signal": signal,
                 "step": step[:160],
-                "action": "direct_file_write",
+                "action": action_bundle.get("action"),
             })
 
         # Store results
@@ -471,89 +423,217 @@ class Executor:
 
         return dispatch_result
 
-    def _validate_atomic_contract(self, step: str, action_bundle: dict, raw: str, state: RunState) -> tuple[bool, str | None, list[dict]]:
-        """Validate that the LLM returned exactly one atomic tool action affecting one file."""
-        if not isinstance(action_bundle, dict):
-            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "invalid_bundle"})
-            return False, "Response was not a valid action bundle.", []
+    # ── Edit-first strategy (edit_file — replace and additive) ─────────────────
 
-        action = action_bundle.get("action")
-        if action in ("noop", "done", "control"):
-            log("executor_contract_check", {"step": step[:120], "passed": True, "reason": "noop_signal"})
-            return True, None, []
-
-        tools = action_bundle.get("tools", [])
-        if not isinstance(tools, list):
-            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "tools_not_list"})
-            return False, "Response did not contain a valid tools list.", []
-
-        tool_count = len(tools)
-        log("executor_contract_check", {"step": step[:120], "passed": tool_count == 1, "tool_count": tool_count, "reason": "tool_count_check"})
-        if tool_count != 1:
-            return False, f"Expected exactly one tool call but received {tool_count}.", tools
-
-        tool = tools[0]
-        if not isinstance(tool, dict):
-            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "tool_not_object"})
-            return False, "Tool entry was malformed.", tools
-
-        name = tool.get("name")
-        args = tool.get("args") or {}
-        if not isinstance(name, str) or not name:
-            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "missing_tool_name"})
-            return False, "Tool name was missing.", tools
-
-        if not isinstance(args, dict):
-            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "args_not_object"})
-            return False, "Tool arguments were malformed.", tools
-
-        if name in _WRITE_TOOLS:
-            path = args.get("path")
-            if not path:
-                log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "missing_path"})
-                return False, "The tool call did not include a file path.", tools
-
-        if action not in ("tool_call", "parallel") and action != "noop":
-            log("executor_contract_check", {"step": step[:120], "passed": False, "reason": "unsupported_action"})
-            return False, f"Unsupported action: {action}", tools
-
-        return True, None, tools
-
-    def _split_child_steps(self, step: str) -> list[str]:
-        """Split a broad planner step into child steps, but ONLY when every
-        resulting fragment independently names its own file write (i.e. each
-        fragment passes _detect_file_write_step on its own). If splitting
-        would produce any fragment that doesn't clearly target a file, treat
-        the step as atomic and return it unmodified — better one big
-        content-first write than several nonsensical noop-rejected fragments.
+    def _execute_edit_first(self, step: str, path: str, state: RunState) -> dict:
         """
-        lowered = step.lower()
-        if not any(keyword in lowered for keyword in ("implement", "create", "build", "add", "write")):
-            return [step]
+        Dedicated flow for edit_file. Reads the real file content deterministically
+        (never trusts the LLM to have it right from stale/trimmed tool_results).
 
-        if " and " not in lowered and "," not in lowered:
-            return [step]
+        Branches by intent:
+          - Additive steps ("add", "insert", "implement", "introduce" without a
+            replace verb) go straight to _execute_additive_append — there is no
+            reliable "old" anchor for genuinely new code, so replace semantics
+            just cause the model to invent text that was never in the file.
+          - Replace steps go through _EDIT_PROMPT with the real file content
+            injected, so the model can copy "old" verbatim. One automatic
+            repair retry if the first old/new pair doesn't match. If that
+            repair ALSO fails with "text not found", falls back to additive
+            append rather than exhausting all iterations on a dead end.
+        """
+        read_handler = self.registry.get("read_file")
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        abs_path = path if os.path.isabs(path) else os.path.join(working_dir, path)
 
-        base = step.strip()
-        parts = [p.strip() for p in re.split(r"\s*(?:,|and)\s*", base) if p.strip()]
-        if len(parts) <= 1:
-            return [step]
+        try:
+            file_content = read_handler({"path": path}) if read_handler else ""
+        except Exception as e:
+            file_content = ""
+            log("executor_edit_first_read_error", {"path": path, "error": str(e)})
 
-        candidate_children = [f"Create {part}" for part in parts]
+        if not file_content or file_content.startswith("ERROR"):
+            error = f"edit_file requested but could not read current content of {path}: {file_content}"
+            log("executor_edit_first_no_content", {"path": path})
+            state.add_tool_result("edit_file", "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": error}],
+                "error": error,
+            }
 
-        # Only accept the split if EVERY child independently names a file.
-        # Otherwise a fragment like "a call-to-action button" gets prefixed
-        # with "Create" and misrouted as a bogus file-write step.
-        for child in candidate_children:
-            tool, path = _detect_file_write_step(child)
-            if not tool or not path:
-                log("child_step_split_rejected", {
-                    "parent_step": step[:160],
-                    "rejected_fragment": child[:120],
-                })
-                return [step]
+        # ── Additive tasks skip replace semantics entirely ─────────────────────
+        if _is_additive_edit(step):
+            log("executor_edit_additive_route", {"path": path, "step": step[:120]})
+            return self._execute_additive_append(step, path, file_content, state)
 
-        return candidate_children
+        prompt = _EDIT_PROMPT.format(
+            path=path,
+            file_content=wrap_prompt_data(file_content, path=path),
+            step=step,
+            requirements=state.requirements.as_prompt_block(),
+        )
+
+        result = self._run_edit_attempt(prompt, path, state, label="coder_edit_first")
+
+        # ── One repair retry if the old/new pair didn't match the real file ────
+        if self._edit_failed_text_not_found(result):
+            failed_args = self._last_edit_args(result)
+            failed_old = (failed_args or {}).get("old", "")[:300]
+
+            repair_prompt = _EDIT_REPAIR_PROMPT.format(
+                path=path,
+                file_content=wrap_prompt_data(file_content, path=path),
+                failed_old=failed_old,
+                step=step,
+            )
+            log("executor_edit_repair", {"path": path, "failed_old": failed_old[:120]})
+            result = self._run_edit_attempt(repair_prompt, path, state, label="coder_edit_repair")
+
+        # ── Last resort: replace failed twice → fall back to guaranteed-anchor
+        # append instead of burning the rest of the iteration budget on a
+        # replace strategy that has already failed twice. append cannot
+        # produce "text not found" since it has no search step at all.
+        if self._edit_failed_text_not_found(result):
+            log("executor_edit_fallback_append", {"path": path, "step": step[:120]})
+            return self._execute_additive_append(step, path, file_content, state)
+
+        return result
+
+    def _execute_additive_append(
+        self, step: str, path: str, file_content: str, state: RunState
+    ) -> dict:
+        """
+        For additive edits: ask the model for ONLY the new code to add
+        (no old/new pair needed), then append it via edit_file's append
+        arg. The anchor problem disappears entirely because append doesn't
+        search for anything — it can never produce 'text not found'.
+        """
+        prompt = _ADDITIVE_APPEND_PROMPT.format(
+            path=path,
+            file_content=wrap_prompt_data(file_content, path=path),
+            step=step,
+            requirements=state.requirements.as_prompt_block(),
+        )
+
+        try:
+            resp = self.llm.invoke([HumanMessage(content=prompt)])
+            new_code = _strip_fences(resp.content.strip())
+        except Exception as e:
+            error = f"Coder LLM error (additive append): {e}"
+            log("executor_additive_append_error", {"error": str(e)})
+            state.add_tool_result("edit_file", "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": error}],
+                "error": error,
+            }
+
+        state.record_llm("coder_additive_append", new_code[:200])
+        log("executor_additive_append_raw", {"path": path, "content_len": len(new_code)})
+
+        if not new_code:
+            error = "Coder returned empty content for additive append."
+            log("executor_additive_append_empty", {"path": path})
+            state.add_tool_result("edit_file", "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": error}],
+                "error": error,
+            }
+
+        action_bundle = {
+            "action": "tool_call",
+            "tools": [{"name": "edit_file", "args": {"path": path, "append": new_code}}],
+        }
+
+        violation = self._framework_violation(state, action_bundle)
+        if violation:
+            log("executor_framework_violation", {
+                "tool": "edit_file",
+                "path": path,
+                "reason": violation,
+            })
+            state.add_tool_result("edit_file", "error", violation)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": violation}],
+                "error": violation,
+            }
+
+        dispatch_result = self.dispatcher.dispatch(action_bundle)
+        if dispatch_result.get("signal") in ("noop", "done"):
+            signal = dispatch_result.get("signal", "noop")
+            state.add_tool_result("dispatcher", "ok", signal)
+            log("executor_dispatch_signal", {
+                "signal": signal,
+                "step": step[:160],
+                "action": action_bundle.get("action"),
+            })
+
+        for r in dispatch_result.get("results", []):
+            state.add_tool_result(r["tool"], r["status"], r["output"])
+
+        return dispatch_result
+
+    def _run_edit_attempt(self, prompt: str, path: str, state: RunState, label: str) -> dict:
+        """Single LLM call + dispatch attempt for a replace-style edit_file action.
+        Shared by the initial edit-first call and the one-shot repair retry."""
+        try:
+            resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
+            raw = resp.content.strip()
+        except Exception as e:
+            error = f"Coder LLM error (edit-first): {e}"
+            log("executor_edit_first_llm_error", {"error": str(e)})
+            state.add_tool_result("edit_file", "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": error}],
+                "error": error,
+            }
+
+        state.record_llm(label, raw)
+
+        action_bundle = Dispatcher.parse_llm_json(raw)
+        if action_bundle is None:
+            action_bundle = self._repair_action_bundle(f"edit {path}", raw, state)
+
+        if action_bundle is None:
+            error = f"Coder edit-first output was not valid JSON: {raw[:200]}"
+            state.add_tool_result("edit_file", "error", error)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": error}],
+                "error": error,
+            }
+
+        violation = self._framework_violation(state, action_bundle)
+        if violation:
+            state.add_tool_result("edit_file", "error", violation)
+            return {
+                "status": "error",
+                "results": [{"tool": "edit_file", "status": "error", "output": violation}],
+                "error": violation,
+            }
+
+        dispatch_result = self.dispatcher.dispatch(action_bundle)
+        for r in dispatch_result.get("results", []):
+            state.add_tool_result(r["tool"], r["status"], r["output"])
+
+        return dispatch_result
+
+    @staticmethod
+    def _edit_failed_text_not_found(result: dict) -> bool:
+        for r in result.get("results", []):
+            if r.get("status") == "error" and "text not found" in (r.get("output") or ""):
+                return True
+        return False
+
+    @staticmethod
+    def _last_edit_args(result: dict) -> dict | None:
+        for r in result.get("results", []):
+            if r.get("tool") == "edit_file":
+                return r.get("args") or {}
+        return None
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -562,63 +642,34 @@ class Executor:
         Translate a step description into a tool call and execute it.
         Returns the dispatcher result dict.
 
-        For steps that involve writing large files (HTML, CSS, JS with design
-        requirements), uses the content-first strategy to avoid JSON truncation.
+        Routing order:
+          1. edit_file steps (existing file + edit-intent language) always go
+             through the edit-first flow. Within that flow, additive steps
+             (add/insert/implement/introduce, no replace verb) skip replace
+             semantics entirely and go straight to append; replace steps get
+             the real file content injected so the model can copy "old"
+             verbatim, with one repair retry and an append fallback if
+             replace still can't find a match.
+          2. write_file/create_file steps with large expected output
+             (HTML, styled CSS/JS, etc.) go through content-first — no JSON
+             wrapper, full output budget goes to file content.
+          3. Everything else goes through the standard JSON tool-call path.
         """
         from context_trimmer import trim_tool_output
-        _cli_status(f"Executing step: {step[:120]}")
 
-        child_steps = self._split_child_steps(step)
-        if len(child_steps) > 1:
-            log("child_step_created", {"parent_step": step[:160], "children": child_steps})
-            child_results = [self.execute_step(child_step, state) for child_step in child_steps]
-
-            # Aggregate honestly: only report success if every child's
-            # dispatch actually succeeded. Previously this branch discarded
-            # each child's return value and unconditionally reported
-            # "success", regardless of how many children failed.
-            def _child_ok(result: dict) -> bool:
-                if not isinstance(result, dict):
-                    return False
-                status = result.get("status")
-                if status == "error":
-                    return False
-                results = result.get("results", [])
-                return not any(r.get("status") == "error" for r in results if isinstance(r, dict))
-
-            all_ok = all(_child_ok(r) for r in child_results)
-            aggregated_results = []
-            for r in child_results:
-                if isinstance(r, dict):
-                    aggregated_results.extend(r.get("results", []))
-
-            # Record an explicit aggregate result as the LAST tool_result for
-            # this step. agent.py's _step_succeeded() only inspects
-            # state.tool_results[-1] — without this, that check would reflect
-            # whichever child happened to run last, not the true combined
-            # outcome of the split step.
-            if all_ok:
-                state.add_tool_result(
-                    "dispatcher", "ok",
-                    f"child_steps_complete:{len(child_steps)}/{len(child_steps)}"
-                )
-            else:
-                failed_count = sum(1 for r in child_results if not _child_ok(r))
-                state.add_tool_result(
-                    "dispatcher", "error",
-                    f"child_steps_failed:{failed_count}/{len(child_steps)}"
-                )
-
-            return {
-                "status": "success" if all_ok else "error",
-                "results": aggregated_results,
-                "child_steps": child_steps,
-                "child_results": child_results,
-            }
-
-        # ── Content-first routing ─────────────────────────────────────────────
+        # ── Edit-first routing — always for detected edit_file steps ──────────
         tool, path = _detect_file_write_step(step)
-        if tool and path and _should_use_content_first(step, path):
+        if tool == "edit_file" and path:
+            log("tool_routing", {
+                "strategy": "edit_first",
+                "tool": tool,
+                "path": path[:80],
+                "additive": _is_additive_edit(step),
+            })
+            return self._execute_edit_first(step, path, state)
+
+        # ── Content-first routing (write_file/create_file only) ───────────────
+        if tool and path and _is_large_content_step(step, path, tool):
             log("tool_routing", {
                 "strategy": "content_first",
                 "tool": tool,
@@ -628,213 +679,138 @@ class Executor:
             return self._execute_content_first(step, tool, path, state)
 
         # ── Standard JSON path ────────────────────────────────────────────────
-        # Reset per-step repair attempts counter at the start of each step
-        try:
-            state.repair_attempts[step] = 0
-        except Exception:
-            state.repair_attempts = {step: 0}
-
         prompt = _STEP_PROMPT.format(
             step=step,
             requirements=state.requirements.as_prompt_block(),
             tools=self.registry.summary(),
             context=wrap_prompt_data(
-                trim_tool_output(state.context_snapshot(max_recent=3), max_tokens=900)
-                or "(none yet)"
+                "\n".join(
+                    trim_tool_output(o, max_tokens=120)
+                    for o in state.recent_tool_outputs(8)
+                ) or "(none yet)"
             ),
         )
 
         # ── Ask Coder LLM ─────────────────────────────────────────────────────
-        for attempt in range(2):
-            try:
-                _cli_status("Asking coder to choose the next tool action.")
-                start_time = time.time()
-                resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
-                end_time = time.time()
-                raw = resp.content.strip()
-                _log_llm_metrics("executor_llm_call", prompt, resp, start_time, end_time)
-            except Exception as e:
-                error = f"Coder LLM error: {e}"
-                log("executor_llm_error", {"step": step[:100], "error": str(e)})
-                state.add_tool_result("coder", "error", error)
-                return {
-                    "status":  "error",
-                    "results": [{"tool": "coder", "status": "error", "output": error}],
-                    "error":   error,
-                }
+        try:
+            resp = self.llm.invoke([self._sys(), HumanMessage(content=prompt)])
+            raw  = resp.content.strip()
+        except Exception as e:
+            error = f"Coder LLM error: {e}"
+            log("executor_llm_error", {"step": step[:100], "error": str(e)})
+            state.add_tool_result("coder", "error", error)
+            return {
+                "status":  "error",
+                "results": [{"tool": "coder", "status": "error", "output": error}],
+                "error":   error,
+            }
 
-            state.record_llm("coder", raw)
+        state.record_llm("coder", raw)
 
-            # ── Parse ─────────────────────────────────────────────────────────
-            action_bundle = Dispatcher.parse_llm_json(raw)
-            repair_needed = False
+        # ── Parse ─────────────────────────────────────────────────────────────
+        action_bundle = Dispatcher.parse_llm_json(raw)
+        repair_needed = False
 
-            # If parse failed, try once more with the repair prompt (but cap attempts)
-            if action_bundle is None:
-                attempts = state.repair_attempts.get(step, 0)
-                if attempts >= 1:
-                    # Repair exhausted for this step — fall back or fail
-                    log("repair_exhausted", {"step": step[:120], "attempts": attempts})
-                    tool_fb, path_fb = _detect_file_write_step(step)
-                    if tool_fb and path_fb:
-                        # fallback to content-first for file writes
-                        log("tool_routing", {
-                            "strategy": "repair_exhausted_content_first",
-                            "tool": tool_fb,
-                            "path": path_fb[:80],
-                        })
-                        return self._execute_content_first(step, tool_fb, path_fb, state)
-                    error = f"Coder output was not valid JSON and repair attempts exhausted: {raw[:200]}"
-                    state.add_tool_result("coder", "error", error)
-                    return {
-                        "status":  "error",
-                        "results": [{"tool": "coder", "status": "error", "output": error}],
-                        "error":   error,
-                    }
+        # If parse failed, try once more with the repair prompt
+        if action_bundle is None:
+            action_bundle = self._repair_action_bundle(step, raw, state)
+            repair_needed = True
 
-                # Perform one repair attempt
-                state.repair_attempts[step] = attempts + 1
-                log("repair_attempt_counter", {"step": step[:120], "attempt": state.repair_attempts[step]})
-                action_bundle = self._repair_action_bundle(step, raw, state, "malformed_json")
-                repair_needed = True
-
-            # If STILL None and this looks like a truncated file-write, switch
-            # to content-first as a last resort (catches cases where the LLM
-            # produced partial JSON with a file path but no closing string)
-            if action_bundle is None:
-                tool_fb, path_fb = _detect_file_write_step(step)
-                if tool_fb and path_fb:
-                    log("tool_routing", {
-                        "strategy": "json_fallback_content_first",
-                        "tool": tool_fb,
-                        "path": path_fb[:80],
-                        "repair": repair_needed,
-                    })
-                    return self._execute_content_first(step, tool_fb, path_fb, state)
-
-            if action_bundle is None:
-                error = f"Coder output was not valid JSON: {raw[:200]}"
+        # If STILL None and this looks like a truncated file-write, switch
+        # to content-first as a last resort — but ONLY for write/create,
+        # never for edit_file (an edit step must never silently become a
+        # full-file rewrite just because JSON parsing failed twice).
+        if action_bundle is None:
+            tool_fb, path_fb = _detect_file_write_step(step)
+            if tool_fb in _WRITE_TOOLS and path_fb:
                 log("tool_routing", {
-                    "strategy": "json",
-                    "status": "parse_fail",
+                    "strategy": "json_fallback_content_first",
+                    "tool": tool_fb,
+                    "path": path_fb[:80],
                     "repair": repair_needed,
                 })
-                state.add_tool_result("coder", "error", error)
-                return {
-                    "status":  "error",
-                    "results": [{"tool": "coder", "status": "error", "output": error}],
-                    "error":   error,
-                }
+                return self._execute_content_first(step, tool_fb, path_fb, state)
 
-            # Extract which tools will be called
-            tools_to_call = []
-            if isinstance(action_bundle, dict) and "tools" in action_bundle:
-                tools_to_call = [t.get("name", "unknown") for t in action_bundle.get("tools", [])]
-
-            log("tool_count", {"step": step[:160], "count": len(tools_to_call), "repair": repair_needed})
+        if action_bundle is None:
+            error = f"Coder output was not valid JSON: {raw[:200]}"
             log("tool_routing", {
                 "strategy": "json",
-                "tools": tools_to_call,
+                "status": "parse_fail",
                 "repair": repair_needed,
+            })
+            state.add_tool_result("coder", "error", error)
+            return {
+                "status":  "error",
+                "results": [{"tool": "coder", "status": "error", "output": error}],
+                "error":   error,
+            }
+
+        # Extract which tools will be called
+        tools_to_call = []
+        if isinstance(action_bundle, dict) and "tools" in action_bundle:
+            tools_to_call = [t.get("name", "unknown") for t in action_bundle.get("tools", [])]
+
+        log("tool_routing", {
+            "strategy": "json",
+            "tools": tools_to_call,
+            "repair": repair_needed,
+            "action": action_bundle.get("action"),
+        })
+
+        action = action_bundle.get("action")
+        if action in ("tool_call", "parallel") and not tools_to_call:
+            error = "Executor produced a tool_call action with no tools; no requested work could run."
+            log("tool_routing", {
+                "strategy": "json",
+                "status": "empty_tool_list",
+                "step": step[:160],
+                "repair": repair_needed,
+                "action_bundle": str(action_bundle)[:500],
+            })
+            state.add_tool_result("dispatcher", "error", error)
+            return {
+                "status":  "error",
+                "results": [{"tool": "dispatcher", "status": "error", "output": error}],
+                "error":   error,
+            }
+
+        violation = self._framework_violation(state, action_bundle)
+        if violation:
+            log("executor_framework_violation", {
+                "step": step[:80],
+                "reason": violation,
+            })
+            state.add_tool_result("coder", "error", violation)
+            return {
+                "status": "error",
+                "results": [{"tool": "coder", "status": "error", "output": violation}],
+                "error": violation,
+            }
+
+        # ── Dispatch ──────────────────────────────────────────────────────────
+        dispatch_result = self.dispatcher.dispatch(action_bundle)
+
+        # ── Store results in state ────────────────────────────────────────────
+        if dispatch_result.get("signal") in ("noop", "done"):
+            signal = dispatch_result.get("signal", "noop")
+            state.add_tool_result("dispatcher", "ok", signal)
+            log("executor_dispatch_signal", {
+                "signal": signal,
+                "step": step[:160],
                 "action": action_bundle.get("action"),
             })
 
-            contract_ok, contract_error, _ = self._validate_atomic_contract(step, action_bundle, raw, state)
-            if not contract_ok:
-                error = f"Executor rejected non-atomic response: {contract_error}"
-                log("executor_contract_check", {"step": step[:160], "passed": False, "reason": contract_error})
-                state.add_tool_result("dispatcher", "error", error)
-                return {
-                    "status": "error",
-                    "results": [{"tool": "dispatcher", "status": "error", "output": error}],
-                    "error": error,
-                }
+        results = dispatch_result.get("results", [])
+        if not results and dispatch_result.get("status") == "error":
+            state.add_tool_result(
+                "dispatcher", "error",
+                dispatch_result.get("error", "Dispatcher returned no results.")
+            )
 
-            action = action_bundle.get("action")
-            if action in ("tool_call", "parallel") and not tools_to_call:
-                error = "Executor produced a tool_call action with no tools; no requested work could run."
-                log("tool_routing", {
-                    "strategy": "json",
-                    "status": "empty_tool_list",
-                    "step": step[:160],
-                    "repair": repair_needed,
-                    "action_bundle": str(action_bundle)[:500],
-                })
-                state.add_tool_result("dispatcher", "error", error)
-                return {
-                    "status":  "error",
-                    "results": [{"tool": "dispatcher", "status": "error", "output": error}],
-                    "error":   error,
-                }
+        for r in results:
+            state.add_tool_result(r["tool"], r["status"], r["output"])
 
-            if action == "noop" and self._should_reject_noop(step, state):
-                attempt_num = state.step_attempts.get(step, 0) + 1
-                state.step_attempts[step] = attempt_num
-                if attempt_num >= 2:
-                    error = f"Executor rejected noop for implementation step after {attempt_num} attempts: {step}"
-                    log("executor_invalid_noop", {"step": step[:160], "attempt": attempt_num})
-                    state.add_tool_result("dispatcher", "error", error)
-                    return {"status": "error", "results": [{"tool": "dispatcher", "status": "error", "output": error}], "error": error}
-                error = "Executor rejected noop for implementation step; the coder must produce a tool_call for this step."
-                log("executor_invalid_noop", {"step": step[:160], "attempt": attempt_num})
-                state.add_tool_result("dispatcher", "error", error)
-                continue
-
-            violation = self._framework_violation(state, action_bundle)
-            if violation:
-                log("executor_framework_violation", {
-                    "step": step[:80],
-                    "reason": violation,
-                })
-                state.add_tool_result("coder", "error", violation)
-                return {
-                    "status": "error",
-                    "results": [{"tool": "coder", "status": "error", "output": violation}],
-                    "error": violation,
-                }
-
-            # ── Dispatch ──────────────────────────────────────────────────────
-            _cli_status(f"Dispatching tool action: {', '.join(tools_to_call) or 'none'}")
-            dispatch_result = self.dispatcher.dispatch(action_bundle)
-
-            # ── Store results in state ────────────────────────────────────────
-            if dispatch_result.get("signal") in ("noop", "done"):
-                signal = dispatch_result.get("signal", "noop")
-                state.add_tool_result("dispatcher", "ok", signal)
-                log("executor_dispatch_signal", {
-                    "signal": signal,
-                    "step": step[:160],
-                    "action": action_bundle.get("action"),
-                })
-
-            results = dispatch_result.get("results", [])
-            if not results and dispatch_result.get("status") == "error":
-                state.add_tool_result(
-                    "dispatcher", "error",
-                    dispatch_result.get("error", "Dispatcher returned no results.")
-                )
-
-            for r in results:
-                state.add_tool_result(r["tool"], r["status"], r["output"])
-
-            return dispatch_result
-
-        error = f"Executor rejected noop for implementation step after retries: {step}"
-        state.add_tool_result("dispatcher", "error", error)
-        return {"status": "error", "results": [{"tool": "dispatcher", "status": "error", "output": error}], "error": error}
-
-    def _should_reject_noop(self, step: str, state: RunState) -> bool:
-        lowered = (step or "").lower()
-        # Kept in sync with _detect_file_write_step's write_keywords: any
-        # step that should have routed to content-first (add/append/insert/
-        # update/edit/write/create/etc.) must not be allowed to complete via
-        # a bare noop — that silently drops the described content.
-        if not any(keyword in lowered for keyword in (
-            "write", "create", "generate", "implement", "build",
-            "add", "append", "insert", "update", "edit",
-        )):
-            return False
-        return state.step_attempts.get(step, 0) < 2
+        return dispatch_result
 
     def _framework_violation(self, state: RunState, action_bundle: dict) -> str | None:
         forbidden = getattr(state, "requirements", None)
@@ -858,23 +834,6 @@ class Executor:
                             f"Forbidden framework content detected in tool args: '{pattern}'. "
                             f"This task is locked to {state.requirements.framework}."
                         )
-            # Special-case: React-locked projects should not output large
-            # rendered HTML files. Allow minimal mount shells (small files
-            # containing a root div) but flag substantive rendered HTML.
-            if state.requirements and state.requirements.framework and state.requirements.framework.lower() == "react":
-                path = (args.get("path") or "")
-                ext = os.path.splitext(path)[1].lower()
-                if ext == ".html":
-                    content = (args.get("content") or "")
-                    # Heuristic: substantive HTML has >15 lines or contains semantic tags
-                    lines = content.splitlines()
-                    semantic_tags = ["<header", "<main", "<article", "<section", "<nav", "<footer", "<h1", "<h2", "<h3"]
-                    has_semantic = any(tag in content.lower() for tag in semantic_tags)
-                    if len(lines) > 15 or has_semantic:
-                        return (
-                            "Generated substantial HTML content detected in a React-locked project. "
-                            "For React projects prefer component files (.jsx/.tsx) and minimal HTML mount shells."
-                        )
         return None
 
 
@@ -884,9 +843,9 @@ def _strip_fences(text: str) -> str:
     """
     Remove markdown code fences that models sometimes add even when told not to.
     Handles:
-      ```html ... ```
-      ```css  ... ```
-      ```     ... ```
+`````html ... ```
+````css  ... ```
+```     ... ```
     """
     text = text.strip()
     # Match opening fence with optional language tag

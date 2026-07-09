@@ -1,9 +1,11 @@
 # core/planner.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Decides whether a task needs full agent execution or a direct Q&A answer.
+# Decides whether a task needs full agent execution, a direct Q&A answer,
+# a read-only lookup, or a targeted single-file edit.
 # Input refinement lives here too (called from main.py before agent.invoke).
 # ─────────────────────────────────────────────────────────────────────────────
 
+import difflib
 import os
 import re
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -38,6 +40,29 @@ EXECUTION_CONTEXT_HINTS = (
     "local file", "codi.log",
 )
 
+# ── Intent classification vocab ────────────────────────────────────────────
+# These must be defined BEFORE route_reason() since route_reason now also
+# consults them (a phrase like "change the button color" has no
+# ACTION_TRIGGERS word and no file extension, so without this it was
+# silently classified as a plain question — see planner_route bug).
+READ_VERBS = (
+    "read", "show", "explain", "describe", "summarize", "summarise",
+    "what does", "how does", "walk me through", "understand", "review",
+    "look at", "inspect", "analyze", "analyse", "tell me about",
+)
+
+EDIT_VERBS = (
+    "edit", "fix", "update", "change", "modify", "rename", "refactor",
+    "remove", "delete", "replace", "append", "prepend", "insert", "patch",
+)
+
+BUILD_VERBS = (
+    "create", "build", "generate", "scaffold", "implement", "make",
+    "set up", "setup", "new project", "new app", "write a",
+)
+
+FILE_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b")
+
 
 def _tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9_]+", text.lower()))
@@ -46,6 +71,29 @@ def _tokens(text: str) -> set[str]:
 def _starts_with_phrase(text: str, phrases: tuple[str, ...]) -> bool:
     for phrase in phrases:
         if re.match(rf"^{re.escape(phrase)}(\b|[?.!,]|$)", text):
+            return True
+    return False
+
+
+def _phrase_hit(t: str, phrases: tuple[str, ...]) -> str | None:
+    for phrase in phrases:
+        if phrase in t:
+            return phrase
+    return None
+
+
+def _fuzzy_verb_hit(words: set[str], vocab: tuple[str, ...], cutoff: float = 0.8) -> bool:
+    """
+    Catch common typos ("chnage" -> "change", "dowload" -> "download") that
+    exact substring matching misses. Only checks single-word vocab entries —
+    multi-word phrases ("what does", "new project") aren't meaningfully
+    fuzzy-matchable against a single mistyped token.
+    """
+    single_words = [v for v in vocab if " " not in v]
+    for w in words:
+        if len(w) < 4:
+            continue
+        if difflib.get_close_matches(w, single_words, n=1, cutoff=cutoff):
             return True
     return False
 
@@ -68,6 +116,29 @@ def route_reason(text: str) -> tuple[bool, str]:
     if action_hits:
         return True, f"action_trigger:{','.join(action_hits[:5])}"
 
+    # NEW: EDIT_VERBS / BUILD_VERBS / READ_VERBS are used downstream by
+    # classify_intent() for fine-grained routing, but they must ALSO count
+    # as execution triggers here — otherwise a phrase like "change the
+    # button color to blue" (no ACTION_TRIGGERS word, no file extension,
+    # under 80 chars) falls through to "short_no_action" and gets answered
+    # as plain Q&A instead of actually being executed.
+    phrase_hit = (
+        _phrase_hit(t, EDIT_VERBS)
+        or _phrase_hit(t, BUILD_VERBS)
+        or _phrase_hit(t, READ_VERBS)
+    )
+    if phrase_hit:
+        return True, f"phrase_trigger:{phrase_hit}"
+
+    # NEW: typo tolerance for the same vocab (chnage/dowload/etc.)
+    if (
+        _fuzzy_verb_hit(words, EDIT_VERBS)
+        or _fuzzy_verb_hit(words, BUILD_VERBS)
+        or _fuzzy_verb_hit(words, READ_VERBS)
+        or _fuzzy_verb_hit(words, ACTION_TRIGGERS)
+    ):
+        return True, "fuzzy_verb_trigger"
+
     if len(t) < 80:
         return False, "short_no_action"
 
@@ -86,6 +157,47 @@ def is_simple_input(text: str) -> bool:
     return not needs_execution
 
 
+def classify_intent(text: str) -> str:
+    """
+    Classify a task into one of four buckets so the agent can pick the
+    right-sized pipeline instead of always running the full build loop.
+
+    "qa"    — plain question, no tools needed at all
+    "read"  — inspect/explain existing code; tools may run (read/search)
+              but nothing is ever written
+    "edit"  — targeted change to one (or two) existing file(s); tries a
+              single direct executor call before falling back to "build"
+    "build" — multi-file creation / scaffolding / ambiguous — full pipeline
+    """
+    needs_exec, _ = route_reason(text)
+    if not needs_exec:
+        return "qa"
+
+    t = (text or "").lower()
+    words = _tokens(t)
+    has_file       = bool(FILE_PATH_RE.search(text))
+    has_read_verb  = any(v in t for v in READ_VERBS) or _fuzzy_verb_hit(words, READ_VERBS)
+    has_edit_verb  = any(v in t for v in EDIT_VERBS) or _fuzzy_verb_hit(words, EDIT_VERBS)
+    has_build_verb = any(v in t for v in BUILD_VERBS) or _fuzzy_verb_hit(words, BUILD_VERBS)
+    file_mentions  = len(FILE_PATH_RE.findall(text))
+
+    if has_read_verb and not has_build_verb and not has_edit_verb:
+        return "read"
+
+    # NOTE: " and " is deliberately NOT a build signal on its own anymore.
+    # "edit index.html and add content there" has one file and one edit
+    # verb and no build verb — it should be a targeted single-file edit,
+    # not a full read-context + multi-step plan (which previously caused
+    # the planner to invent an unrequested edit to styles.css as well).
+    if has_build_verb or file_mentions > 1:
+        return "build"
+
+    if has_edit_verb and (has_file or "this file" in t or "that function" in t):
+        return "edit"
+
+    return "build"
+
+
 class Planner:
     def __init__(self):
         self.llm = get_refiner_llm()
@@ -93,13 +205,21 @@ class Planner:
     def _system_prompt(self) -> str:
         working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
         return (
-            f"You are Codi, an offline-first AI coding agent.\n"
-            f"CURRENT PROJECT DIRECTORY: {working_dir}\n"
-            f"Answer questions directly and concisely."
+            f"You are Codi, an offline-first AI coding agent having a plain-text "
+            f"conversation with a developer. You are NOT executing tools right now — "
+            f"this is a direct question-and-answer exchange.\n"
+            f"CURRENT PROJECT DIRECTORY: {working_dir}\n\n"
+            f"Answer directly and concisely. Use code blocks for code. "
+            f"If the question implies you should inspect or change actual project "
+            f"files, say so plainly — don't pretend to have read files you haven't."
         )
 
     def needs_execution(self, state: RunState) -> bool:
-        """True if the task requires tool execution. False for simple Q&A."""
+        """True if the task requires tool execution. False for simple Q&A.
+
+        Kept for backward compatibility — prefer classify() for new code,
+        since it distinguishes read/edit/build instead of a single bucket.
+        """
         result, reason = route_reason(state.user_input)
         log("planner_route", {
             "input": state.user_input[:160],
@@ -108,6 +228,16 @@ class Planner:
             "input_len": len(state.user_input or ""),
         })
         return result
+
+    def classify(self, state: RunState) -> str:
+        """Return one of "qa" | "read" | "edit" | "build" for state.user_input."""
+        intent = classify_intent(state.user_input)
+        log("planner_classify", {
+            "input": state.user_input[:160],
+            "intent": intent,
+            "input_len": len(state.user_input or ""),
+        })
+        return intent
 
     def direct_answer(self, state: RunState) -> str:
         """For simple Q&A that doesn't need tools. Returns plain text answer."""
@@ -146,7 +276,9 @@ class Planner:
 
         prompt = (
             "Rewrite this coding task as a clear 1-2 sentence instruction "
-            "for an AI agent. No bullet points. No headers. Just the core instruction.\n\n"
+            "for an AI agent. Preserve every concrete detail: file names, "
+            "exact wording, colors, values. Do not add scope that wasn't "
+            "there. No bullet points. No headers. Just the core instruction.\n\n"
             f"Task: {text}\nInstruction:"
         )
         try:

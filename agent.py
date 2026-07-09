@@ -1,38 +1,50 @@
 # agent.py
 # ─────────────────────────────────────────────────────────────────────────────
-# The new Codi agent. Clean, explicit, no LangGraph magic.
+# The Codi agent. Clean, explicit, no LangGraph magic.
 #
-# Loop:
-#   while not done:
-#       step  = improver.next_step(state)
-#       result = executor.execute_step(step, state)
-#       done  = validator.validate(state)
-#       if not done and validation failed:
-#           correction = improver.improve(state)
-#           → retry with correction
-#   output = improver.summarize(state)
+# Routing:
+#   "qa"    → direct LLM answer, no tools
+#   "read"  → read/search only, answer from that content, never writes
+#   "edit"  → one direct executor call for a targeted single-file change;
+#             falls back to the full build pipeline if that doesn't land
+#   "build" → full Improver → Executor → Validator loop
 #
-# Plan confirmation gate:
-#   - On a FRESH task, plan_confirmed is forced to False. After create_plan()
-#     runs, if plan_confirmed is still False, we write plan.md and return
-#     immediately WITHOUT executing anything, along with the RunState object
-#     itself so the caller (main.py) can hold onto it.
+# Plan confirmation gate (build path only):
+#   - On a FRESH "build" task, plan_confirmed is forced to False. After
+#     create_plan() runs, if plan_confirmed is still False, we write
+#     plan.md and return immediately WITHOUT executing anything, along
+#     with the RunState object itself so the caller (main.py) can hold
+#     onto it.
 #   - To actually execute, the caller must call invoke() again passing that
 #     same RunState back in via resume_state=. That call skips planning
 #     entirely and goes straight into the execution loop.
+#
+# IMPORTANT: _run() MUST return a string in every code path. The execution
+# loop below sets state.status = "complete" via break but does not itself
+# produce user-facing output — the final summarize() call at the bottom of
+# _run() is what turns "the loop finished" into an actual answer. Without
+# it, invoke() returns output=None and the caller prints "No output
+# returned." even after files were written successfully.
 # ─────────────────────────────────────────────────────────────────────────────
 
+import re
 import traceback
 import os
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from core.executor  import Executor
 from core.improver  import Improver
 from core.planner   import Planner
 from core.quick_actions import try_fast_file_task
 from core.validator import Validator
-from logger         import log
-from state.temp_db  import RunState
-from tools.registry import ToolRegistry, registry as _global_registry
-from status_stream import emit_status
+from dispatcher      import Dispatcher, wrap_prompt_data
+from logger          import log
+from state.temp_db   import RunState
+from tools.registry  import ToolRegistry, registry as _global_registry
+from status_stream   import emit_status
+
+_FILE_MENTION_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b")
+
 
 def _step_succeeded(state: RunState) -> bool:
     """
@@ -53,6 +65,7 @@ def _step_succeeded(state: RunState) -> bool:
     if last.tool == "dispatcher" and last.output in ("noop", "done"):
         return True
     return False
+
 
 def _agent_status(message: str) -> None:
     """Show high-level agent progress without exposing hidden model reasoning."""
@@ -92,8 +105,9 @@ class CodiAgent:
                 user_input=inputs.get("input", ""),
                 history=inputs.get("history", ""),
             )
-            # Every fresh task starts unconfirmed. Fast-path / direct-answer
-            # tasks never reach the gate check, so this is safe to force here.
+            # Every fresh task starts unconfirmed. Fast-path / direct-answer /
+            # read / edit tasks never reach the gate check, so this is safe
+            # to force here — only the "build" path consults it.
             state.plan_confirmed = False
 
         _agent_status(f"Received task: {state.user_input[:120]}")
@@ -105,6 +119,13 @@ class CodiAgent:
             log("agent_crash", {"error": str(e), "traceback": traceback.format_exc()[:4000]})
             output = f"Agent error: {e}"
             state.status = "failed"
+
+        # Defensive: if some code path still slips through without setting
+        # output (e.g. a future refactor breaks the invariant again), fall
+        # back to a real summary rather than silently returning None.
+        if output is None:
+            log("agent_output_missing", {"status": state.status, "iterations": state.iteration})
+            output = self.improver.summarize(state) or "Task finished, but no summary could be generated."
 
         log("agent_end", {
             "output": (output or "")[:120],
@@ -123,12 +144,20 @@ class CodiAgent:
     def _run(self, state: RunState, resuming: bool = False) -> str:
 
         if not resuming:
-            # ── Route: simple Q&A or full execution? ───────────────────────────
-            if not self.planner.needs_execution(state):
+            # ── Route: qa / read / edit / build ────────────────────────────────
+            intent = self.planner.classify(state)
+
+            if intent == "qa":
                 _agent_status("Answering directly; no tools needed.")
                 log("agent_direct", {"input": state.user_input[:80]})
                 state.status = "complete"
                 return self.planner.direct_answer(state)
+
+            if intent == "read":
+                _agent_status("Reading code to answer — no files will be changed.")
+                log("agent_read", {"input": state.user_input[:80]})
+                state.status = "complete"
+                return self._handle_read(state)
 
             _agent_status("Checking for a fast file action.")
             fast_output = try_fast_file_task(state.user_input, self.registry, state)
@@ -138,6 +167,18 @@ class CodiAgent:
                 state.status = "complete"
                 return fast_output
 
+            if intent == "edit":
+                _agent_status("Making a targeted edit.")
+                edit_output = self._handle_edit(state)
+                if edit_output is not None:
+                    log("agent_edit_success", {"input": state.user_input[:80]})
+                    state.status = "complete"
+                    return edit_output
+                _agent_status("Targeted edit needs broader context — planning full task.")
+                log("agent_edit_fallback", {"input": state.user_input[:80]})
+                # falls through to the full build pipeline below
+
+            # ── intent == "build" (or edit fallback) ────────────────────────────
             # ── Phase 1: Read context ──────────────────────────────────────────
             _agent_status("Reading project context.")
             context = self.improver.read_context(state)
@@ -230,6 +271,99 @@ class CodiAgent:
                 correction = str(self.improver.improve(state))
                 log("agent_correction", {"correction": correction[:100]})
                 state.plan = f"{state.plan}\n[CORRECTION]: {correction}"
+
+        # ── Phase 4: Final summary ────────────────────────────────────────────
+        # THIS WAS PREVIOUSLY MISSING. The loop above only sets state.status
+        # via break — it never itself produces user-facing output. Without
+        # this call, _run() fell off the end and returned None, which is
+        # why every task that reached the execution loop printed "No output
+        # returned." even when files were written successfully.
+        final_output = self.improver.summarize(state)
+        state.final_output = final_output
+        log("agent_final_summary", {
+            "output": final_output[:200],
+            "status": state.status,
+            "iterations": state.iteration,
+        })
+        return final_output
+
+    # ── Lightweight intent handlers ─────────────────────────────────────────
+
+    def _handle_read(self, state: RunState) -> str:
+        """
+        Answer a question about the code without writing anything.
+        Reads named file(s) if present in the input, otherwise falls back
+        to a semantic search + directory listing. Never dispatches a
+        write/edit/create tool — this path is read-only by construction.
+        """
+        dispatcher = Dispatcher(self.registry)
+        file_matches = list(dict.fromkeys(_FILE_MENTION_RE.findall(state.user_input)))
+
+        if file_matches:
+            tools_to_run = [{"name": "read_file", "args": {"path": p}} for p in file_matches]
+        else:
+            tools_to_run = [
+                {"name": "search_codebase", "args": {"query": state.user_input[:200]}},
+                {"name": "list_files", "args": {}},
+            ]
+
+        result = dispatcher.dispatch({"action": "tool_call", "tools": tools_to_run})
+
+        context_parts = []
+        for r in result.get("results", []):
+            if r["status"] == "ok":
+                context_parts.append(
+                    wrap_prompt_data(r["output"], path=(r.get("args") or {}).get("path"))
+                )
+            state.add_tool_result(r["tool"], r["status"], r["output"])
+
+        context_text = "\n\n".join(context_parts) or "(no matching files found)"
+
+        try:
+            resp = self.improver.llm.invoke([
+                SystemMessage(content=(
+                    "You are Codi, explaining code to the user. You are in "
+                    "read-only mode — never claim to have written or changed "
+                    "any file, and never invent file contents you haven't seen."
+                )),
+                HumanMessage(content=(
+                    f"Answer using ONLY the context below.\n\n"
+                    f"Question: {state.user_input}\n\nContext:\n{context_text}"
+                )),
+            ])
+            answer = resp.content.strip()
+            log("agent_read_answer", {"output": answer[:120]})
+            return answer
+        except Exception as e:
+            log("agent_read_error", {"error": str(e)})
+            return f"Error reading code: {e}"
+
+    def _handle_edit(self, state: RunState):
+        """
+        Attempt a targeted, single-file edit with one direct executor call —
+        skips the full read-context + multi-step-plan pipeline entirely.
+
+        Returns the summary string on success, or None if it couldn't be
+        resolved this way, so the caller falls back to the full build loop
+        instead of failing outright.
+        """
+        step = state.user_input
+        state.current_step = step
+
+        self.executor.execute_step(step, state)
+
+        if not _step_succeeded(state):
+            log("agent_edit_step_failed", {"step": step[:120]})
+            return None
+
+        state.mark_step_complete(step)
+        state.plan_steps = [step]
+
+        if self.validator.validate(state):
+            return self.improver.summarize(state)
+
+        log("agent_edit_validation_failed", {"notes": (state.validation_notes or "")[:160]})
+        return None
 
 
 def create_agent(mode: str = None) -> CodiAgent:
