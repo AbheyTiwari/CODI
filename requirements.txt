@@ -20,3 +20,4 @@ python-dotenv
 pydantic
 numpy
 pybind11>=3.0.4
+truststore
