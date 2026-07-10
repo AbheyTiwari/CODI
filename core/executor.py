@@ -206,7 +206,12 @@ _LARGE_CONTENT_TRIGGERS = (
     "nav", "card", "modal", "form", "button", "style", "color", "font",
 )
 
-_LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg")
+# FIX (bug 1): ".py" added — small local models can't reliably produce full
+# python file content escaped inside a JSON string; without this, .py write
+# steps fell through to the standard JSON path, the LLM couldn't fit real
+# content, and the executor consistently emitted {"action":"noop"} instead —
+# see codi.log trace 2026-07-10T10:00-10:02, "test_main.py" never touched.
+_LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg", ".py")
 
 _WRITE_TOOLS = {"write_file", "create_file"}
 
@@ -226,6 +231,73 @@ _LINE_EDIT_KEYWORDS = (
 
 # Directories skipped when scanning for fuzzy-match candidates
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
+
+# Package-manager / long-running commands are always routed through the
+# VISIBLE external terminal (run_command_external) rather than the hidden
+# run_command, even if the step's wording didn't explicitly ask for "a
+# separate terminal" — installs are exactly the kind of side-effecting,
+# occasionally slow, sometimes-fails operation the user should be able to
+# watch live rather than discover only after the fact via a status line.
+_FORCE_EXTERNAL_SHELL_PATTERNS = (
+    "pip install", "pip uninstall", "pip3 install", "pip3 uninstall",
+    "uv pip", "uv sync", "uv add", "uv remove",
+    "poetry install", "poetry add", "poetry remove",
+    "npm install", "npm i ", "npm uninstall", "npm ci",
+    "yarn add", "yarn install", "yarn remove",
+    "pnpm install", "pnpm add",
+)
+
+# FIX (bug 2 support): filename immediately following one of these words is
+# the WRITE TARGET — "Write X for Y in Z" / "Write X for Y into Z" / "save
+# ... as Z" all mean Z is what gets written, not Y (which is usually just
+# referenced/tested-against). Checked before falling back to "last filename
+# mentioned", which is itself a better default than "first filename
+# mentioned" for this kind of phrasing.
+_TARGET_PREPOSITION_RE = re.compile(
+    r"\b(?:in|to|into|as)\s+['\"`]?([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))",
+    re.IGNORECASE,
+)
+
+
+def _should_force_external_shell(command: str) -> bool:
+    lowered = (command or "").lower()
+    return any(pattern in lowered for pattern in _FORCE_EXTERNAL_SHELL_PATTERNS)
+
+
+def _force_external_shell_if_package_manager(action_bundle: dict) -> dict:
+    """
+    Rewrite a run_command call to run_command_external in place when the
+    command is a package-manager install/uninstall, regardless of whether
+    the step's wording explicitly asked for a visible/separate terminal.
+    Handles both action_bundle shapes that can reach this point:
+      - normalized: {"action":"tool_call","tools":[{"name":"run_command","args":{...}}]}
+      - action-as-toolname (pre-dispatcher-normalization): {"action":"run_command","args":{...}}
+    """
+    if not isinstance(action_bundle, dict):
+        return action_bundle
+
+    action = action_bundle.get("action")
+
+    if action == "run_command":
+        args = action_bundle.get("args") or {}
+        command = args.get("command", "") if isinstance(args, dict) else ""
+        if _should_force_external_shell(command):
+            action_bundle["action"] = "run_command_external"
+            log("executor_force_external_shell", {"command": command[:160]})
+        return action_bundle
+
+    tools = action_bundle.get("tools")
+    if isinstance(tools, list):
+        for t in tools:
+            if not isinstance(t, dict) or t.get("name") != "run_command":
+                continue
+            args = t.get("args") or {}
+            command = args.get("command", "") if isinstance(args, dict) else ""
+            if _should_force_external_shell(command):
+                t["name"] = "run_command_external"
+                log("executor_force_external_shell", {"command": command[:160]})
+
+    return action_bundle
 
 
 def _resolve_existing_path(path: str) -> str | None:
@@ -279,6 +351,38 @@ def _resolve_existing_path(path: str) -> str | None:
     return None
 
 
+def _extract_write_target_path(step: str) -> str | None:
+    """
+    FIX (bug 2): pick the filename that is actually the WRITE TARGET out of
+    a step that may mention several files, instead of blindly taking the
+    first filename `re.search` finds.
+
+    Example that was broken before this fix:
+      "Write unit tests for the 'main.py' file in 'test_main.py'"
+      old behavior -> "main.py"   (WRONG — that's the file under test)
+      new behavior -> "test_main.py"  (correct — that's what gets written)
+
+    Strategy:
+      1. Prefer a filename immediately following in/to/into/as — these
+         prepositions are the strongest, most explicit signal of a
+         destination in natural-language step phrasing.
+      2. Otherwise fall back to the LAST filename mentioned in the step.
+         Empirically the destination tends to trail the referenced/source
+         file in unprefixed phrasing, so "last" is a safer default than
+         "first" even without a preposition match.
+    """
+    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))"
+    matches = list(re.finditer(ext_pattern, step))
+    if not matches:
+        return None
+
+    prep_match = _TARGET_PREPOSITION_RE.search(step)
+    if prep_match:
+        return prep_match.group(1).strip("'\"` ")
+
+    return matches[-1].group(1).strip("'\"` ")
+
+
 def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     """
     If this step is clearly a file write/edit operation, return (tool_name, path).
@@ -294,12 +398,9 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     """
     step_lower = step.lower()
 
-    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))"
-    match = re.search(ext_pattern, step)
-    if not match:
+    path = _extract_write_target_path(step)
+    if not path:
         return None, None
-
-    path = match.group(1).strip("'\"` ")
 
     if any(kw in step_lower for kw in _EDIT_KEYWORDS):
         working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
@@ -365,7 +466,9 @@ def _is_large_content_step(step: str, path: str, tool: str | None = None) -> boo
     if ext not in _LARGE_CONTENT_EXTS:
         return False
 
-    if ext == ".html":
+    # HTML and Python are almost always large enough (boilerplate/imports/
+    # structure) that content-first beats JSON-escaped inline generation.
+    if ext in (".html", ".py"):
         return True
 
     if any(trigger in step_lower for trigger in _LARGE_CONTENT_TRIGGERS):
@@ -876,6 +979,11 @@ class Executor:
                 "results": [{"tool": "coder", "status": "error", "output": error}],
                 "error":   error,
             }
+
+        # Package-manager installs always go through the visible external
+        # terminal, even if the step didn't explicitly ask for one — see
+        # _force_external_shell_if_package_manager's docstring.
+        action_bundle = _force_external_shell_if_package_manager(action_bundle)
 
         tools_to_call = []
         if isinstance(action_bundle, dict) and "tools" in action_bundle:

@@ -1,53 +1,132 @@
-# Codi — AI Coding Agent
+# ⚽ Codi — AI Coding Agent
 
-Codi is a system-driven coding agent that runs in your terminal. You point it at any project directory and talk to it in plain English. It reads your code, makes a plan, executes tools in parallel, validates the result, and corrects itself if something goes wrong.
+**Codi** is a system-driven, terminal-native coding agent. Point it at any project directory, talk to it in plain English, and it will read your code, form a plan, execute tools (locally and via MCP), validate the result, and correct itself automatically when something goes wrong — all without leaving your terminal.
 
-It works fully offline (Ollama), on your phone over Wi-Fi (Air LLM), or through cloud providers (Groq, Anthropic, OpenAI, Gemini).
+It runs fully offline (Ollama / llama.cpp), on your phone over Wi-Fi (Air LLM), or through cloud providers (Groq, Anthropic, OpenAI, Gemini) — switchable live, mid-session, with `/mode`.
+
+```
+  ██████╗ ██████╗ ██████╗ ██╗
+ ██╔════╝██╔═══██╗██╔══██╗██║
+ ██║     ██║   ██║██║  ██║██║
+ ██║     ██║   ██║██║  ██║██║
+ ╚██████╗╚██████╔╝██████╔╝██║
+  ╚═════╝ ╚═════╝ ╚═════╝ ╚═╝
+```
 
 ---
 
 ## Table of Contents
 
-1. [How it works](#how-it-works)
-2. [Requirements](#requirements)
-3. [Installation](#installation)
-4. [Quick start](#quick-start)
-5. [Modes](#modes)
+1. [Why Codi](#why-codi)
+2. [How it works](#how-it-works)
+3. [Requirements](#requirements)
+4. [Installation](#installation)
+5. [Quick start](#quick-start)
+6. [Modes](#modes)
    - [Cloud](#cloud-mode)
    - [Local (Ollama)](#local-mode)
    - [Hybrid](#hybrid-mode)
    - [Air LLM](#air-llm-mode)
-6. [API keys](#api-keys)
-7. [Commands](#commands)
-8. [MCP servers](#mcp-servers)
-9. [Project structure](#project-structure)
-10. [How the agent loop works](#how-the-agent-loop-works)
-11. [Adding a custom tool](#adding-a-custom-tool)
-12. [Troubleshooting](#troubleshooting)
+   - [llama.cpp](#llamacpp-mode)
+7. [API keys](#api-keys)
+8. [Commands](#commands)
+9. [How the agent loop works](#how-the-agent-loop-works)
+10. [Intent routing (qa / read / edit / build)](#intent-routing-qa--read--edit--build)
+11. [Surgical file editing](#surgical-file-editing)
+12. [Running commands in a separate terminal](#running-commands-in-a-separate-terminal)
+13. [MCP servers](#mcp-servers)
+14. [Football theming (CLI)](#football-theming-cli)
+15. [Project structure](#project-structure)
+16. [Adding a custom tool](#adding-a-custom-tool)
+17. [Configuration reference](#configuration-reference)
+18. [Environment variables reference](#environment-variables-reference)
+19. [Troubleshooting](#troubleshooting)
+20. [Tips for best results](#tips-for-best-results)
+21. [Contributing](#contributing)
+22. [License](#license)
+
+---
+
+## Why Codi
+
+Most AI coding tools either:
+- **Rewrite entire files** for a one-line change, destroying unrelated work, or
+- **Hide their reasoning** behind a black-box agent loop with no visibility into what's actually happening, or
+- **Require a cloud subscription** even for simple, local, offline-capable tasks.
+
+Codi is built around three explicit principles instead:
+
+- **Surgical over destructive.** Codi edits the smallest possible region of a file — a text span, a line range, an append — instead of regenerating the whole thing whenever it can avoid it.
+- **Transparent over magical.** No LangGraph, no hidden state machines. Every decision — plan, step, tool call, validation, correction — is a JSON object you can see in `/logs`.
+- **Yours over rented.** Run it 100% offline against your own Ollama models with zero API spend, or escalate to cloud only when you choose to.
 
 ---
 
 ## How it works
 
-Codi uses a two-LLM architecture with a central Dispatcher:
+Codi uses a **two-LLM architecture** with a central **Dispatcher**:
 
-- **Improver LLM** (fast/cheap) — orchestrates. It reads context, creates a plan, decides the next step each iteration, and writes the final output.
-- **Coder LLM** (stronger) — executes. It receives one step at a time and translates it into a JSON action bundle.
-- **Dispatcher** — routes. It receives the JSON, runs tools in parallel (local Python functions or MCP servers), and returns structured results.
-- **Validator** — checks. After each execution round it decides pass or fail. On fail, the Improver corrects and retries.
+| Component | Role |
+|---|---|
+| **Improver LLM** (fast/cheap) | Orchestrates. Reads context, creates a plan, decides the next step each iteration, writes the final summary. |
+| **Coder LLM** (stronger) | Executes. Receives one step at a time and translates it into a JSON action bundle — or, for file edits, a precise text/line-range operation. |
+| **Dispatcher** | Routes. Normalizes the JSON, runs tools in parallel (local Python functions or MCP servers), returns structured results. |
+| **Validator** | Checks. After each round, decides pass/fail deterministically first (cheap, fast, no LLM cost) and only escalates to an LLM semantic check if every deterministic gate already passed. |
 
-No LangGraph. No regex parsing. No guessing. Every decision flows through JSON.
+No regex-parsed prose. No guessing. Every hop is JSON in, JSON out.
+
+```
+Your input
+    │
+    ▼
+Planner — qa / read / edit / build?
+    │
+    ├── qa    ──────────────────────► Direct answer, no tools
+    ├── read  ──────────────────────► Read-only context, answer, never writes
+    ├── edit  ──────────────────────► One direct targeted call, falls back to build
+    │
+    └── build ──────────────────────► Full pipeline:
+            │
+            ▼
+        Improver reads context (list_files, search_codebase)
+            │
+            ▼
+        Improver creates a plan → writes plan.md → waits for 'y'
+            │
+            ▼
+        ┌─── LOOP ─────────────────────────────────────────────┐
+        │  Improver: "what's the next step?"                   │
+        │  Executor (Coder LLM): step → JSON action bundle      │
+        │    - text-match edit_file (old/new)                   │
+        │    - line-range edit_file (replace/delete/insert)      │
+        │    - content-first write_file (new/large files)        │
+        │    - additive append (safe fallback)                  │
+        │  Dispatcher: runs tools in parallel                   │
+        │  Validator: pass? exit loop. fail? Improver corrects.  │
+        └────────────────────────────────────────────────────────┘
+            │
+            ▼
+        Improver writes final, deterministic summary
+            │
+            ▼
+        Rendered to terminal (with football-themed live status)
+```
+
+**Max iterations:** 8 by default (`state/temp_db.py` → `RunState.max_iterations`).
 
 ---
 
 ## Requirements
 
-- Python 3.10 or higher
+- Python 3.10+
 - `pip`
-- Node.js 18+ and `npx` (required for MCP servers)
-- `uvx` — install with `pip install uv` (required for some MCP servers)
-- For local mode: [Ollama](https://ollama.com) installed and running
+- Node.js 18+ and `npx` (for MCP servers)
+- `uvx` — install with `pip install uv` (for some MCP servers)
+- For local mode: [Ollama](https://ollama.com) installed and running, **or** a running [llama.cpp](https://github.com/ggerganov/llama.cpp) server
 - For cloud mode: an API key for at least one provider
+- **Windows only** (for the external-shell feature): PowerShell available on `PATH` (default on Windows 10/11)
+- **macOS** (for the external-shell feature): Terminal.app available (default)
+- **Linux** (for the external-shell feature): one of `gnome-terminal`, `konsole`, `xterm`, or `x-terminal-emulator` on `PATH`
 
 ---
 
@@ -78,11 +157,11 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-This installs the `codi` command globally in your environment. You can now type `codi` from any directory.
+This installs the `codi` command globally in your environment (see `cli.py` / `setup.cfg`). You can now type `codi` from any directory.
 
 ### 4. Create your `.env` file
 
-In the repo root, create a file called `.env`:
+In the repo root:
 
 ```env
 # Paste whichever keys you have — leave the rest blank
@@ -95,11 +174,11 @@ STITCH_API_KEY=...
 BRAVE_API_KEY=...
 ```
 
+None of these are required to get started — local mode needs zero keys.
+
 ---
 
 ## Quick start
-
-Navigate to any project you want to work on, then run:
 
 ```bash
 cd ~/my-project
@@ -107,27 +186,37 @@ codi
 ```
 
 Codi will:
-1. Auto-index your project into a local vector database
-2. Load all enabled MCP servers
-3. Show you a prompt
+1. Auto-index your project into a local ChromaDB vector database (skipped automatically for >5000 files).
+2. Load every MCP server marked `"enabled": true` in `mcp_servers.json`.
+3. Show you a prompt: `❯`
 
-Then just type what you want:
+Then just talk to it:
 
 ```
 ❯ create a FastAPI app with a /health endpoint and write it to app.py
 ❯ find all TODO comments in this codebase
-❯ add pytest tests for the User class in models.py
+❯ replace lines 40 to 55 in server.py with a proper error handler
+❯ run npm install in a separate terminal window
 ❯ push all uncommitted changes to github with message "fix auth bug"
 ❯ what does the parse_config function do?
 ```
 
-Codi will plan, execute, validate, and tell you exactly what it did.
+For anything that touches files (`build` intent), Codi writes a plan to `plan.md`, shows it to you, and **waits for confirmation**:
+
+```
+❯ build a todo app with FastAPI and SQLite
+  Plan written to /home/you/my-project/plan.md. Review it, then type 'y' to run it,
+  or give me a new instruction to replan.
+❯ y
+  → resuming confirmed plan
+  ...
+```
 
 ---
 
 ## Modes
 
-Set `MODE` at the top of `config.py`, or switch live with `/mode <name>` while Codi is running.
+Set `MODE` at the top of `config.py`, or switch live with `/mode <name>` while Codi is running (no restart needed for most modes).
 
 ### Cloud mode
 
@@ -137,74 +226,36 @@ MODE = "cloud"
 CLOUD_PROVIDER = "groq"   # groq | anthropic | openai | gemini
 ```
 
-Every LLM call goes to the cloud provider. Best quality and capability. Costs money (except Groq free tier).
+Every LLM call goes to the cloud provider. Best quality and capability. Costs money (except Groq's free tier).
 
-**Recommended cloud setup for most users:**
-
+**Recommended cloud setup:**
 ```python
-MODE           = "cloud"
+MODE = "cloud"
 CLOUD_PROVIDER = "groq"
 REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"
 CODER_MODEL_CLOUD   = "llama-3.3-70b-versatile"
 ```
 
-Groq has a free tier with generous rate limits. Sign up at [console.groq.com](https://console.groq.com).
-
-**To use Anthropic:**
-
-```python
-CLOUD_PROVIDER      = "anthropic"
-REFINER_MODEL_CLOUD = "claude-haiku-4-5-20251001"
-CODER_MODEL_CLOUD   = "claude-sonnet-4-6"
-```
-
-**To use OpenAI:**
-
-```python
-CLOUD_PROVIDER      = "openai"
-REFINER_MODEL_CLOUD = "gpt-4o-mini"
-CODER_MODEL_CLOUD   = "gpt-4o"
-```
-
-**To use Gemini:**
-
-```python
-CLOUD_PROVIDER      = "gemini"
-REFINER_MODEL_CLOUD = "gemini-2.0-flash"
-CODER_MODEL_CLOUD   = "gemini-2.5-pro"
-```
-
----
+| Provider | Refiner example | Coder example |
+|---|---|---|
+| Groq | `llama-3.1-8b-instant` | `llama-3.3-70b-versatile` |
+| Anthropic | `claude-haiku-4-5-20251001` | `claude-sonnet-4-6` |
+| OpenAI | `gpt-4o-mini` | `gpt-4o` |
+| Gemini | `gemini-2.0-flash` | `gemini-2.5-pro` |
 
 ### Local mode
 
 100% offline. Ollama only. Zero API spend. No internet needed.
 
-**Step 1 — Install Ollama:**
-
 ```bash
-# Linux / macOS
-curl -fsSL https://ollama.com/install.sh | sh
+# Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh    # Linux/macOS
+# Windows: download from https://ollama.com
 
-# Windows: download installer from https://ollama.com
-```
-
-**Step 2 — Pull models:**
-
-Minimum setup (low RAM):
-```bash
-ollama pull phi3:mini           # ~2.2 GB — fast planner
+# Pull models
+ollama pull phi3:mini           # ~2.2 GB — fast planner/refiner
 ollama pull qwen2.5-coder:7b    # ~4.7 GB — code generation
 ```
-
-High-end setup (16 GB+ RAM or GPU):
-```bash
-ollama pull phi3:mini
-ollama pull qwen2.5-coder:14b   # ~9.0 GB — better code quality
-ollama pull deepseek-r1:8b      # ~5.0 GB — deep reasoning tasks
-```
-
-**Step 3 — Set config:**
 
 ```python
 # config.py
@@ -213,229 +264,257 @@ REFINER_MODEL_LOCAL = "phi3:mini"
 CODER_MODEL_LOCAL   = "qwen2.5-coder:7b"
 ```
 
-**Step 4 — Start Ollama and run Codi:**
-
 ```bash
-ollama serve   # keep this running in a separate terminal
+ollama serve   # keep running in a separate terminal
 codi
 ```
 
-**Model recommendations by task:**
-
-| Use case | Refiner | Coder |
+| Machine | Refiner | Coder |
 |---|---|---|
-| Low-end machine (8 GB RAM) | `phi3:mini` | `qwen2.5-coder:7b` |
+| Low-end (8 GB RAM) | `phi3:mini` | `qwen2.5-coder:7b` |
 | Mid-range (16 GB RAM) | `phi3:mini` | `qwen2.5-coder:14b` |
 | GPU / high-end | `qwen2.5:3b` | `deepseek-coder:33b` |
-| General purpose | `phi3:mini` | `llama3.1:8b` |
-
----
 
 ### Hybrid mode
 
-Ollama handles most tasks. When Ollama is unavailable or the context overflows, it automatically escalates to cloud.
+Ollama handles most tasks; escalates to cloud automatically when Ollama is unreachable, or falls back through llama.cpp → Air LLM → cloud in that order.
 
 ```python
 MODE                   = "hybrid"
 CLOUD_PROVIDER         = "groq"
-HYBRID_TOKEN_LIMIT     = 3500    # escalate when context exceeds this
-HYBRID_REQUIRE_CONFIRM = False   # set True to prompt before every cloud call
+HYBRID_TOKEN_LIMIT     = 3500
+HYBRID_REQUIRE_CONFIRM = False
 ```
 
-Fallback chain: **Ollama → Air LLM → Cloud**
-
----
+Fallback chain: **Ollama → llama.cpp (localhost) → Air LLM → Cloud**
 
 ### Air LLM mode
 
-Run LLMs on your Android phone over local Wi-Fi. Useful when you have no internet and your laptop is too slow for Ollama.
+Run models on your Android phone over local Wi-Fi — useful with no internet and a laptop too slow for local inference.
 
-**Step 1 — Install Air LLM on Android:**
+1. Install [Air LLM](https://play.google.com/store/apps/details?id=com.airlm.app) on Android.
+2. Load a GGUF model in-app (`phi-3-mini-4k-instruct.Q4_K_M` recommended).
+3. Start the server — note the LAN IP:port shown.
+4. Configure:
+   ```python
+   MODE = "air"
+   AIR_LLM_URL = "http://192.168.1.42:8080"
+   AIR_LLM_REFINER_MODEL = "phi3-mini"
+   AIR_LLM_CODER_MODEL   = "phi3-mini"
+   AIR_LLM_TIMEOUT = 180
+   ```
+5. `codi` — phone and laptop must share the same Wi-Fi network.
 
-Download from [Google Play](https://play.google.com/store/apps/details?id=com.airlm.app).
+### llama.cpp mode
 
-**Step 2 — Load a model in the app:**
-
-`phi-3-mini-4k-instruct.Q4_K_M` is a good pick. Download it inside the app.
-
-**Step 3 — Start the server in the app:**
-
-The app will show you a LAN IP and port, e.g. `http://192.168.1.42:8080`.
-
-**Step 4 — Set config:**
+Point Codi at a local `llama-server` OpenAI-compatible endpoint:
 
 ```python
-# config.py
-MODE              = "air"
-AIR_LLM_URL       = "http://192.168.1.42:8080"   # your phone's address
-AIR_LLM_REFINER_MODEL = "phi3-mini"
-AIR_LLM_CODER_MODEL   = "phi3-mini"
-AIR_LLM_TIMEOUT   = 180    # phones are slower — be patient
+MODE = "llamacpp"
+LLAMACPP_URL = "http://127.0.0.1:8080"
+LLAMACPP_REFINER_MODEL = "qwen2.5-coder-7b"
+LLAMACPP_CODER_MODEL   = "qwen2.5-coder-7b"
+LLAMACPP_TIMEOUT = 120
 ```
-
-**Step 5:**
-
-```bash
-codi
-```
-
-Your phone and laptop must be on the same Wi-Fi network.
 
 ---
 
 ## API keys
 
-The cleanest way to set keys is in the `.env` file in the repo root. Codi loads it automatically on startup.
+Preferred: `.env` in the repo root (loaded automatically). Also supported: shell environment variables, or hardcoding in `config.py` (not recommended — never commit real keys).
 
-```env
-CODI_GROQ_API_KEY=gsk_...
-CODI_ANTHROPIC_API_KEY=sk-ant-...
-CODI_OPENAI_API_KEY=sk-...
-CODI_GEMINI_API_KEY=AIza...
-```
-
-You can also set them as shell environment variables:
-
-```bash
-export CODI_GROQ_API_KEY=gsk_...
-```
-
-Or hard-code them in `config.py` (not recommended — do not commit keys):
-
-```python
-GROQ_API_KEY = "gsk_..."
-```
-
-**Where to get keys:**
-
-| Provider | URL | Notes |
-|---|---|---|
-| Groq | [console.groq.com](https://console.groq.com) | Free tier, very fast |
-| Anthropic | [console.anthropic.com](https://console.anthropic.com) | Pay per token |
-| OpenAI | [platform.openai.com](https://platform.openai.com) | Pay per token |
-| Gemini | [aistudio.google.com](https://aistudio.google.com) | Free tier available |
+| Provider | Get a key at |
+|---|---|
+| Groq | [console.groq.com](https://console.groq.com) — free tier, very fast |
+| Anthropic | [console.anthropic.com](https://console.anthropic.com) |
+| OpenAI | [platform.openai.com](https://platform.openai.com) |
+| Gemini | [aistudio.google.com](https://aistudio.google.com) — free tier available |
 
 ---
 
 ## Commands
 
-These are typed directly at the `❯` prompt while Codi is running.
+Typed directly at the `❯` prompt:
 
-| Command | What it does |
+| Command | Description |
 |---|---|
 | `/help` | Show all commands |
 | `/mode` | Show current mode and all available modes |
-| `/mode cloud` | Switch to cloud mode (live, no restart needed) |
-| `/mode local` | Switch to local Ollama mode |
-| `/mode hybrid` | Switch to hybrid mode |
-| `/mode air` | Switch to Air LLM mode |
-| `/mcp` | List all MCP servers and their ON/OFF status |
+| `/mcp` | List all MCP servers and ON/OFF status |
 | `/mcp on <name>` | Enable an MCP server (restart to apply) |
 | `/mcp off <name>` | Disable an MCP server (restart to apply) |
 | `/tools` | List every tool currently loaded (local + MCP) |
-| `/index` | Re-index the current project directory |
-| `/index /path/to/dir` | Index a specific directory |
-| `/clear` | Wipe session memory (helps with token overflow) |
-| `/history` | Print the full conversation history for this session |
-| `/logs` | Open the live telemetry dashboard |
-| `/quit` or `/exit` | Exit Codi |
+| `/index [path]` | Index a directory and set it as the working dir |
+| `/clear` | Wipe session memory (fixes context overflow / confused responses) |
+| `/history` | Print the full conversation history |
+| `/logs` | Open the live telemetry dashboard (every tool call, LLM decision, error) |
+| `cd <path>` | Change Codi's project directory (re-indexes automatically) |
+| `pwd` | Show Codi's current project directory |
+| `/quit` / `/exit` | Exit Codi (cleans up session memory, MCP connections, and `plan.md`) |
 
-**Tip:** If Codi starts giving confused responses mid-session, run `/clear` to wipe context and start fresh.
+---
+
+## How the agent loop works
+
+Understanding this helps you write better prompts and debug faster.
+
+1. **Planner** classifies your input into `qa`, `read`, `edit`, or `build` (see [Intent routing](#intent-routing-qa--read--edit--build) below).
+2. For `build` tasks, the **Improver** reads context (`list_files`, `search_codebase`, and reads any just-created boilerplate files), then produces a plan of 2–5 concrete steps.
+3. The plan is written to `plan.md` and Codi **waits for your confirmation** (`y`) before touching anything.
+4. Once confirmed, the loop runs:
+   - Improver picks the next step.
+   - **Executor** (Coder LLM) turns it into a precise action — see [Surgical file editing](#surgical-file-editing) for how it picks between text-match, line-range, content-first, and additive-append strategies.
+   - **Dispatcher** runs the tool(s), normalizing common LLM JSON mistakes (missing `tools[]` wrapper, `content_lines` arrays, truncated JSON, etc.) before execution.
+   - **Validator** runs deterministic checks first (file write success, syntax checks, framework-contamination checks, Java compile checks) and only calls an LLM for semantic verification if everything deterministic already passed.
+   - On failure, the Improver generates a targeted correction and the loop retries (up to `max_iterations`, default 8).
+5. A deterministic (non-LLM) summary is produced from the actual tool results — it only ever reports files that were *successfully* written, never guesses.
+
+---
+
+## Intent routing (qa / read / edit / build)
+
+Every input is classified before anything else runs (`core/planner.py`):
+
+| Intent | Behavior |
+|---|---|
+| `qa` | Plain question — answered directly, zero tool calls. E.g. *"what is a hash map?"* |
+| `read` | Read-only investigation — reads/searches files, answers, **never writes**. E.g. *"explain what auth.py does"* |
+| `edit` | Single targeted change to one (or two) existing files — tries one direct Executor call before falling back to the full `build` pipeline. E.g. *"fix the null check in parse_config"* |
+| `build` | Multi-file creation, scaffolding, or anything ambiguous — full plan → confirm → execute → validate loop. |
+
+Routing also recognizes typos (fuzzy keyword matching), broad-scope phrases (*"debug the entire website"* → `build`, not a narrow single-file `edit`), and explicit file/path mentions.
+
+---
+
+## Surgical file editing
+
+Codi never regenerates a whole file for a small change unless it has to. `edit_file` supports four strategies, and the Executor picks automatically based on the step's wording:
+
+### 1. Text-match replace (default for small, precise changes)
+```json
+{"path": "app.py", "old": "def foo():\n    pass", "new": "def foo():\n    return 42"}
+```
+Falls back through three levels of whitespace normalization (trailing spaces, CRLF vs LF, indentation collapse) before giving up — this is what makes small-model edits reliable even when they don't reproduce whitespace perfectly.
+
+### 2. Line-range surgical edit (for anything referencing lines, functions, classes, or methods)
+Uses `read_file_numbered` first to get **real, verified** line numbers — no guessing:
+```json
+{"path": "app.py", "replace_lines": {"start": 40, "end": 55, "content": "..."}}
+{"path": "app.py", "delete_lines":  {"start": 12, "end": 18}}
+{"path": "app.py", "insert_at_line": {"line": 9, "content": "..."}}
+```
+Example prompts that trigger this path:
+```
+❯ replace lines 40 to 55 in server.py with a proper error handler
+❯ delete the old_helper function, it's around lines 20-30
+❯ insert a new validate_input method after line 12
+```
+If a line range turns out to be stale or out-of-bounds (e.g. the file changed since it was last read), Codi automatically re-reads the file and retries once before falling back to the text-match strategy.
+
+### 3. Content-first (new files, or large HTML/CSS/JS generation)
+Used for `write_file`/`create_file` on fresh files, or files matching size/complexity heuristics (e.g. any `.html`, or steps containing words like *"responsive"*, *"dashboard"*, *"animated"*).
+
+### 4. Additive append (safe fallback)
+If a text-match `old` genuinely can't be found (and it isn't a line-range case), Codi falls back to appending clearly-scoped new code rather than failing the whole step.
+
+All four report back through the same JSON shape (`{"success": bool, "file_modified": path, ...}`), so the Validator, framework-contamination checker, and correction loop work identically regardless of which strategy fired.
+
+---
+
+## Running commands in a separate terminal
+
+Two shell tools are available to the Coder LLM:
+
+| Tool | Behavior |
+|---|---|
+| `run_command` | Hidden, in-process, 60s timeout. Good for quick, non-interactive commands (`git status`, `ls`, `pytest`). |
+| `run_command_external` | Opens a **separate, visible** terminal window (PowerShell on Windows, Terminal.app on macOS, or your Linux terminal emulator), asks you for **explicit permission first**, tees all output to a log file, and reports the exit code + full output back to Codi once it finishes. |
+
+Example:
+```
+❯ run npm install in a separate terminal window
+```
+```
+  ┌─ CODI wants to run a command in a separate shell window ─
+  │  npm install
+  └─────────────────────────────────────────────────────────
+  Allow? [y/N]:
+```
+
+Type `y` and a real terminal window opens so you can watch it live. Once it exits, Codi reads the captured output back and — if the command failed — automatically triggers the Improver's correction loop, the same way a failed file edit does. No architecture changes were needed for this: `run_command_external` returns errors prefixed with `ERROR:`, which the Dispatcher already treats as a failed step.
+
+**Skip the permission prompt** for unattended/CI runs:
+```bash
+export CODI_AUTO_APPROVE_SHELL=1      # bash
+$env:CODI_AUTO_APPROVE_SHELL="1"      # PowerShell
+```
+
+**Change the timeout** (default 300s):
+```bash
+export CODI_EXTERNAL_SHELL_TIMEOUT=600
+```
+
+Both dangerous-pattern blocking (`rm -rf`, `DROP TABLE`, fork bombs, etc.) and the same JSON result shape as `run_command` apply identically here.
 
 ---
 
 ## MCP servers
 
-MCP (Model Context Protocol) servers extend Codi with external capabilities. They are configured in `mcp_servers.json`.
+MCP (Model Context Protocol) servers extend Codi with external capabilities, configured in `mcp_servers.json`. Connections are opened **once and kept alive** for Codi's entire session (via a persistent `AsyncExitStack` in `mcp_manager.py`) rather than being closed and reopened per call — this is what makes tools like `browser_navigate` actually work reliably run after run.
 
 ### Enabled by default
 
 | Server | What it does |
 |---|---|
-| `filesystem` | Read and write files anywhere on disk |
-| `memory` | Persistent knowledge graph across sessions |
-| `sequential-thinking` | Forces structured step-by-step reasoning |
+| `filesystem` | Read/write files anywhere on disk |
+| `memory` | Persistent cross-session knowledge graph |
+| `sequential-thinking` | Forces step-by-step structured reasoning |
 | `github` | Read/write repos, issues, pull requests |
 | `fetch` | Fetch any URL and return its content |
-| `playwright` | Full browser automation |
-| `stitch` | Google Stitch — generate UI/UX code |
+| `playwright` | Full browser automation (navigate, click, fill, screenshot, evaluate JS) |
 
-### Disabled by default (enable as needed)
+### Disabled by default
 
-| Server | What it does | Key needed |
+| Server | What it does | Requires |
 |---|---|---|
-| `brave-search` | Web search | `BRAVE_API_KEY` |
-| `sqlite` | Query SQLite databases in your project | — |
-| `git` | `git status`, `git diff`, `git commit`, `git log` | — |
-| `postgres` | Query PostgreSQL databases | Connection string in config |
-| `mysql` | Query MySQL databases | Credentials in config |
-| `redis` | Redis key inspection | Redis URL in config |
-| `docker` | Manage Docker containers | Docker running locally |
-| `kubernetes` | kubectl operations | kubeconfig present |
-| `gitlab` | GitLab repos and CI/CD | `GITLAB_PERSONAL_ACCESS_TOKEN` |
-| `puppeteer` | Browser automation (alternative to playwright) | — |
-| `python-sandbox` | Execute Python in a safe sandbox | — |
-| `sentry` | Read errors and stack traces | Sentry auth token |
-| `prometheus` | Query metrics | Prometheus running locally |
-| `openapi` | Call any API from its OpenAPI spec | API spec URL |
+| `brave-search` | Web search (2000 free/month) | `BRAVE_API_KEY` |
+| `sqlite` | Query SQLite databases | — |
+| `git` | `git status/diff/commit/log` | Valid git repo |
+| `postgres` / `mysql` / `redis` | Query databases | Connection details |
+| `docker` / `kubernetes` | Container/cluster ops | Docker/kubeconfig locally |
+| `gitlab` | Repos and CI/CD | `GITLAB_PERSONAL_ACCESS_TOKEN` |
+| `puppeteer` | Browser automation (alt. to Playwright) | — |
+| `sentry` | Read errors/stack traces | Sentry auth token |
+| `stitch` | Google Stitch UI/UX generation | `STITCH_API_KEY` |
 
-### Enable or disable a server
+### Toggle a server
 
-**Option 1 — Live command (restart required):**
 ```
 ❯ /mcp on brave-search
 ❯ /mcp off playwright
 ```
+...or edit `mcp_servers.json` directly, then restart Codi.
 
-**Option 2 — Edit `mcp_servers.json` directly:**
-```json
-"brave-search": {
-  "enabled": true,
-  "env": {
-    "BRAVE_API_KEY": "your-key-here"
-  }
-}
-```
-
-### GitHub MCP setup
-
-The GitHub server is enabled by default but requires a token:
-
-1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
-2. Generate a Personal Access Token with `repo` scope
-3. Add to `.env`:
-
-```env
-GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...
-```
-
-### Google Stitch setup
-
-Stitch generates UI/UX code from descriptions.
-
-1. Get a key from [Google AI Studio](https://aistudio.google.com)
-2. Add to `.env`:
-
-```env
-STITCH_API_KEY=AIza...
-```
+### GitHub setup
+1. [github.com/settings/tokens](https://github.com/settings/tokens) → generate a token with `repo` scope.
+2. Add `GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...` to `.env`.
 
 ### Brave Search setup
+1. Get a free key at [brave.com/search/api](https://brave.com/search/api).
+2. Add `BRAVE_API_KEY=BSA...` to `.env`.
+3. `/mcp on brave-search`
 
-2000 free searches/month at [brave.com/search/api](https://brave.com/search/api).
+---
 
-1. Get your key
-2. Add to `.env`:
+## Football theming (CLI) ⚽
 
-```env
-BRAVE_API_KEY=BSA...
-```
+Because why not. This is purely cosmetic, purely hardcoded — **zero LLM calls**, so it costs no tokens and no latency:
 
-3. Enable the server:
+- A bouncing ⚽ animates across the live status panel title as Codi works.
+- Every real status line gets a matching football pun appended via plain keyword lookup (e.g. *"Creating an execution plan." → "Creating an execution plan. — Setting up the formation"*).
+- Lives entirely in `football_theme.py` (repo root) and is only ever called from `main.py`'s `LiveRenderer._panel()` — the actual agent status strings emitted by `agent.py` / `improver.py` are completely untouched.
 
-```
-❯ /mcp on brave-search
-```
+Turning it off is as simple as reverting the two lines in `LiveRenderer._panel()` that call `next_frame()` / `themed_status_line()` — no other file depends on it.
 
 ---
 
@@ -443,116 +522,59 @@ BRAVE_API_KEY=BSA...
 
 ```
 codi/
-├── agent.py              Thin agent shell — explicit loop, no LangGraph
-├── dispatcher.py         Central router — receives JSON, runs tools in parallel
+├── agent.py                  Thin agent shell — explicit loop, no LangGraph
+├── dispatcher.py              Central router — JSON in, tools out, parallel execution
+├── football_theme.py          Hardcoded CLI football animation + puns (zero LLM cost)
+├── mcp_manager.py              Persistent MCP session lifecycle (AsyncExitStack)
 │
 ├── core/
-│   ├── improver.py       Orchestrator LLM: plans, drives loop, summarizes
-│   ├── planner.py        Routes simple Q&A vs execution, refines input
-│   ├── executor.py       Coder LLM: step → JSON action bundle
-│   └── validator.py      Explicit pass/fail validation after each step
+│   ├── improver.py             Orchestrator LLM: plans, drives loop, summarizes
+│   ├── planner.py               Routes qa/read/edit/build, refines input
+│   ├── executor.py               Coder LLM: step → precise action (text/line/content/append)
+│   ├── validator.py               Deterministic-first, LLM-fallback validation
+│   ├── prompts.py                  Canonical system prompts + tool signatures
+│   ├── quick_actions.py             Fast-path file creation without the full LLM loop
+│   └── validation_utils.py           Framework-contamination detection (AST + regex)
 │
 ├── tools/
-│   ├── registry.py       Unified tool registry — dispatcher calls this
+│   ├── registry.py               Unified tool registry — Dispatcher calls this
 │   ├── local/
-│   │   ├── file_tools.py     read_file, write_file, list_files
-│   │   ├── shell_tools.py    run_command
-│   │   └── search_tools.py   search_codebase
+│   │   ├── file_tools.py           read_file, read_file_numbered, write_file, edit_file
+│   │   ├── shell_tools.py            run_command, run_command_external
+│   │   └── search_tools.py            search_codebase (ChromaDB similarity search)
 │   └── mcp/
-│       └── mcp_tools.py      Wraps MCP servers as plain callables
+│       └── mcp_tools.py             Wraps MCP StructuredTools as async-safe callables
 │
 ├── state/
-│   └── temp_db.py        RunState — owns all data for a single run
+│   └── temp_db.py                 RunState — owns all data for a single agent run
 │
-├── main.py               Terminal UI — renders output, handles commands
-├── cli.py                Entry point for the `codi` command
-├── config.py             Mode, models, providers — edit this to configure
-├── config_loader.py      Reads API keys from env / .env file
-├── context_trimmer.py    Keeps token usage under budget
-├── indexer.py            Builds and queries the ChromaDB vector index
-├── llm_factory.py        Returns the right LLM for local/cloud/air/hybrid
-├── logger.py             Appends JSON events to codi.log
-├── log_viewer.py         Live telemetry dashboard (/logs command)
-├── mcp_manager.py        Connects to MCP servers and loads their tools
-├── mcp_servers.json      MCP server configuration — edit to add/remove servers
-├── memory.py             Per-session conversation history with compression
-├── pyproject.toml        Package definition and dependencies
-└── .env                  Your API keys — create this, never commit it
-```
-
----
-
-## How the agent loop works
-
-Understanding this helps you write better prompts and debug when things go wrong.
-
-```
-Your input
-    │
-    ▼
-Planner — is this a simple question or does it need tools?
-    │
-    ├── Simple (what is X, explain Y) ──► Direct answer, no tools
-    │
-    └── Action (create, build, fix, run...) ──► Execution loop
-            │
-            ▼
-        Improver reads context
-        (lists your files, searches codebase)
-            │
-            ▼
-        Improver creates a plan
-        (JSON: {plan, steps[]})
-            │
-            ▼
-        ┌─── LOOP ───────────────────────────────┐
-        │                                        │
-        │  Improver → "what's the next step?"    │
-        │                                        │
-        │  Executor (Coder LLM) translates step  │
-        │  into JSON action bundle:              │
-        │    {action: tool_call,                 │
-        │     tools: [{name, args}, ...]}        │
-        │                                        │
-        │  Dispatcher runs tools in parallel     │
-        │  (local Python or MCP server)          │
-        │                                        │
-        │  Results stored in RunState            │
-        │                                        │
-        │  Validator checks: pass or fail?       │
-        │    pass ──► exit loop                  │
-        │    fail ──► Improver generates         │
-        │             correction ──► retry       │
-        │                                        │
-        └────────────────────────────────────────┘
-            │
-            ▼
-        Improver writes final summary
-            │
-            ▼
-        Output rendered to terminal
-```
-
-**Max iterations:** 8 by default. Change in `state/temp_db.py`:
-```python
-@dataclass
-class RunState:
-    max_iterations: int = 8   # ← change this
+├── main.py                    Terminal UI — rendering, commands, live status panel
+├── cli.py                      `codi` command entry point
+├── config.py                    Mode, models, providers
+├── config_loader.py               API key resolution (.env / config.json)
+├── context_trimmer.py               Token-budget-aware context trimming
+├── indexer.py                        ChromaDB vector index builder/query
+├── llm_factory.py                     Returns the right LLM for the active mode
+├── logger.py                            Appends JSON events to codi.log
+├── log_viewer.py                          Live telemetry dashboard (/logs)
+├── mcp_client.py                            Standalone MCP client helper
+├── mcp_servers.json                           MCP server configuration
+├── memory.py                                    Per-session history + compression
+├── status_stream.py                               Live status line pub/sub
+├── quantized_embeddings.py                          TurboQuant-compressed embeddings
+├── pyproject.toml / setup.cfg                         Package definition
+└── .env                                                 API keys — never commit
 ```
 
 ---
 
 ## Adding a custom tool
 
-Tools are plain Python functions that take a `dict` and return a `str`. Here's how to add one.
+Tools are plain Python functions: `fn(args: dict) -> str`.
 
-**Step 1 — Write the function:**
-
-Create or edit a file in `tools/local/`:
-
+**1. Write it** in `tools/local/`:
 ```python
 # tools/local/my_tools.py
-
 def count_lines(args: dict) -> str:
     """Count lines in a file."""
     import os
@@ -560,137 +582,53 @@ def count_lines(args: dict) -> str:
     if not os.path.exists(path):
         return f"ERROR: file not found: {path}"
     with open(path) as f:
-        count = sum(1 for _ in f)
-    return f"{count} lines in {path}"
-
+        return f"{sum(1 for _ in f)} lines in {path}"
 
 def register_my_tools(registry):
     registry.register_local("count_lines", count_lines)
 ```
 
-**Step 2 — Register it in the registry loader:**
-
-Edit `tools/registry.py`, inside the `load_all` method:
-
+**2. Register it** in `tools/registry.py`'s `load_all`:
 ```python
-def load_all(self, mode: str = "cloud") -> "ToolRegistry":
-    from tools.local.file_tools   import register_file_tools
-    from tools.local.shell_tools  import register_shell_tools
-    from tools.local.search_tools import register_search_tools
-    from tools.local.my_tools     import register_my_tools   # ← add this
-    from tools.mcp.mcp_tools      import register_mcp_tools
-
-    register_file_tools(self)
-    register_shell_tools(self)
-    register_search_tools(self)
-    register_my_tools(self)                                  # ← add this
-    register_mcp_tools(self, mode=mode)
-    return self
+from tools.local.my_tools import register_my_tools
+# ...
+register_my_tools(self)
 ```
 
-**Step 3 — Restart Codi.** The tool is now available. You can verify with `/tools`.
-
-That's it. The Coder LLM will see the tool name and its docstring and use it when relevant.
+**3. Restart Codi.** Verify with `/tools`. The Coder LLM sees the tool name and docstring automatically — add a signature to `core/prompts.py`'s `_TOOL_SIGNATURES` if you want it to see the exact args schema too.
 
 ---
 
-## Troubleshooting
+## Configuration reference
 
-### `codi: command not found`
+All in `config.py`:
 
-You installed into a virtual environment that isn't active. Run:
+```python
+MODE = "local"              # local | hybrid | cloud | air | llamacpp
+CLOUD_PROVIDER = "groq"     # groq | anthropic | openai | gemini
 
-```bash
-source .venv/bin/activate   # Linux/macOS
-.venv\Scripts\activate      # Windows
+HYBRID_TOKEN_LIMIT = 3500
+HYBRID_REQUIRE_CONFIRM = False
+
+REFINER_MODEL_LOCAL = "phi3:mini"
+CODER_MODEL_LOCAL   = "qwen2.5-coder:7b"
+
+REFINER_MODEL_CLOUD = "llama-3.1-8b-instant"
+CODER_MODEL_CLOUD   = "llama-3.3-70b-versatile"
+
+AIR_LLM_URL = "http://192.168.1.XXX:8080"
+AIR_LLM_TIMEOUT = 180
+
+LLAMACPP_URL = "http://127.0.0.1:8080"
+LLAMACPP_TIMEOUT = 120
+
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_THINK = False   # strip <think> blocks from Qwen3-style reasoning output
 ```
 
-Or reinstall:
-
-```bash
-pip install -e .
-```
-
-### Ollama errors / connection refused
-
-Make sure Ollama is running:
-
-```bash
-ollama serve
-```
-
-And the models are actually pulled:
-
-```bash
-ollama list
-```
-
-If you changed models in `config.py`, make sure to pull them first:
-
-```bash
-ollama pull phi3:mini
-ollama pull qwen2.5-coder:7b
-```
-
-### MCP server fails to connect
-
-Check that `npx` and `uvx` are installed:
-
-```bash
-npx --version
-uvx --version    # install with: pip install uv
-```
-
-Disable a broken server while you debug:
-
-```
-❯ /mcp off <server-name>
-```
-
-Then restart Codi.
-
-### Token limit / context overflow
-
-If you see a warning about tokens, or responses become confused:
-
-```
-❯ /clear
-```
-
-This wipes session memory. Then re-state your task.
-
-For consistently large projects, switch to cloud mode which has a bigger context window:
-
-```
-❯ /mode cloud
-```
-
-### Codi loops without doing anything
-
-This usually means the Coder LLM doesn't support the task well enough. Try switching to a stronger model or cloud mode:
-
-```
-❯ /mode cloud
-```
-
-Or break your request into smaller steps.
-
-### Check the logs
-
-```
-❯ /logs
-```
-
-This opens a live log viewer showing every tool call, LLM decision, and error. Press `Ctrl+C` to exit the viewer.
-
-The raw log file is at `codi.log` in the repo root. Each line is a JSON event.
-
-### Re-index the project
-
-If Codi seems unaware of recent changes to your codebase:
-
-```
-❯ /index
+And in `state/temp_db.py`:
+```python
+max_iterations: int = 8   # hard cap on the execution loop
 ```
 
 ---
@@ -704,512 +642,97 @@ If Codi seems unaware of recent changes to your codebase:
 | `CODI_OPENAI_API_KEY` | OpenAI API key |
 | `CODI_GEMINI_API_KEY` | Gemini API key |
 | `CODI_WORKING_DIR` | Auto-set to the directory you ran `codi` from |
-| `CODI_CHROMA_DIR` | Auto-set to the vector DB path for your project |
+| `CODI_CHROMA_DIR` | Auto-set to the per-project vector DB path |
 | `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub MCP server token |
 | `STITCH_API_KEY` | Google Stitch MCP server key |
 | `BRAVE_API_KEY` | Brave Search MCP server key |
+| `CODI_AUTO_APPROVE_SHELL` | `1` to skip the `run_command_external` permission prompt |
+| `CODI_EXTERNAL_SHELL_TIMEOUT` | Seconds to wait for an external shell command to finish (default 300) |
+| `OLLAMA_BASE_URL` | Override the default `http://localhost:11434` |
+| `OLLAMA_THINK` | `1` to keep Qwen3-style `<think>` reasoning in raw output |
+| `CODI_CALLER_DEBUG` | `1` to include caller file/line metadata in every log entry |
 
-All of these can be set in `.env` in the repo root or as shell environment variables.
+All can be set in `.env` (repo root) or as shell environment variables.
+
+---
+
+## Troubleshooting
+
+### `codi: command not found`
+Your virtual environment isn't active:
+```bash
+source .venv/bin/activate      # Linux/macOS
+.venv\Scripts\activate         # Windows
+```
+Or reinstall: `pip install -e .`
+
+### Ollama errors / connection refused
+```bash
+ollama serve
+ollama list       # confirm your configured models are actually pulled
+ollama pull phi3:mini
+ollama pull qwen2.5-coder:7b
+```
+
+### MCP tool calls fail immediately (`StructuredTool does not support sync invocation`)
+Fixed as of the persistent-session update to `mcp_manager.py` / `tools/mcp/mcp_tools.py`. If you still see this, confirm you're on the latest version of both files — the root cause was MCP sessions being closed the instant `load_all()` returned, before any tool could actually be called.
+
+### MCP server fails to connect
+```bash
+npx --version
+uvx --version    # install with: pip install uv
+```
+Disable the broken server while debugging: `/mcp off <server-name>`, then restart.
+
+### `run_command_external` doesn't open a window
+- **Windows**: confirm `powershell` is on `PATH`.
+- **macOS**: confirm Terminal.app is installed (default) — Codi calls `open -a Terminal`.
+- **Linux**: install one of `gnome-terminal`, `konsole`, or `xterm`. Without any of these, Codi silently falls back to running the command hidden, still logging output to the same temp file.
+
+### Token limit / context overflow
+```
+❯ /clear
+```
+For large projects, cloud mode has a bigger context window: `/mode cloud`.
+
+### Codi loops without doing anything
+Usually means the Coder LLM isn't strong enough for the task. Try `/mode cloud`, a bigger local model, or break the request into smaller steps.
+
+### Check the logs
+```
+❯ /logs
+```
+Live dashboard of every tool call, LLM decision, and error (`Ctrl+C` to exit). Raw JSON-lines file: `codi.log` in the repo root.
+
+### Re-index the project
+```
+❯ /index
+```
 
 ---
 
 ## Tips for best results
 
-**Be specific about files and frameworks.** Codi respects your choices — if you say FastAPI, it will use FastAPI, not Flask.
+- **Be specific about files and frameworks.** Codi respects explicit choices — say FastAPI, get FastAPI, not Flask (enforced by the framework-lock/contamination checker).
+- **Reference line numbers or function/class names explicitly** when you want a surgical edit (*"replace lines 40-55"*, *"delete the old_helper function"*) — this routes to the precise line-range strategy instead of a broader text-match attempt.
+- **For multi-file tasks**, break them into focused requests. One clear ask per session beats one massive one.
+- **Use `/clear` liberally** — session memory has limits; a long session producing degraded output usually just needs a fresh start.
+- **Local mode is great for focused tasks** (write a function, fix a bug, read a file). For complex multi-step reasoning, cloud mode is more reliable.
+- **Check `/tools` after startup** to confirm all MCP servers loaded — a failed server simply won't appear in the list.
+- **`run_command_external` for anything you want to watch live** — dev servers, installers, long builds. `run_command` for everything else.
 
-**For multi-file tasks**, break them into steps. One clear request per session works better than one massive request.
+---
 
-**Use `/clear` liberally.** Session memory has limits. If a long session is producing degraded output, clear and restate.
+## Contributing
 
-**Local mode works best for focused tasks** — write a function, fix a bug, read a file. For complex multi-step reasoning, cloud mode is more reliable.
+1. Fork the repo and create a feature branch.
+2. Keep new tools as plain `fn(args: dict) -> str` callables in `tools/local/` — no LangChain binding required.
+3. Run `/tools` and `/logs` locally to confirm your change registers and behaves as expected before opening a PR.
+4. Match the existing JSON result shape (`{"success": bool, ...}`) for any new file/shell tool so the Validator's deterministic checks keep working without modification.
+5. Open a PR with a clear description of the behavior change and, where relevant, a before/after `/logs` snippet.
 
-**Check `/tools` after startup** to confirm all your MCP servers loaded. If a server failed, it will be absent from the list.
+---
 
+## License
 
-
-
-
-);
-    --glow-purple: rgba(168,85,247,0.2);
-  }
-
-  html, body {
-    height: 100%;
-    overflow: hidden;
-    font-family: 'Inter', system-ui, sans-serif;
-    background: var(--bg-dark);
-    color: var(--text-primary);
-  }
-
-  /* ── Hex canvas background ── */
-  #hex-bg {
-    position: fixed;
-    inset: 0;
-    z-index: 0;
-    pointer-events: none;
-  }
-
-  /* ── Layout ── */
-  #app {
-    position: relative;
-    z-index: 1;
-    height: 100dvh;
-    display: flex;
-    flex-direction: column;
-  }
-
-  /* ── Chat history ── */
-  #messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 24px 16px 8px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    scrollbar-width: thin;
-    scrollbar-color: rgba(255,255,255,0.1) transparent;
-  }
-  #messages::-webkit-scrollbar { width: 4px; }
-  #messages::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
-
-  /* ── Empty state ── */
-  #empty-state {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    pointer-events: none;
-    user-select: none;
-  }
-  #empty-state .logo-ring {
-    width: 56px; height: 56px;
-    border-radius: 50%;
-    border: 1.5px solid rgba(168,85,247,0.5);
-    box-shadow: 0 0 24px var(--glow-purple), inset 0 0 16px rgba(168,85,247,0.1);
-    display: flex; align-items: center; justify-content: center;
-  }
-  #empty-state .logo-ring svg { opacity: 0.7; }
-  #empty-state p {
-    font-size: 13px;
-    color: var(--text-muted);
-    letter-spacing: 0.03em;
-  }
-
-  /* ── Message bubbles ── */
-  .msg {
-    display: flex;
-    gap: 10px;
-    max-width: 720px;
-    width: 100%;
-    align-self: center;
-    animation: fadeUp 0.25s ease both;
-  }
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(10px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
-  .msg.user { flex-direction: row-reverse; align-self: flex-end; max-width: 80%; }
-
-  .bubble {
-    padding: 11px 15px;
-    border-radius: 14px;
-    font-size: 14px;
-    line-height: 1.65;
-    letter-spacing: 0.01em;
-  }
-  .msg.user .bubble {
-    background: linear-gradient(135deg, rgba(79,163,224,0.22), rgba(168,85,247,0.22));
-    border: 1px solid rgba(168,85,247,0.25);
-    color: var(--text-primary);
-    border-bottom-right-radius: 4px;
-  }
-  .msg.assistant .bubble {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    color: var(--text-primary);
-    border-bottom-left-radius: 4px;
-  }
-
-  .avatar {
-    width: 28px; height: 28px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 11px; font-weight: 500;
-    margin-top: 2px;
-  }
-  .msg.user .avatar {
-    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-    color: #fff;
-  }
-  .msg.assistant .avatar {
-    background: linear-gradient(135deg, var(--accent-purple), var(--accent-pink));
-    color: #fff;
-    box-shadow: 0 0 10px var(--glow-purple);
-  }
-
-  /* Typing indicator */
-  .typing-dots span {
-    display: inline-block;
-    width: 5px; height: 5px;
-    border-radius: 50%;
-    background: var(--accent-purple);
-    margin: 0 2px;
-    animation: blink 1.1s infinite both;
-  }
-  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
-  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes blink {
-    0%,80%,100% { opacity: 0.2; transform: scale(0.8); }
-    40% { opacity: 1; transform: scale(1); }
-  }
-
-  /* ── Bottom input bar ── */
-  #input-area {
-    padding: 12px 16px 20px;
-    display: flex;
-    justify-content: center;
-  }
-
-  #input-wrap {
-    width: 100%;
-    max-width: 720px;
-    display: flex;
-    align-items: flex-end;
-    gap: 0;
-    background: rgba(12, 15, 28, 0.75);
-    backdrop-filter: blur(18px) saturate(1.4);
-    -webkit-backdrop-filter: blur(18px) saturate(1.4);
-    border: 1px solid rgba(168,85,247,0.25);
-    border-radius: 22px;
-    padding: 10px 10px 10px 18px;
-    box-shadow:
-      0 0 0 1px rgba(79,163,224,0.08),
-      0 8px 32px rgba(0,0,0,0.5),
-      0 0 40px rgba(168,85,247,0.08);
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
-  #input-wrap:focus-within {
-    border-color: rgba(168,85,247,0.5);
-    box-shadow:
-      0 0 0 1px rgba(79,163,224,0.15),
-      0 8px 32px rgba(0,0,0,0.5),
-      0 0 50px rgba(168,85,247,0.18);
-  }
-
-  #prompt-input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    resize: none;
-    color: var(--text-primary);
-    font-family: inherit;
-    font-size: 14px;
-    line-height: 1.6;
-    max-height: 160px;
-    min-height: 24px;
-    overflow-y: auto;
-    scrollbar-width: none;
-    caret-color: var(--accent-purple);
-  }
-  #prompt-input::placeholder { color: var(--text-muted); }
-  #prompt-input::-webkit-scrollbar { display: none; }
-
-  #send-btn {
-    flex-shrink: 0;
-    width: 36px; height: 36px;
-    border-radius: 50%;
-    border: none;
-    cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
-    box-shadow: 0 0 14px var(--glow-purple);
-    transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
-    color: #fff;
-  }
-  #send-btn:hover { transform: scale(1.08); box-shadow: 0 0 22px var(--glow-purple); }
-  #send-btn:active { transform: scale(0.95); }
-  #send-btn:disabled { opacity: 0.35; cursor: default; transform: none; }
-
-  /* ── Scrollbar on messages ── */
-  .msg.assistant .bubble pre {
-    background: rgba(0,0,0,0.3);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-size: 12.5px;
-    overflow-x: auto;
-    margin-top: 8px;
-  }
-</style>
-</head>
-<body>
-
-<canvas id="hex-bg"></canvas>
-
-<div id="app">
-  <div id="messages">
-    <div id="empty-state">
-      <div class="logo-ring">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-          <path d="M12 3L20 7.5V16.5L12 21L4 16.5V7.5L12 3Z" stroke="url(#g)" stroke-width="1.5" fill="none"/>
-          <defs>
-            <linearGradient id="g" x1="4" y1="3" x2="20" y2="21" gradientUnits="userSpaceOnUse">
-              <stop stop-color="#4fa3e0"/><stop offset="1" stop-color="#a855f7"/>
-            </linearGradient>
-          </defs>
-        </svg>
-      </div>
-      <p>Ask me anything</p>
-    </div>
-  </div>
-
-  <div id="input-area">
-    <div id="input-wrap">
-      <textarea id="prompt-input" rows="1" placeholder="Ask me anything…"></textarea>
-      <button id="send-btn" title="Send">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-          <path d="M22 2L11 13" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-      </button>
-    </div>
-  </div>
-</div>
-
-<script>
-/* ─── Hex canvas background ─── */
-(function () {
-  const canvas = document.getElementById('hex-bg');
-  const ctx = canvas.getContext('2d');
-
-  const HEX_SIZE = 14;
-  const GAP = 1.5;
-  const STEP_X = HEX_SIZE * Math.sqrt(3) + GAP;
-  const STEP_Y = HEX_SIZE * 1.5 + GAP * 0.866;
-
-  function resize() {
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight;
-    drawHexGrid();
-  }
-
-  function hexPath(cx, cy, r) {
-    ctx.beginPath();
-    for (let i = 0; i < 6; i++) {
-      const angle = (Math.PI / 3) * i - Math.PI / 6;
-      const x = cx + r * Math.cos(angle);
-      const y = cy + r * Math.sin(angle);
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-  }
-
-  function getColor(nx, ny) {
-    // Normalised coords 0–1
-    const cx = 0.55, cy = 0.72;   // center of glow — lower right of center
-    const dx = nx - cx, dy = ny - cy;
-    const dist = Math.sqrt(dx*dx + dy*dy);
-
-    // Two-color blobs: blue (left) and pink/purple (right)
-    const blueCx = 0.35, blueCy = 0.75;
-    const pinkCx = 0.65, pinkCy = 0.70;
-    const dBlue = Math.sqrt((nx-blueCx)**2 + (ny-blueCy)**2);
-    const dPink = Math.sqrt((nx-pinkCx)**2 + (ny-pinkCy)**2);
-
-    const blueI = Math.max(0, 1 - dBlue / 0.38);
-    const pinkI = Math.max(0, 1 - dPink / 0.30);
-
-    const totalI = Math.max(blueI, pinkI);
-    if (totalI < 0.01) return null; // pure black → skip stroke
-
-    const t = pinkI / (blueI + pinkI + 0.001);
-
-    const r = Math.round(lerp(40,  232, t));
-    const g = Math.round(lerp(130, 80,  t));
-    const b = Math.round(lerp(220, 180, t));
-    const a = Math.min(1, totalI * 1.2);
-
-    return `rgba(${r},${g},${b},${a})`;
-  }
-
-  function lerp(a, b, t) { return a + (b - a) * t; }
-
-  function drawHexGrid() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const cols = Math.ceil(canvas.width  / STEP_X) + 2;
-    const rows = Math.ceil(canvas.height / STEP_Y) + 2;
-
-    for (let row = -1; row < rows; row++) {
-      for (let col = -1; col < cols; col++) {
-        const offset = (row % 2 === 0) ? 0 : STEP_X / 2;
-        const cx = col * STEP_X + offset;
-        const cy = row * STEP_Y;
-
-        const nx = cx / canvas.width;
-        const ny = cy / canvas.height;
-        const color = getColor(nx, ny);
-
-        hexPath(cx, cy, HEX_SIZE - GAP);
-
-        if (color) {
-          ctx.fillStyle = color.replace('rgba', 'rgba').replace(/[\d.]+\)$/, v => {
-            return String(Math.min(parseFloat(v)*0.35, 0.35)) + ')';
-          });
-          ctx.fill();
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 0.8;
-          ctx.stroke();
-        } else {
-          ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-          ctx.lineWidth = 0.5;
-          ctx.stroke();
-        }
-      }
-    }
-  }
-
-  window.addEventListener('resize', resize);
-  resize();
-})();
-
-/* ─── Chat logic ─── */
-const messagesEl = document.getElementById('messages');
-const emptyEl    = document.getElementById('empty-state');
-const inputEl    = document.getElementById('prompt-input');
-const sendBtn    = document.getElementById('send-btn');
-
-// ── Change this URL to point at your local LLM endpoint ──
-const LLM_URL = 'http://localhost:11434/api/generate';  // Ollama default
-const LLM_MODEL = 'llama3';                             // or whatever model you run
-
-let history = [];
-let busy = false;
-
-function autoResize() {
-  inputEl.style.height = 'auto';
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + 'px';
-}
-
-inputEl.addEventListener('input', autoResize);
-
-inputEl.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    send();
-  }
-});
-
-sendBtn.addEventListener('click', send);
-
-function addMessage(role, text) {
-  if (emptyEl) emptyEl.remove();
-
-  const msg = document.createElement('div');
-  msg.className = `msg ${role}`;
-
-  const avatar = document.createElement('div');
-  avatar.className = 'avatar';
-  avatar.textContent = role === 'user' ? 'U' : 'AI';
-
-  const bubble = document.createElement('div');
-  bubble.className = 'bubble';
-  bubble.textContent = text;
-
-  msg.appendChild(avatar);
-  msg.appendChild(bubble);
-  messagesEl.appendChild(msg);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-  return bubble;
-}
-
-function addTyping() {
-  if (emptyEl) emptyEl.remove();
-
-  const msg = document.createElement('div');
-  msg.className = 'msg assistant';
-  msg.id = 'typing-msg';
-
-  const avatar = document.createElement('div');
-  avatar.className = 'avatar';
-  avatar.textContent = 'AI';
-
-  const bubble = document.createElement('div');
-  bubble.className = 'bubble';
-  bubble.innerHTML = '<span class="typing-dots"><span></span><span></span><span></span></span>';
-
-  msg.appendChild(avatar);
-  msg.appendChild(bubble);
-  messagesEl.appendChild(msg);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-  return { msg, bubble };
-}
-
-async function send() {
-  const prompt = inputEl.value.trim();
-  if (!prompt || busy) return;
-
-  busy = true;
-  sendBtn.disabled = true;
-  inputEl.value = '';
-  autoResize();
-
-  addMessage('user', prompt);
-  history.push({ role: 'user', content: prompt });
-
-  const { msg: typingMsg, bubble: typingBubble } = addTyping();
-
-  try {
-    const res = await fetch(LLM_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: LLM_MODEL,
-        prompt: history.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n') + '\nAssistant:',
-        stream: true
-      })
-    });
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    // Replace typing indicator with streaming bubble
-    typingBubble.innerHTML = '';
-    const avatar = typingMsg.querySelector('.avatar');
-    let fullText = '';
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const lines = decoder.decode(value, { stream: true }).split('\n').filter(Boolean);
-      for (const line of lines) {
-        try {
-          const json = JSON.parse(line);
-          if (json.response) {
-            fullText += json.response;
-            typingBubble.textContent = fullText;
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-          }
-          if (json.done) break;
-        } catch {}
-      }
-    }
-
-    history.push({ role: 'assistant', content: fullText });
-
-  } catch (err) {
-    typingBubble.style.color = '#e879a0';
-    typingBubble.textContent = `⚠ Could not reach LLM: ${err.message}`;
-  }
-
-  busy = false;
-  sendBtn.disabled = false;
-  inputEl.focus();
-}
-</script>
-</body>
-</html>
+MIT Licencse

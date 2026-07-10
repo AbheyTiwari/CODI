@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -19,6 +20,14 @@ DANGEROUS_PATTERNS = [
     "DROP TABLE", "DELETE FROM", ":(){:|:&};:",
 ]
 
+# Commands that install/uninstall packages into a Python venv. Used to detect
+# the "CODI is trying to modify its own running venv" deadlock below.
+_PACKAGE_MANAGER_PATTERNS = (
+    "pip install", "pip uninstall", "pip3 install", "pip3 uninstall",
+    "uv pip", "uv sync", "uv add", "uv remove",
+    "poetry install", "poetry add", "poetry remove",
+)
+
 # Set CODI_AUTO_APPROVE_SHELL=1 to skip the interactive permission prompt
 # (e.g. for CI or fully unattended runs). Default is to always ask.
 _AUTO_APPROVE_EXTERNAL_SHELL = os.environ.get("CODI_AUTO_APPROVE_SHELL", "0").lower() in ("1", "true", "yes")
@@ -28,6 +37,54 @@ _EXTERNAL_SHELL_TIMEOUT_SECONDS = int(os.environ.get("CODI_EXTERNAL_SHELL_TIMEOU
 
 def _working_dir() -> str:
     return os.environ.get("CODI_WORKING_DIR", os.getcwd())
+
+
+def _targets_own_running_venv(command: str) -> bool:
+    """
+    True if this command is a pip/uv/poetry install-or-uninstall that would
+    modify the EXACT Python venv CODI itself is currently running in.
+
+    Windows (and similarly macOS/Linux) locks loaded .pyd/.dll/.so files
+    against deletion or replacement while any process — including CODI's
+    own process — has them mapped into memory. No amount of retrying,
+    wrapping in a different shell, or opening a new terminal window fixes
+    this: the lock is held by CODI itself, not by whatever shell is trying
+    to run the install command. The only real fix is to exit CODI first.
+    Detecting this up front turns 3+ wasted correction cycles (each
+    guessing "close your IDE" style fixes that don't apply) into one
+    clear, honest message.
+    """
+    lowered = (command or "").lower()
+    if not any(pattern in lowered for pattern in _PACKAGE_MANAGER_PATTERNS):
+        return False
+
+    try:
+        own_venv = os.path.normcase(os.path.abspath(sys.prefix))
+    except Exception:
+        return False
+
+    working_dir = os.path.normcase(os.path.abspath(_working_dir()))
+
+    # Common case: CODI's working directory sits inside (or matches) CODI's
+    # own venv root — e.g. D:\CODI\test\... resolving requirements against
+    # D:\CODI\.venv, as in the reported bug.
+    return own_venv in lowered or own_venv.startswith(working_dir) or working_dir.startswith(own_venv)
+
+
+def _own_venv_lock_error(command: str, tool_name: str) -> str:
+    return json.dumps({
+        "success": False,
+        "tool": tool_name,
+        "error": (
+            "This command would modify the Python venv CODI itself is currently "
+            f"running in ({sys.prefix}). Windows (and similarly macOS/Linux) locks "
+            "loaded .pyd/.dll/.so files while any process holds them open — this "
+            "will fail every time while CODI is running, no matter how many times "
+            "it's retried or which shell runs it. Exit CODI first (/quit), then run "
+            "this command yourself, or point it at a different virtual environment."
+        ),
+        "command": command,
+    })
 
 
 def run_command(args: dict) -> str:
@@ -40,6 +97,10 @@ def run_command(args: dict) -> str:
         if pattern.lower() in command.lower():
             log("tool_call", {"tool": "run_command", "status": "BLOCKED", "input": command})
             return f"BLOCKED: dangerous pattern '{pattern}'"
+
+    if _targets_own_running_venv(command):
+        log("tool_call", {"tool": "run_command", "status": "BLOCKED_OWN_VENV", "input": command})
+        return _own_venv_lock_error(command, "run_command")
 
     log("tool_call", {"tool": "run_command", "input": command})
     try:
@@ -113,6 +174,10 @@ def run_command_external(args: dict) -> str:
         if pattern.lower() in command.lower():
             log("tool_call", {"tool": "run_command_external", "status": "BLOCKED", "input": command})
             return f"BLOCKED: dangerous pattern '{pattern}'"
+
+    if _targets_own_running_venv(command):
+        log("tool_call", {"tool": "run_command_external", "status": "BLOCKED_OWN_VENV", "input": command})
+        return _own_venv_lock_error(command, "run_command_external")
 
     if not _ask_permission(command):
         return json.dumps({
