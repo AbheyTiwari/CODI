@@ -3,6 +3,7 @@ Name: codi
 Version: 1.2.0
 Summary: Codi — offline-first AI coding agent
 Requires-Python: >=3.10
+License-File: LICENSE
 Requires-Dist: langchain
 Requires-Dist: langchain-core
 Requires-Dist: langchain-community
@@ -23,3 +24,4 @@ Requires-Dist: prompt_toolkit
 Requires-Dist: python-dotenv
 Requires-Dist: requests
 Requires-Dist: pydantic
+Dynamic: license-file
