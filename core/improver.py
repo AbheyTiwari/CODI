@@ -26,7 +26,6 @@ from tools.registry import ToolRegistry
 
 
 # ── Orchestrator system message ───────────────────────────────────────────────
-# Lightweight — rules for the orchestrator role only, not tool-calling rules.
 _ORCHESTRATOR_SYSTEM = """\
 You are the Improver — the orchestrator of a coding agent called Codi.
 You plan, coordinate, and decide. You never call tools yourself.
@@ -75,6 +74,10 @@ Produce an execution plan. Respond ONLY with JSON — no fences, no prose:
 
 Rules:
 - Maximum 5 steps. Each step is a plain string — NOT an object.
+- ONLY reference files that actually appear in the codebase context above.
+  Do NOT invent a filename that is a typo or guess (e.g. do not write
+  "scripts.js" if the context shows "script.js") — copy the exact filename
+  as it appears in the context.
 - If task mentions [BOILERPLATE CREATED: file1, file2], those files exist.
   Plan EDIT steps only — do NOT plan to create them again.
 - For simple single-file tasks, ONE step is enough.
@@ -153,43 +156,12 @@ def _extract_file_refs(text: str) -> list[str]:
     pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|svg))"
     return _unique([m.group(1).strip("'\"` ") for m in re.finditer(pattern, text or "")])
 
-_NEGATION_TRIGGERS = (
-    "no framework", "no frameworks", "without a framework", "without frameworks",
-    "not use", "don't use", "do not use", "excluding", "except for", "except",
-    "never use", "forbidden", "avoid using", "avoid",
-)
-
-
-def _strip_negated_clauses(text: str) -> str:
-    """
-    Truncate the task text at the first negation trigger, so anything named
-    inside a 'no X, Y, Z' / 'without X' / 'excluding X' clause is excluded
-    from framework/keyword detection entirely.
-
-    This is deliberately blunt: it cuts the rest of the sentence off rather
-    than trying to parse clause boundaries. A forbidden-frameworks list is
-    almost always the LAST thing named in a requirements sentence, so this
-    works for the common case without needing real NLP. If it ever proves too
-    aggressive (cutting off something needed after the negation), that's a
-    sign this needs real clause-boundary detection instead of truncation —
-    don't patch around it with more special-casing.
-    """
-    lowered = text.lower()
-    cut_positions = [
-        lowered.find(trigger)
-        for trigger in _NEGATION_TRIGGERS
-        if trigger in lowered
-    ]
-    if not cut_positions:
-        return text
-    return text[: min(cut_positions)]
 
 def _deterministic_requirements(task: str) -> TaskRequirements:
-    positive_text = _strip_negated_clauses(task or "")
-    lowered = positive_text.lower()
+    lowered = (task or "").lower()
     framework = None
     for candidate in ("fastapi", "flask", "django", "react"):
-        if re.search(rf"\b{re.escape(candidate)}\b", lowered):
+        if candidate in lowered:
             framework = candidate
             break
     if not framework and any(term in lowered for term in ("vanilla js", "plain html", "no framework")):
@@ -203,26 +175,30 @@ def _deterministic_requirements(task: str) -> TaskRequirements:
     return reqs
 
 
-def _derive_package(task: str, requirements: TaskRequirements) -> str | None:
-    lowered = (task or "").lower()
-    if "java" not in lowered and "package" not in lowered:
-        return None
-    if requirements.framework == "react":
-        return "com.example"
-    if "java" in lowered:
-        return "com.example.library"
-    return None
-
-
 def _files_from_tool_results(state: RunState) -> list[str]:
+    """
+    Extract the list of files that were actually, successfully modified.
+
+    CRITICAL FIX: this previously iterated ALL tool_results regardless of
+    status, so a failed edit_file call (e.g. "ERROR editing scripts.js:
+    file does not exist") still had its path text-matched by
+    _extract_file_refs and reported to the user as "Changed" — even though
+    nothing was written. The summary must only ever reflect real,
+    successful writes.
+    """
     files = []
     for result in state.tool_results:
         if result.tool not in ("create_file", "write_file", "edit_file"):
             continue
+        if result.status != "ok":
+            continue  # <-- the fix: skip failed attempts entirely
+
         output = result.output or ""
         if output.strip().startswith("{"):
             try:
                 payload = json.loads(output)
+                if payload.get("success") is False:
+                    continue
                 path = payload.get("file_modified") or payload.get("path")
                 if path:
                     files.append(str(path))
@@ -289,15 +265,14 @@ class Improver:
             status = r["status"]
             output = r["output"]
             output_len = len(output)
-            
-            # Log each tool call
+
             log("context_gathered_tool", {
                 "tool": tool_name,
                 "status": status,
                 "output_len": output_len,
                 "output_sample": trim_tool_output(output, max_tokens=10) if status == "ok" else output[:150],
             })
-            
+
             if status == "ok":
                 should_add_context = True
                 if tool_name == "read_file":
@@ -316,8 +291,7 @@ class Improver:
                     context_parts.append(f"[{tool_name}]\n{wrapped_output}")
                     total_context_chars += len(wrapped_output)
             state.add_tool_result(tool_name, status, output)
-        
-        # Log final context summary
+
         log("context_gathered", {
             "files_inspected": len(files_inspected),
             "total_context_chars": total_context_chars,
@@ -330,78 +304,15 @@ class Improver:
     # ── Phase 2: Create plan ──────────────────────────────────────────────────
 
     def _extract_requirements(self, state: RunState):
-        """
-        Extract structured requirements without an LLM round trip.
-        The planner still sees the full task, so this only anchors obvious
-        framework and file constraints for validators/executors.
-        """
         state.requirements = _deterministic_requirements(state.user_input)
-        # Infer framework from existing files in the workspace/tool results.
-        if not state.requirements.framework:
-            # Detect from seen files
-            files_seen = _files_from_tool_results(state)
-            for f in files_seen:
-                if f.lower().endswith((".jsx", ".tsx")):
-                    state.requirements.framework = "react"
-                    state.requirements.must_not.extend(state.requirements.framework_lock())
-                    log("improver_framework_inferred", {"inferred": "react", "source_files": files_seen[:5]})
-                    break
-            # Also detect from package.json in working dir
-            if not state.requirements.framework:
-                working_dir = os.environ.get("CODI_WORKING_DIR") or os.getcwd()
-                pkg_path = os.path.join(working_dir, "package.json")
-                try:
-                    if os.path.exists(pkg_path):
-                        with open(pkg_path, "r", encoding="utf-8", errors="replace") as fh:
-                            pkg = json.load(fh)
-                        deps = {}
-                        for k in ("dependencies", "devDependencies", "peerDependencies"):
-                            if isinstance(pkg.get(k), dict):
-                                deps.update(pkg.get(k))
-                        if any(n.lower().startswith("react") or n.lower().startswith("react-dom") for n in deps.keys()):
-                            state.requirements.framework = "react"
-                            state.requirements.must_not.extend(state.requirements.framework_lock())
-                            log("improver_framework_inferred", {"inferred": "react", "source": "package.json"})
-                except Exception:
-                    pass
-        package_name = _derive_package(state.user_input, state.requirements)
-        state.project_manifest = {"package": package_name, "files_created": {}}
         log("improver_requirements", {
             "source": "deterministic",
             "requirements": state.requirements.to_dict(),
-            "project_manifest": state.project_manifest,
         })
 
-    def _plan_contamination_check(self, state: RunState) -> list[str]:
-        """
-        Scan the generated plan steps (not yet executed) for forbidden
-        framework mentions. Returns a list of offending step strings.
-        Runs immediately after create_plan(), before the plan is written
-        to plan.md or shown to the user.
-        """
-        forbidden = state.requirements.framework_lock()
-        if not forbidden:
-            return []
-
-        offending = []
-        for step in state.plan_steps:
-            lowered_step = step.lower()
-            for pattern in forbidden:
-                if pattern.lower() in lowered_step:
-                    offending.append(step)
-                    break
-        return offending
-    
     def create_plan(self, state: RunState, context: str) -> dict:
-        """
-        Extract requirements first, then ask the LLM to produce a plan.
-        Requirements are injected into the plan prompt so every step
-        is grounded against them from the start.
-        Falls back gracefully if the LLM outputs plain text instead of JSON.
-        """
         from dispatcher import Dispatcher
 
-        # Extract requirements before planning — they anchor every subsequent step
         self._extract_requirements(state)
 
         prompt = _PLAN_PROMPT.format(
@@ -411,8 +322,6 @@ class Improver:
             context=wrap_prompt_data(context[:1200]),
         )
 
-        # Use planner_system_prompt (from prompts.py) for this call —
-        # it has tighter JSON-only constraints than the orchestrator system.
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
         state.record_llm("improver_plan_raw", raw)
 
@@ -432,48 +341,27 @@ class Improver:
                 "plan": trim_tool_output(state.plan, max_tokens=20),
                 "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
             })
-        else:
-            # Fallback: LLM output wasn't JSON — extract non-empty lines as steps
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            # Strip markdown fences and leading numbers/bullets
-            steps = []
-            for line in lines:
-                line = line.lstrip("```").strip()
-                if line.lower().startswith(("json", "{")):
-                    continue
-                line = line.lstrip("0123456789.-) ").strip()
-                if line:
-                    steps.append(line)
-            state.plan       = raw[:200]
-            state.plan_steps = steps[:500]  # cap to avoid runaway memory usage
+            return parsed
 
-            log("plan_created", {
-                "plan_source": "fallback",
-                "steps": len(state.plan_steps),
-                "plan": trim_tool_output(state.plan, max_tokens=20),
-                "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
-                "raw_sample": trim_tool_output(raw, max_tokens=30),
-            })
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        steps = []
+        for line in lines:
+            line = line.lstrip("```").strip()
+            if line.lower().startswith(("json", "{")):
+                continue
+            line = line.lstrip("0123456789.-) ").strip()
+            if line:
+                steps.append(line)
+        state.plan       = raw[:200]
+        state.plan_steps = steps[:5]
 
-        # Contamination check now runs on EVERY path — this was previously
-        # only reachable via the fallback branch, which meant it almost
-        # never ran, since the JSON-success branch returned before it.
-        offending_steps = self._plan_contamination_check(state)
-        if offending_steps:
-            log("plan_contamination_detected", {
-                "offending_steps": offending_steps,
-                "framework": state.requirements.framework,
-            })
-            state.plan_steps = [
-                s for s in state.plan_steps if s not in offending_steps
-            ]
-            state.plan_steps.insert(
-                0,
-                f"Do NOT use any forbidden framework/library. "
-                f"Task is locked to {state.requirements.framework}. Rewrite the "
-                f"offending step(s) using {state.requirements.framework} only.",
-            )
-
+        log("plan_created", {
+            "plan_source": "fallback",
+            "steps": len(state.plan_steps),
+            "plan": trim_tool_output(state.plan, max_tokens=20),
+            "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
+            "raw_sample": trim_tool_output(raw, max_tokens=30),
+        })
         return {"plan": state.plan, "steps": state.plan_steps}
 
     # ── Phase 3: Decide next step ─────────────────────────────────────────────
@@ -485,37 +373,26 @@ class Improver:
         done_count = max(0, state.iteration - 1)
 
         if state.plan_steps and "[CORRECTION]" not in (state.plan or ""):
-            remaining = [s for s in state.plan_steps if s not in state.completed_steps]
-
-            if not remaining:
+            index = state.iteration - 1
+            if 0 <= index < len(state.plan_steps):
+                selected_step = state.plan_steps[index]
                 log("step_selected", {
-                    "step": "",
+                    "step": trim_tool_output(selected_step, max_tokens=20),
                     "matched_plan": True,
                     "iteration": state.iteration,
-                    "done": True,
-                    "plan_steps_remaining": 0,
-                    "source": "plan_index_exhausted",
+                    "done": False,
+                    "plan_steps_remaining": max(0, len(state.plan_steps) - done_count),
+                    "source": "plan_index",
                 })
-                return {"step": "", "done": True}
-
-            selected_step = remaining[0]
-            log("step_selected", {
-                "step": trim_tool_output(selected_step, max_tokens=20),
-                "matched_plan": True,
-                "iteration": state.iteration,
-                "done": False,
-                "plan_steps_remaining": len(remaining),
-                "source": "plan_index",
-            })
-            return {"step": selected_step, "done": False}
+                return {"step": selected_step, "done": False}
 
         prompt = _NEXT_STEP_PROMPT.format(
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
             plan=state.plan,
             plan_steps="\n".join(state.plan_steps) if state.plan_steps else "(no steps)",
-            done_steps="\n".join(state.completed_steps) if state.completed_steps else "(none yet)",
-            tool_results=wrap_prompt_data(trim_tool_output(state.context_snapshot(max_recent=3), max_tokens=900)),
+            done_steps=f"{done_count} of {len(state.plan_steps)}",
+            tool_results=wrap_prompt_data("\n".join(state.recent_tool_outputs(5))),
         )
         raw = self._call(prompt)
         state.record_llm("improver_next_step", raw)
@@ -524,20 +401,18 @@ class Improver:
         selected_step = None
         matched_plan = False
         done = False
-        
+
         if isinstance(parsed, dict):
             selected_step = _as_text(parsed.get("step", ""))
             done = bool(parsed.get("done", False))
         elif parsed:
             selected_step = _as_text(parsed)
         else:
-            # Total parse failure — return raw text as the step, keep going
             selected_step = _as_text(raw)[:300]
-        
-        # Check if selected step exactly matches a plan step
+
         if selected_step and state.plan_steps:
             matched_plan = any(selected_step.strip() == ps.strip() for ps in state.plan_steps)
-        
+
         log("step_selected", {
             "step": trim_tool_output(selected_step, max_tokens=20),
             "matched_plan": matched_plan,
@@ -545,26 +420,17 @@ class Improver:
             "done": done,
             "plan_steps_remaining": max(0, len([s for s in state.plan_steps if s]) - done_count),
         })
-        
+
         return {"step": selected_step, "done": done}
 
     # ── Phase 4: Generate correction after validation failure ─────────────────
 
     def improve(self, state: RunState) -> str:
-        """
-        Called when validation fails.
-        Returns a correction string injected into the plan for the next Coder call.
-
-        KEY CHANGE: the correction is adaptive — it names the SPECIFIC failure
-        (e.g. "Flask detected") and gives explicit DELETE + REPLACE instructions.
-        Vague corrections like "use FastAPI instead" caused the infinite retry loop.
-        """
         from dispatcher import Dispatcher
         notes = state.validation_notes or "unknown failure"
         reqs  = state.requirements
         forbidden = reqs.framework_lock()
 
-        # Build an adaptive, specific correction based on what failed
         lines = [
             f"PREVIOUS ATTEMPT FAILED. Reason: {notes}",
             "",
@@ -573,7 +439,6 @@ class Improver:
             "",
         ]
 
-        # If it is a framework contamination failure, be brutally explicit
         if forbidden and any(p.lower() in notes.lower() for p in forbidden):
             lines += [
                 "CRITICAL: You used a forbidden framework.",
@@ -582,6 +447,14 @@ class Improver:
                 f"  2. Rewrite the ENTIRE file using {reqs.framework} ONLY.",
                 "  3. Do NOT import anything from the forbidden frameworks.",
                 f"Any output still containing forbidden imports is automatic failure.",
+            ]
+
+        if "does not exist" in notes.lower():
+            lines += [
+                "CRITICAL: The referenced file does not exist. Do NOT keep",
+                "retrying the same filename. Either it was typo'd — check the",
+                "codebase context for the exact real filename — or it genuinely",
+                "needs to be created first with write_file/create_file.",
             ]
 
         lines += [
@@ -606,7 +479,6 @@ class Improver:
         elif parsed:
             correction = _as_text(parsed)
         else:
-            # Fallback: construct correction directly — don't rely on LLM if it's struggling
             correction = f"FAILED: {notes}. Fix required: {reqs.as_prompt_block()}"
 
         log("improver_correction", {"correction": correction[:200]})
@@ -623,24 +495,12 @@ class Improver:
         successes = len([r for r in state.tool_results if r.status == "ok"])
         failures = len([r for r in state.tool_results if r.status == "error"])
 
-        # Special case: exited due to reaching max iterations with a known
-        # validation failure. Report this as a non-clean termination.
-        if state.exceeds_max() and not state.validation_passed and state.validation_notes:
-            output = (
-                "Stopped: reached max iterations without passing validation. "
-                f"Validation failure: {state.validation_notes}"
-            )
-            if files:
-                output += " Changed: " + ", ".join(files[:8]) + "."
-            log("improver_summary", {"source": "max_iteration", "output": output[:200]})
-            return output
-
         if files:
             output = "Done. Changed: " + ", ".join(files[:8]) + "."
         elif successes:
             output = f"Done. Completed {successes} tool action(s)."
         else:
-            output = "Done."
+            output = "Nothing was successfully changed."
 
         if failures:
             output += f" {failures} tool action(s) reported errors."

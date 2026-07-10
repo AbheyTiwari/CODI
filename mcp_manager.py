@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
@@ -30,6 +31,22 @@ def _resolve_command(command: str) -> str:
 
 
 class MCPManager:
+    """
+    Owns a single dedicated asyncio event loop (on its own thread) and keeps
+    every MCP server connection open for the manager's entire lifetime via an
+    AsyncExitStack.
+
+    IMPORTANT: earlier versions of this class opened each server connection
+    inside a nested `async with stdio_client(...): async with ClientSession(...):`
+    block and then RETURNED the loaded tools from inside that block. In Python,
+    returning from inside a `with`/`async with` still runs __exit__ before the
+    caller gets the value — so the stdio pipe and ClientSession were being
+    closed the instant load_all() returned, before any tool was ever actually
+    invoked. Every subsequent tool call then failed. Using an AsyncExitStack
+    that lives as long as the MCPManager itself fixes this: connections stay
+    open until shutdown() is called (e.g. at program exit).
+    """
+
     def __init__(self, config_path: str):
         self.config_path = config_path
         self.tools = []
@@ -37,6 +54,15 @@ class MCPManager:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        # The exit stack MUST be created on the manager's own loop/thread —
+        # async context manager bookkeeping is not thread-safe across loops.
+        self._exit_stack: AsyncExitStack = asyncio.run_coroutine_threadsafe(
+            self._make_exit_stack(), self._loop
+        ).result(timeout=10)
+
+    @staticmethod
+    async def _make_exit_stack() -> AsyncExitStack:
+        return AsyncExitStack()
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
@@ -44,6 +70,12 @@ class MCPManager:
             self._loop.run_forever()
         except Exception as e:
             log("mcp_manager_crash", {"error": str(e)})
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """Exposed so tool wrappers (tools/mcp/mcp_tools.py) can schedule
+        ainvoke() calls on the same loop these sessions were opened on."""
+        return self._loop
 
     def load_all(self) -> list:
         if not os.path.exists(self.config_path):
@@ -79,8 +111,13 @@ class MCPManager:
             return list(self.tools)
 
     def reload(self) -> list:
+        """Close all existing connections and reload from config."""
+        self.shutdown_connections()
         with self._lock:
             self.tools.clear()
+        self._exit_stack = asyncio.run_coroutine_threadsafe(
+            self._make_exit_stack(), self._loop
+        ).result(timeout=10)
         return self.load_all()
 
     async def _load_server(self, name: str, cfg: dict) -> list:
@@ -106,10 +143,15 @@ class MCPManager:
             args=[os.path.expandvars(a) for a in cfg.get("args", [])],
             env=merged_env
         )
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                return await load_mcp_tools(session)
+
+        # Enter the context managers via the shared exit stack instead of a
+        # `with`/`async with` block, so they stay open past this function's
+        # return — closed only when shutdown()/reload() explicitly unwinds
+        # the stack.
+        read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+        session = await self._exit_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        return await load_mcp_tools(session)
 
     async def _load_sse(self, name: str, cfg: dict) -> list:
         url = cfg.get("url")
@@ -132,7 +174,20 @@ class MCPManager:
             if resolved:
                 headers[k] = resolved
 
-        async with sse_client(url, headers=headers) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                return await load_mcp_tools(session)
+        read, write = await self._exit_stack.enter_async_context(sse_client(url, headers=headers))
+        session = await self._exit_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        return await load_mcp_tools(session)
+
+    def shutdown_connections(self):
+        """Close every open MCP connection without stopping the event loop."""
+        try:
+            asyncio.run_coroutine_threadsafe(self._exit_stack.aclose(), self._loop).result(timeout=15)
+        except Exception as e:
+            log("mcp_shutdown_error", {"error": str(e)})
+
+    def shutdown(self):
+        """Close all connections and stop the manager's event loop entirely.
+        Call this once at program exit (main.py's cleanup path)."""
+        self.shutdown_connections()
+        self._loop.call_soon_threadsafe(self._loop.stop)

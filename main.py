@@ -6,6 +6,7 @@ import threading
 import re
 import truststore
 truststore.inject_into_ssl()
+from football_theme import next_frame, themed_status_line
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -233,11 +234,12 @@ class LiveRenderer:
         body.append(f"  {self.task}\n\n", style="bold")
         status_lines = get_status_snapshot() or _STATUS_LINES or ["starting"]
         for line in status_lines[-_STATUS_MAX_LINES:]:
-            body.append(f"  *  {line.strip()}\n", style="dim")
+            body.append(f"  *  {themed_status_line(line.strip())}\n", style="dim")   # ← pun call
         for line in self.lines[-10:]:
             body.append(f"  *  {line.strip()}\n", style="dim")
-        return Panel(body, title=Text(f" {t['label']} · working ", style=f"bold {t['accent']}"),
-                     border_style=t["dim"], padding=(0,1))
+        ball = next_frame()   # ← animation call
+        return Panel(body, title=Text(f" {ball}{t['label']} · working ", style=f"bold {t['accent']}"),
+                    border_style=t["dim"], padding=(0,1))
 
     def refresh(self):
         with self._lock:

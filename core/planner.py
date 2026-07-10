@@ -22,6 +22,10 @@ SIMPLE_PREFIXES = (
     "yes", "no", "ok", "okay", "sure", "help", "why", "when", "where"
 )
 
+# "debug" added — without it, "debug the entire website" has no action
+# trigger word, no file extension, and is under 80 chars, so route_reason
+# fell through to short_no_action and got answered as plain Q&A instead of
+# ever touching the project files.
 ACTION_TRIGGERS = (
     "create", "write", "make", "build", "fix", "edit", "update", "delete",
     "run", "execute", "generate", "refactor", "implement", "add", "code",
@@ -31,13 +35,14 @@ ACTION_TRIGGERS = (
     "list", "search", "find", "show", "get", "check", "access", "browse",
     "navigate", "click", "screenshot", "scrape", "query", "lookup", "pull",
     "push", "commit", "clone", "diff", "status", "remember", "store",
-    "repo", "repository", "github", "git",
+    "repo", "repository", "github", "git", "debug", "troubleshoot",
+    "diagnose", "inspect", "lint",
 )
 
 EXECUTION_CONTEXT_HINTS = (
     "this repo", "this repository", "this project", "current project",
     "codebase", "workspace", "current file", "these files", "my files",
-    "local file", "codi.log",
+    "local file", "codi.log", "the website", "the frontend", "the site",
 )
 
 # ── Intent classification vocab ────────────────────────────────────────────
@@ -51,9 +56,15 @@ READ_VERBS = (
     "look at", "inspect", "analyze", "analyse", "tell me about",
 )
 
+# "debug" and "troubleshoot" belong here too — debugging is fundamentally
+# a fix/edit action (it implies inspecting AND then changing code), not a
+# read-only lookup. Treating it as edit-intent means it correctly triggers
+# execution and, downstream in classify_intent, gets routed toward "build"
+# (multi-file) rather than silently answered as prose.
 EDIT_VERBS = (
     "edit", "fix", "update", "change", "modify", "rename", "refactor",
     "remove", "delete", "replace", "append", "prepend", "insert", "patch",
+    "debug", "troubleshoot", "diagnose",
 )
 
 BUILD_VERBS = (
@@ -116,12 +127,13 @@ def route_reason(text: str) -> tuple[bool, str]:
     if action_hits:
         return True, f"action_trigger:{','.join(action_hits[:5])}"
 
-    # NEW: EDIT_VERBS / BUILD_VERBS / READ_VERBS are used downstream by
+    # EDIT_VERBS / BUILD_VERBS / READ_VERBS are used downstream by
     # classify_intent() for fine-grained routing, but they must ALSO count
-    # as execution triggers here — otherwise a phrase like "change the
-    # button color to blue" (no ACTION_TRIGGERS word, no file extension,
-    # under 80 chars) falls through to "short_no_action" and gets answered
-    # as plain Q&A instead of actually being executed.
+    # as execution triggers here — otherwise a phrase like "debug the
+    # entire website" or "change the button color to blue" (no
+    # ACTION_TRIGGERS word, no file extension, under 80 chars) falls
+    # through to "short_no_action" and gets answered as plain Q&A instead
+    # of actually being executed.
     phrase_hit = (
         _phrase_hit(t, EDIT_VERBS)
         or _phrase_hit(t, BUILD_VERBS)
@@ -130,7 +142,7 @@ def route_reason(text: str) -> tuple[bool, str]:
     if phrase_hit:
         return True, f"phrase_trigger:{phrase_hit}"
 
-    # NEW: typo tolerance for the same vocab (chnage/dowload/etc.)
+    # typo tolerance for the same vocab (chnage/dowload/etc.)
     if (
         _fuzzy_verb_hit(words, EDIT_VERBS)
         or _fuzzy_verb_hit(words, BUILD_VERBS)
@@ -180,6 +192,19 @@ def classify_intent(text: str) -> str:
     has_edit_verb  = any(v in t for v in EDIT_VERBS) or _fuzzy_verb_hit(words, EDIT_VERBS)
     has_build_verb = any(v in t for v in BUILD_VERBS) or _fuzzy_verb_hit(words, BUILD_VERBS)
     file_mentions  = len(FILE_PATH_RE.findall(text))
+
+    # "debug the entire website" — no explicit file, but multiple project-wide
+    # words ("entire", "website", "frontend") imply multi-file scope. Since
+    # EDIT_VERBS now includes debug/troubleshoot/diagnose, has_edit_verb will
+    # be True here; without a specific file mentioned, treat broad-scope
+    # debug/troubleshoot requests as "build" (full pipeline) rather than the
+    # single-file "edit" fast path, since they legitimately need to inspect
+    # and potentially touch more than one file.
+    broad_scope_hint = any(
+        phrase in t for phrase in ("entire website", "whole site", "entire site", "whole project", "entire project")
+    )
+    if broad_scope_hint:
+        return "build"
 
     if has_read_verb and not has_build_verb and not has_edit_verb:
         return "read"
@@ -269,7 +294,7 @@ class Planner:
 
         refine_triggers = (
             "create", "write", "make", "build", "fix", "edit",
-            "update", "generate", "refactor", "implement", "add"
+            "update", "generate", "refactor", "implement", "add", "debug",
         )
         if not any(t in text.lower() for t in refine_triggers):
             return text

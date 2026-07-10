@@ -97,6 +97,52 @@ def read_file(args) -> str:
         return f"ERROR reading {path}: {e}"
 
 
+def read_file_numbered(args) -> str:
+    """Read a file WITH 1-indexed line numbers prefixed (e.g. '  42\\t<code>').
+    Use this before any surgical line-range edit (replace_lines / delete_lines /
+    insert_at_line) so the exact line numbers are known ahead of time instead
+    of being guessed. Args: path, optionally start_line/end_line to view a
+    slice of a large file instead of the whole thing."""
+    path = _path_arg(args)
+    if not path:
+        return "ERROR reading file: missing path"
+
+    start_line = None
+    end_line = None
+    if isinstance(args, dict):
+        start_line = args.get("start_line")
+        end_line = args.get("end_line")
+
+    log("tool_call", {"tool": "read_file_numbered", "path": path})
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+
+    total = len(lines)
+    if total == 0:
+        return f"[{path} — 0 lines, file is empty]"
+
+    try:
+        s = max(1, int(start_line)) if start_line else 1
+    except (TypeError, ValueError):
+        s = 1
+    try:
+        e = min(total, int(end_line)) if end_line else total
+    except (TypeError, ValueError):
+        e = total
+
+    if s > e:
+        s, e = 1, total
+
+    numbered = [f"{i:>5}\t{lines[i - 1].rstrip(chr(10)).rstrip(chr(13))}" for i in range(s, e + 1)]
+    body = "\n".join(numbered)
+    result = trim_tool_output(body, max_tokens=1500)
+    log("tool_result", {"tool": "read_file_numbered", "lines": total, "status": "ok"})
+    return f"[{path} — {total} lines total, showing {s}-{e}]\n{result}"
+
+
 def write_file(args: dict) -> str:
     """Write text to a file. Args: path, content or content_lines list; warns on .py syntax errors."""
     path = _path_arg(args)
@@ -138,7 +184,10 @@ def write_file(args: dict) -> str:
 
 
 def edit_file(args: dict) -> str:
-    """Edit an existing file. Args: path plus old/new, replacements, append, prepend, insert_after, or insert_before."""
+    """Edit an existing file. Args: path plus old/new, replacements, append,
+    prepend, insert_after, insert_before — OR surgical line-range operations
+    replace_lines / delete_lines / insert_at_line (use read_file_numbered
+    first to get accurate line numbers)."""
     path = _path_arg(args)
     if not path:
         return "ERROR editing file: missing path"
@@ -456,13 +505,77 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
         content = content[:pos] + payload + content[pos:]
         changes += 1
 
+    # ── Line-range operations ──────────────────────────────────────────────
+    # Surgical edits by 1-indexed line number instead of exact text matching.
+    # Pair these with read_file_numbered so the caller knows real line numbers
+    # before editing — this is what lets CODI touch any portion of any file
+    # type without ever having to regenerate/rewrite the whole thing.
+
+    if "replace_lines" in args:
+        spec = args.get("replace_lines")
+        if not isinstance(spec, dict) or "start" not in spec or "end" not in spec:
+            raise ValueError("replace_lines requires {'start': int, 'end': int, 'content': str}")
+        lines = content.splitlines(keepends=True)
+        try:
+            start = int(spec["start"])
+            end = int(spec["end"])
+        except (TypeError, ValueError):
+            raise ValueError("replace_lines 'start'/'end' must be integers")
+        if start < 1 or end > len(lines) or start > end:
+            raise ValueError(
+                f"replace_lines range {start}-{end} out of bounds (file has {len(lines)} lines)"
+            )
+        new_text = str(spec.get("content", ""))
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        content = "".join(lines[:start - 1]) + new_text + "".join(lines[end:])
+        changes += 1
+
+    if "delete_lines" in args:
+        spec = args.get("delete_lines")
+        if not isinstance(spec, dict) or "start" not in spec or "end" not in spec:
+            raise ValueError("delete_lines requires {'start': int, 'end': int}")
+        lines = content.splitlines(keepends=True)
+        try:
+            start = int(spec["start"])
+            end = int(spec["end"])
+        except (TypeError, ValueError):
+            raise ValueError("delete_lines 'start'/'end' must be integers")
+        if start < 1 or end > len(lines) or start > end:
+            raise ValueError(
+                f"delete_lines range {start}-{end} out of bounds (file has {len(lines)} lines)"
+            )
+        content = "".join(lines[:start - 1]) + "".join(lines[end:])
+        changes += 1
+
+    if "insert_at_line" in args:
+        spec = args.get("insert_at_line")
+        if not isinstance(spec, dict) or "line" not in spec:
+            raise ValueError("insert_at_line requires {'line': int, 'content': str}")
+        lines = content.splitlines(keepends=True)
+        try:
+            line_no = int(spec["line"])
+        except (TypeError, ValueError):
+            raise ValueError("insert_at_line 'line' must be an integer")
+        if line_no < 0 or line_no > len(lines) + 1:
+            raise ValueError(
+                f"insert_at_line {line_no} out of bounds (file has {len(lines)} lines)"
+            )
+        new_text = str(spec.get("content", ""))
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        idx = max(0, line_no - 1)
+        content = "".join(lines[:idx]) + new_text + "".join(lines[idx:])
+        changes += 1
+
     return content, changes
 
 
 def register_file_tools(registry):
-    registry.register_local("create_file",       write_file)
-    registry.register_local("read_file",         read_file)
-    registry.register_local("write_file",        write_file)
-    registry.register_local("edit_file",         edit_file)
-    registry.register_local("list_files",        list_files)
-    registry.register_local("create_directory",  create_directory)
+    registry.register_local("create_file",        write_file)
+    registry.register_local("read_file",           read_file)
+    registry.register_local("read_file_numbered",  read_file_numbered)
+    registry.register_local("write_file",          write_file)
+    registry.register_local("edit_file",           edit_file)
+    registry.register_local("list_files",          list_files)
+    registry.register_local("create_directory",    create_directory)
