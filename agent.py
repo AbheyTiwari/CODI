@@ -31,7 +31,9 @@ import re
 import traceback
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
-
+from core.mission_analyzer import MissionAnalyzer
+from core.context_builder import ContextBuilder
+from core.execution_reflector import ExecutionReflector
 from core.executor  import Executor
 from core.improver  import Improver
 from core.planner   import Planner
@@ -76,9 +78,11 @@ class CodiAgent:
     def __init__(self, registry: ToolRegistry = None):
         self.registry  = registry or _global_registry
         self.planner   = Planner()
+        self.mission = MissionAnalyzer()
         self.improver  = Improver(self.registry)
         self.executor  = Executor(self.registry)
         self.validator = Validator()
+        self.reflector = ExecutionReflector()
 
     def invoke(self, inputs: dict, resume_state: RunState = None) -> dict:
         """
@@ -99,12 +103,23 @@ class CodiAgent:
 
         if resuming:
             state = resume_state
-            state.plan_confirmed = True
+            if state.status == "awaiting_plan_confirmation":
+                state.plan_confirmed = True
+            elif state.status == "awaiting_context":
+                response = str(inputs.get("context_response", "")).strip()
+                state.context_response = response
+                if response:
+                    state.history = f"{state.history}\nUser context response: {response}".strip()
+                # A declined request means proceed with the verified evidence
+                # already gathered. Any other response is treated as added
+                # context and discovery gets another pass before planning.
+                state.plan_confirmed = False
         else:
             state = RunState(
                 user_input=inputs.get("input", ""),
                 history=inputs.get("history", ""),
             )
+            state.context_scope = "full" if inputs.get("read_entire_codebase") else "targeted"
             # Every fresh task starts unconfirmed. Fast-path / direct-answer /
             # read / edit tasks never reach the gate check, so this is safe
             # to force here — only the "build" path consults it.
@@ -159,15 +174,20 @@ class CodiAgent:
                 state.status = "complete"
                 return self._handle_read(state)
 
+            # A user who opted into a repository-wide read explicitly asked
+            # for evidence before changes, so do not bypass discovery via a
+            # write-oriented fast path.
             _agent_status("Checking for a fast file action.")
-            fast_output = try_fast_file_task(state.user_input, self.registry, state)
+            fast_output = None if state.context_scope == "full" else try_fast_file_task(
+                state.user_input, self.registry, state
+            )
             if fast_output:
                 _agent_status("Completed with fast file action.")
                 log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
                 state.status = "complete"
                 return fast_output
 
-            if intent == "edit":
+            if intent == "edit" and state.context_scope != "full":
                 _agent_status("Making a targeted edit.")
                 edit_output = self._handle_edit(state)
                 if edit_output is not None:
@@ -181,8 +201,44 @@ class CodiAgent:
             # ── intent == "build" (or edit fallback) ────────────────────────────
             # ── Phase 1: Read context ──────────────────────────────────────────
             _agent_status("Reading project context.")
-            context = self.improver.read_context(state)
+
+            analysis = self.mission.analyze(state.user_input)
+            state.mission = analysis
+            _agent_status(
+                f"Mission confidence: {analysis.confidence:.2f}"
+            )
+            if analysis.confidence < 0.90:
+                _agent_status(
+                "Need additional project context before planning."
+            )
+            log(
+                "mission_requires_context",
+                {
+                    "files": analysis.files_needed,
+                    "unknowns": analysis.unknowns
+                }
+            )
+
+            self.context_builder = ContextBuilder(self.registry)
+            context_state = self.context_builder.build(
+                analysis,
+                history=state.history,
+                full_codebase=state.context_scope == "full",
+            )
+            state.knowledge = context_state.knowledge
+            state.context_confidence = context_state.confidence
+            context = context_state.context
             log("agent_context_ready", {"context_len": len(context)})
+
+            if not context_state.complete:
+                state.status = "awaiting_context"
+                _agent_status("Context is incomplete; planning is blocked.")
+                return (
+                    "I inspected the project and its saved .agent_history, but I still need context "
+                    "to plan safely. Reply with the missing details, or type 'no' to continue using "
+                    "only the verified evidence I have.\n\nUnresolved items: "
+                    + "; ".join(state.knowledge.unknowns[-4:])
+                )
 
             # ── Phase 2: Create plan ────────────────────────────────────────────
             _agent_status("Creating an execution plan.")
@@ -196,9 +252,16 @@ class CodiAgent:
                 plan_path = os.path.join(
                     os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
                 )
-                lines = [f"# Plan: {state.plan}", ""]
+                plan_context = state.knowledge.plan_context()
+                lines = [f"# Plan: {state.plan}", "", "## Mission", analysis.goal, "", "## Understanding", state.knowledge.summary_for_prompt(), "", "## Architecture", "```json", str(plan_context["dependency_graph"]), "```", "", "## Files inspected"]
+                lines.extend(f"- {path}" for path in plan_context["files_inspected"])
+                lines.extend(["", "## Assumptions"] + [f"- {value}" for value in analysis.assumptions])
+                lines.extend(["", "## Unknowns"] + [f"- {value}" for value in plan_context["unknowns"]])
+                lines.extend(["", "## Risks"] + [f"- {value}" for value in plan_context["risks"]])
+                lines.extend(["", "## Execution Strategy"])
                 for i, s in enumerate(state.plan_steps, 1):
                     lines.append(f"{i}. {s}")
+                lines.extend(["", "## Validation Strategy", "- Run the project test command or targeted tests.", "- Classify any failure, gather missing context where needed, and repair before retrying."])
                 try:
                     with open(plan_path, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines) + "\n")
@@ -211,6 +274,31 @@ class CodiAgent:
                     f"Plan written to {plan_path}. Review it, then type 'y' to run it, "
                     f"or give me a new instruction to replan."
                 )
+
+        elif state.status == "awaiting_context":
+            declined = state.context_response.lower() in {"n", "no", "proceed", "continue"}
+            if declined:
+                _agent_status("Proceeding with the available verified context at the user's request.")
+                log("context_declined", {"confidence": state.context_confidence})
+            else:
+                _agent_status("Rechecking project context with the user's additional details.")
+                analysis = state.mission or self.mission.analyze(state.user_input)
+                context_state = self.context_builder.build(
+                    analysis, history=state.history, knowledge=state.knowledge,
+                    full_codebase=state.context_scope == "full",
+                )
+                state.knowledge = context_state.knowledge
+                state.context_confidence = context_state.confidence
+                if not context_state.complete:
+                    state.status = "awaiting_context"
+                    return (
+                        "I still cannot verify enough context to plan safely. Add the missing details, "
+                        "or type 'no' to continue with the evidence already collected.\n\nUnresolved items: "
+                        + "; ".join(state.knowledge.unknowns[-4:])
+                    )
+            context = state.knowledge.summary_for_prompt()
+            _agent_status("Creating an execution plan.")
+            self.improver.create_plan(state, context)
 
         state.status = "running"
 
@@ -246,6 +334,23 @@ class CodiAgent:
 
             # Executor runs the step — once.
             dispatch_result = self.executor.execute_step(step, state)
+            reflection = self.reflector.reflect(dispatch_result, state.knowledge)
+            state.reflections.append({"needs_context": reflection.needs_context, "reason": reflection.reason, "unknowns": reflection.unknowns})
+            if reflection.needs_context:
+                _agent_status("Execution found missing context; returning to discovery.")
+                log("execution_needs_context", {"reason": reflection.reason})
+                context_tool = dispatch_result.get("tool", "inspect_file")
+                context_args = dispatch_result.get("args", {})
+                if context_args:
+                    context_result = Dispatcher(self.registry).dispatch(
+                        {"action": "tool_call", "tools": [{"name": context_tool, "args": context_args}]},
+                        knowledge=state.knowledge,
+                    )
+                    for item in context_result.get("results", []):
+                        state.add_tool_result(item["tool"], item["status"], item["output"])
+                # Do not validate or mark an implementation step complete when
+                # the executor explicitly requested more evidence.
+                continue
 
             # Step-level completion is a deterministic fact: did the most
             # recent tool action for THIS step succeed? This is independent

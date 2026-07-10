@@ -6,7 +6,7 @@ import os
 import subprocess
 import time
 import traceback
-
+from tools.local.project_inspector import inspect_file as _inspect_file, inspect_project
 from context_trimmer import trim_tool_output
 from logger import log
 
@@ -15,6 +15,117 @@ from logger import log
 TYPING_DELAY = 0.1  # seconds between characters (adjust for speed)
 TYPING_ENABLED = False  # Disabled: char-by-char writes block the agent loop for seconds per file
 
+def inspect_file(args) -> str:
+    """
+    Inspect a source file and return its structure instead of the raw contents.
+    Uses Python AST for .py files and lightweight parsing for other file types.
+    """
+
+    # Keep the tool boundary string-based, but delegate all parsing to the
+    # canonical structured inspector.
+    return json.dumps(_inspect_file(args), ensure_ascii=False)
+
+    path = _path_arg(args)
+    if not path:
+        return json.dumps({
+            "success": False,
+            "error": "missing path"
+        })
+
+    if not os.path.exists(path):
+        return json.dumps({
+            "success": False,
+            "error": "file not found"
+        })
+
+    ext = os.path.splitext(path)[1].lower()
+
+    try:
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+
+        result = {
+            "success": True,
+            "file": path,
+            "extension": ext,
+            "imports": [],
+            "classes": [],
+            "functions": [],
+            "constants": [],
+            "entrypoint": "__main__" in source
+        }
+
+        if ext == ".py":
+
+            tree = ast.parse(source)
+
+            for node in tree.body:
+
+                if isinstance(node, ast.Import):
+
+                    for alias in node.names:
+                        result["imports"].append(alias.name)
+
+                elif isinstance(node, ast.ImportFrom):
+
+                    result["imports"].append(node.module)
+
+                elif isinstance(node, ast.Assign):
+
+                    for target in node.targets:
+
+                        if isinstance(target, ast.Name):
+
+                            if target.id.isupper():
+                                result["constants"].append(target.id)
+
+                elif isinstance(node, ast.FunctionDef):
+
+                    result["functions"].append({
+                        "name": node.name,
+                        "line": node.lineno,
+                        "args": [a.arg for a in node.args.args]
+                    })
+
+                elif isinstance(node, ast.ClassDef):
+
+                    cls = {
+                        "name": node.name,
+                        "line": node.lineno,
+                        "methods": []
+                    }
+
+                    for child in node.body:
+
+                        if isinstance(child, ast.FunctionDef):
+
+                            cls["methods"].append({
+                                "name": child.name,
+                                "line": child.lineno,
+                                "args": [a.arg for a in child.args.args]
+                            })
+
+                    result["classes"].append(cls)
+
+        else:
+
+            result["lines"] = len(source.splitlines())
+
+        log("tool_result", {
+            "tool": "inspect_file",
+            "file": path,
+            "status": "ok"
+        })
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
 
 def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELAY):
     """Write content to file character by character with a typing effect.
@@ -95,6 +206,16 @@ def read_file(args) -> str:
         return result
     except Exception as e:
         return f"ERROR reading {path}: {e}"
+
+
+def read_agent_history(_args=None) -> str:
+    """Read CODI's own persistent command history, outside the user project."""
+    history_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".agent_history")
+    try:
+        with open(history_path, "r", encoding="utf-8", errors="replace") as f:
+            return trim_tool_output(f.read(), max_tokens=800)
+    except Exception as e:
+        return f"ERROR reading CODI agent history: {e}"
 
 
 def read_file_numbered(args) -> str:
@@ -574,8 +695,11 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
 def register_file_tools(registry):
     registry.register_local("create_file",        write_file)
     registry.register_local("read_file",           read_file)
+    registry.register_local("read_agent_history",  read_agent_history)
     registry.register_local("read_file_numbered",  read_file_numbered)
     registry.register_local("write_file",          write_file)
     registry.register_local("edit_file",           edit_file)
     registry.register_local("list_files",          list_files)
     registry.register_local("create_directory",    create_directory)
+    registry.register_local("inspect_file",         inspect_file)
+    registry.register_local("inspect_project",      lambda args: json.dumps(inspect_project(args), ensure_ascii=False))

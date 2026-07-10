@@ -74,6 +74,9 @@ Produce an execution plan. Respond ONLY with JSON — no fences, no prose:
 
 Rules:
 - Maximum 5 steps. Each step is a plain string — NOT an object.
+- Reconcile every file name with the evidence before using it. If an intended
+  file is absent, make the step explicitly create it; do not say "edit".
+- Include a verification step only after all implementation steps.
 - ONLY reference files that actually appear in the codebase context above.
   Do NOT invent a filename that is a typo or guess (e.g. do not write
   "scripts.js" if the context shows "script.js") — copy the exact filename
@@ -160,12 +163,19 @@ def _extract_file_refs(text: str) -> list[str]:
 def _deterministic_requirements(task: str) -> TaskRequirements:
     lowered = (task or "").lower()
     framework = None
-    for candidate in ("fastapi", "flask", "django", "react"):
-        if candidate in lowered:
-            framework = candidate
-            break
-    if not framework and any(term in lowered for term in ("vanilla js", "plain html", "no framework")):
+    # Pick an explicitly requested stack before scanning framework names.
+    # A naive substring scan classified "no React" as React and caused the
+    # coder to generate exactly the framework the user prohibited.
+    if any(term in lowered for term in (
+        "vanilla javascript", "vanilla js", "plain javascript", "plain html",
+        "html5", "no framework", "no frameworks",
+    )):
         framework = "vanilla"
+    else:
+        for candidate in ("fastapi", "flask", "django", "react"):
+            if candidate in lowered and not re.search(rf"\b(no|without)\s+{candidate}\b", lowered):
+                framework = candidate
+                break
 
     files = _extract_file_refs(task)
     reqs = TaskRequirements(framework=framework, files=files)
@@ -319,7 +329,7 @@ class Improver:
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
-            context=wrap_prompt_data(context[:1200]),
+            context=wrap_prompt_data(context[:6000]),
         )
 
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
@@ -370,19 +380,21 @@ class Improver:
         """Return {"step": str, "done": bool} for the current iteration."""
         from dispatcher import Dispatcher
         from context_trimmer import trim_tool_output
-        done_count = max(0, state.iteration - 1)
+        done_count = len(state.completed_steps)
 
         if state.plan_steps and "[CORRECTION]" not in (state.plan or ""):
-            index = state.iteration - 1
-            if 0 <= index < len(state.plan_steps):
-                selected_step = state.plan_steps[index]
+            selected_step = next(
+                (step for step in state.plan_steps if step not in state.completed_steps),
+                None,
+            )
+            if selected_step:
                 log("step_selected", {
                     "step": trim_tool_output(selected_step, max_tokens=20),
                     "matched_plan": True,
                     "iteration": state.iteration,
                     "done": False,
                     "plan_steps_remaining": max(0, len(state.plan_steps) - done_count),
-                    "source": "plan_index",
+                    "source": "first_incomplete_plan_step",
                 })
                 return {"step": selected_step, "done": False}
 

@@ -62,7 +62,7 @@ class Dispatcher:
 
     # ── Public entry point ────────────────────────────────────────────────────
 
-    def dispatch(self, action_bundle: dict) -> dict:
+    def dispatch(self, action_bundle: dict, knowledge=None) -> dict:
         """
         Accepts a JSON action bundle from the planner/executor.
         Normalizes common LLM mistakes before routing.
@@ -86,7 +86,25 @@ class Dispatcher:
                 direct_name = bundle.get("name")
                 if isinstance(direct_name, str) and direct_name:
                     tools = [{"name": direct_name, "args": bundle.get("args", {}) or {}}]
-            return self._execute_tools(tools)
+            result = self._execute_tools(tools)
+            if knowledge is not None:
+                for item in result.get("results", []):
+                    try:
+                        payload = json.loads(item.get("output", ""))
+                    except (TypeError, ValueError):
+                        payload = item.get("output", "")
+                    knowledge.record_tool_output(item.get("tool", ""), item.get("args", {}) or {}, payload)
+            return result
+
+        if action == "need_context":
+            path = bundle.get("path")
+            tool = bundle.get("tool", "inspect_file")
+            return {
+                "status": "partial", "results": [], "signal": "need_context",
+                "reason": str(bundle.get("reason", "More project context is required.")),
+                "tool": tool,
+                "args": {"path": path} if path else {},
+            }
 
         if action in ("noop", "done", "control"):
             signal = bundle.get("signal", "noop")
@@ -272,6 +290,15 @@ class Dispatcher:
                 else:
                     output_text = f"{output_text}\n{warning}" if output_text else warning
             status = "error" if output_text.startswith(("ERROR", "WRITE REJECTED", "BLOCKED")) else "ok"
+            # Most local tools return structured JSON.  A payload declaring
+            # success:false is a real failure even though its serialized form
+            # does not start with the word "ERROR".
+            try:
+                payload = json.loads(output_text)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("success") is False:
+                status = "error"
             log("dispatcher_ok", {
                 "tool": name,
                 "status": status,

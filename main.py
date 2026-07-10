@@ -256,7 +256,7 @@ class LiveRenderer:
         global _ACTIVE_RENDERER
         _ACTIVE_RENDERER = self
         self._live = Live(self._panel(), console=console,
-                          refresh_per_second=8, transient=True)
+                          refresh_per_second=40, transient=True)
         self._live.start()
 
     def stop(self):
@@ -376,6 +376,21 @@ def main():
         history=FileHistory(os.path.join(_REPO_ROOT, ".agent_history")),
         style=_pt_style(),
     )
+    # Make repository-wide reading an explicit session preference.  It is
+    # applied when the user gives a coding task, not before a task exists.
+    try:
+        preference = session.prompt(
+            [("class:prompt", "  Read and understand the entire codebase before coding tasks? [y/N] ")],
+            style=_pt_style(),
+        ).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        _cleanup_session_on_exit()
+        return
+    read_entire_codebase = preference in {"y", "yes"}
+    console.print(Text(
+        "  full-codebase context enabled" if read_entire_codebase else "  targeted context enabled",
+        style=_t()["dim"],
+    ))
     pending_plan_state = {"awaiting": False, "state": None}
 
     while True:
@@ -515,6 +530,35 @@ def main():
             # confirmation ("y"/"yes") or a brand new instruction that replaces
             # the pending plan entirely.
             if pending_plan_state["awaiting"]:
+                pending_state = pending_plan_state["state"]
+                if pending_state is not None and pending_state.status == "awaiting_context":
+                    pending_plan_state["awaiting"] = False
+                    pending_plan_state["state"] = None
+                    console.print(Text("  → continuing context discovery", style="dim"))
+                    renderer = LiveRenderer(pending_state.user_input)
+                    renderer.start()
+                    console.print()
+                    try:
+                        response = agent_executor.invoke(
+                            {"context_response": user_input}, resume_state=pending_state
+                        )
+                        output = response.get("output") or "No output returned."
+                        tool_outputs = response.get("tool_outputs", [])
+                        run_state = response.get("state")
+                        renderer.stop()
+                        console.print()
+                        _refresh_status_panel()
+                        if run_state is not None and run_state.status in {"awaiting_context", "awaiting_plan_confirmation"}:
+                            pending_plan_state["awaiting"] = True
+                            pending_plan_state["state"] = run_state
+                            console.print(Panel(Markdown(output), border_style=t["dim"], padding=(0, 2)))
+                        else:
+                            render_response(output, tool_outputs)
+                        session_memory.add("assistant", output)
+                    except Exception as e:
+                        renderer.stop()
+                        console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
+                    continue
                 if user_input.strip().lower() in ("y", "yes"):
                     confirmed_state = pending_plan_state["state"]
                     pending_plan_state["awaiting"] = False
@@ -577,7 +621,11 @@ def main():
                 if token_est > 3000 and config.MODE in ("local", "air"):
                     renderer.push(f"⚠ context ~{token_est} tokens — consider /clear")
  
-                response     = agent_executor.invoke({"input": refined, "history": history_str})
+                response     = agent_executor.invoke({
+                    "input": refined,
+                    "history": history_str,
+                    "read_entire_codebase": read_entire_codebase,
+                })
                 output       = response.get("output") or "No output returned."
                 tool_outputs = response.get("tool_outputs", [])
                 run_state    = response.get("state")
@@ -587,7 +635,7 @@ def main():
                 console.print()
                 _refresh_status_panel()
  
-                if run_state is not None and run_state.status == "awaiting_plan_confirmation":
+                if run_state is not None and run_state.status in {"awaiting_context", "awaiting_plan_confirmation"}:
                     pending_plan_state["awaiting"] = True
                     pending_plan_state["state"] = run_state
                     console.print(Panel(Markdown(output), border_style=t["dim"], padding=(0, 2)))

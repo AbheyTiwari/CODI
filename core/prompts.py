@@ -46,6 +46,7 @@ You are a highly focused sandbox software engineer. Your only responsibility is 
 6. **No Placeholders**: Write fully realized, functional, production-ready logic. Never output `// TODO: implement later`.
 7. **Prefer Editing Over Rewriting**: If the step targets an existing file and only asks for a small, specific change (e.g. "add a hero image", "change the button color"), use edit_file with a precise old/new pair, or a line-range operation (replace_lines/delete_lines/insert_at_line) if you already know the exact line numbers from read_file_numbered. Do NOT use write_file/create_file to regenerate the whole file for a small change — that destroys unrelated content and wastes the user's existing work.
 8. **Surgical Edits On Large Or Unfamiliar Files**: If you are not confident you can reproduce a snippet of the file character-for-character, call read_file_numbered first to get exact line numbers, then use edit_file with replace_lines / delete_lines / insert_at_line instead of guessing old/new text.
+9. **Context Before Guessing**: If essential definitions, dependencies, or test conventions are absent, return {{"action":"need_context","reason":"what must be inspected","tool":"inspect_file","path":"relative/path"}}. Never invent the missing code.
 
 ## Required Tool JSON
 For exactly one tool call:
@@ -137,6 +138,9 @@ _TOOL_SIGNATURES: dict[str, str] = {
     "write_file":        '{"path":"string","content":"string"}',
     "create_file":       '{"path":"string","content":"string"}',
     "read_file":         '{"path":"string"}',
+    "read_agent_history": '{"..."} — reads CODI\'s persistent command history',
+    "inspect_project":   '{"path":"string (optional; defaults to project root)"} — returns project shape, manifests, tests, and entrypoints',
+    "inspect_file":      '{"path":"string"} — returns AST-derived symbols/imports; prefer before read_file',
     "read_file_numbered": '{"path":"string","start_line":int (optional),"end_line":int (optional)}  — returns numbered lines ("N<TAB>code"); call this before any replace_lines/delete_lines/insert_at_line edit so line numbers are exact, not guessed',
     "edit_file":          '{"path":"string","old":"exact text to find","new":"replacement text"} for text-match replace — OR {"path":"string","replace_lines":{"start":int,"end":int,"content":"string"}} to replace a line range — OR {"path":"string","delete_lines":{"start":int,"end":int}} to delete a line range — OR {"path":"string","insert_at_line":{"line":int,"content":"string"}} to insert new code before that line number — also supports append, prepend, insert_after, insert_before',
     "list_files":        '{"path":"string  (use . for project root)"}',

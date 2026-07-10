@@ -21,14 +21,18 @@ codi.egg-info/entry_points.txt
 codi.egg-info/requires.txt
 codi.egg-info/top_level.txt
 core/__init__.py
+core/context_builder.py
+core/execution_reflector.py
 core/executor.py
 core/improver.py
+core/mission_analyzer.py
 core/planner.py
 core/prompts.py
 core/quick_actions.py
 core/validation_utils.py
 core/validator.py
 state/__init__.py
+state/knowledge.py
 state/temp_db.py
 test/test_content_diversity.py
 test/test_dispatcher_and_context.py
@@ -50,6 +54,7 @@ tools/__init__.py
 tools/registry.py
 tools/local/__init__.py
 tools/local/file_tools.py
+tools/local/project_inspector.py
 tools/local/search_tools.py
 tools/local/shell_tools.py
 tools/mcp/__init__.py

@@ -142,8 +142,11 @@ def _llamacpp_llm(role: str):
         base_url=f"{LLAMACPP_URL.rstrip('/')}/v1",
         api_key="not-needed",
         temperature=0.2 if role == "refiner" else 0.1,
+        # Bound local generation so one stalled request does not consume two
+        # full timeout windows and leave the agent appearing to only reason.
         timeout=LLAMACPP_TIMEOUT,
-        max_retries=1,
+        max_retries=0,
+        max_tokens=700 if role == "refiner" else 1600,
     )
 
 # ── Local (Ollama) ────────────────────────────────────────────────────────────

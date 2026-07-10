@@ -259,11 +259,28 @@ class Validator:
         state.validation_passed = True
         state.validation_notes  = notes
         state.validation_requires_correction = False
+        state.validation_classification = "success"
+        state.validation_recommendation = "continue"
 
     def _fail(self, state: RunState, notes: str, requires_correction: bool = True):
         state.validation_passed = False
         state.validation_notes  = notes
         state.validation_requires_correction = requires_correction
+        lowered = notes.lower()
+        if any(token in lowered for token in ("no tools", "missing context", "file does not exist", "not found")):
+            classification, recommendation = "missing_context", "gather_more_context"
+        elif any(token in lowered for token in ("syntax", "compile", "compilation", "importerror")):
+            classification, recommendation = "compilation_failure", "repair"
+        elif any(token in lowered for token in ("test", "assertion", "pytest")):
+            classification, recommendation = "test_failure", "repair"
+        elif any(token in lowered for token in ("tool error", "timeout", "permission")):
+            classification, recommendation = "tool_failure", "retry"
+        elif any(token in lowered for token in ("dependency", "module not found", "package")):
+            classification, recommendation = "external_dependency", "gather_more_context"
+        else:
+            classification, recommendation = "incorrect_assumption", "gather_more_context"
+        state.validation_classification = classification
+        state.validation_recommendation = recommendation
 
     def _generation_completion_check(self, state: RunState) -> str:
         """Fail fast when content-first generation did not provide its end marker."""

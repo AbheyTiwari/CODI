@@ -13,6 +13,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from state.knowledge import KnowledgeBase
 
 
 @dataclass
@@ -89,6 +90,18 @@ class RunState:
     # ── Input ─────────────────────────────────────────────────────────────────
     user_input:  str = ""
     history:     str = ""
+    mission: Any = None
+    knowledge: KnowledgeBase = field(default_factory=KnowledgeBase)
+    context_confidence: float = 0.0
+    # Context is an explicit user-controlled part of a run.  "full" means
+    # inspect and read the repository before planning; "targeted" lets the
+    # discovery controller choose only task-relevant files.
+    context_scope: str = "targeted"
+    context_response: str = ""
+    context_attempts: int = 0
+    reflections: list[dict[str, Any]] = field(default_factory=list)
+    validation_classification: str = ""
+    validation_recommendation: str = ""
 
     # ── Task requirements (populated by Improver.create_plan) ─────────────────
     requirements: TaskRequirements = field(default_factory=TaskRequirements)
