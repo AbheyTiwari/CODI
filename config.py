@@ -11,11 +11,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 import os
 
+
 MODE = "llamacpp"    # local | hybrid | cloud | air | llamacpp
 
 # ── Cloud provider (used when MODE="cloud" or hybrid escalates) ───────────────
 # Options: "groq" | "anthropic" | "openai" | "gemini"
-CLOUD_PROVIDER = "groq"
+CLOUD_PROVIDER = "gemini"
 
 # ── Hybrid escalation settings ────────────────────────────────────────────────
 HYBRID_TOKEN_LIMIT     = 3500   # trimmed context tokens before escalating to cloud
@@ -96,8 +97,8 @@ CODER_MODEL_CLOUD   = "llama-3.3-70b-versatile"  # strong — use for actual cod
 #  CODER_MODEL_CLOUD   = "claude-sonnet-4-6"
 
 #  Gemini (uncomment + set CLOUD_PROVIDER = "gemini"):
-#  REFINER_MODEL_CLOUD = "gemini-2.0-flash"
-#  CODER_MODEL_CLOUD   = "gemini-2.5-pro"
+REFINER_MODEL_CLOUD = "gemini-2.0-flash"
+CODER_MODEL_CLOUD   = "gemini-2.5-pro"
 
 #  OpenAI (uncomment + set CLOUD_PROVIDER = "openai"):
 #  REFINER_MODEL_CLOUD = "gpt-4o-mini"
