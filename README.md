@@ -390,6 +390,8 @@ Routing also recognizes typos (fuzzy keyword matching), broad-scope phrases (*"d
 
 Codi never regenerates a whole file for a small change unless it has to. `edit_file` supports four strategies, and the Executor picks automatically based on the step's wording:
 
+For exact code navigation, Codi keeps ChromaDB for semantic search and a local SQLite index at `.codi/code_index.sqlite3` for exact file paths, declarations, and identifier references. SQLite ships with Python; no MySQL or separate database installation is needed. Before a variable or symbol rename, the Coder is instructed to use `find_symbol` and `find_references`, then edit only a verified span. Ambiguous text replacements are rejected instead of silently changing the first match.
+
 ### 1. Text-match replace (default for small, precise changes)
 ```json
 {"path": "app.py", "old": "def foo():\n    pass", "new": "def foo():\n    return 42"}

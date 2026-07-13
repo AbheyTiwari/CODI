@@ -191,6 +191,15 @@ def _path_arg(args) -> str:
     return _abs(str(raw_path)) if raw_path else ""
 
 
+def _refresh_exact_index(path: str) -> None:
+    """Keep the SQLite symbol index synchronized without failing file I/O."""
+    try:
+        from state.code_index import index_file
+        index_file(path)
+    except Exception as exc:
+        log("code_index_refresh_error", {"path": path, "error": str(exc)[:160]})
+
+
 def read_file(args) -> str:
     """Read a file. Relative paths resolve from the project directory."""
     path = _path_arg(args)
@@ -289,6 +298,7 @@ def write_file(args: dict) -> str:
                 _write_with_typing_effect(f, content)
             else:
                 f.write(content)
+        _refresh_exact_index(path)
         log("tool_result", {"tool": "write_file", "path": path, "status": "ok"})
         result = {
             "success":       True,
@@ -302,6 +312,27 @@ def write_file(args: dict) -> str:
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"success": False, "tool": "write_file", "error": str(e), "path": path})
+
+
+def create_file(args: dict) -> str:
+    """Create a new file without overwriting an existing one."""
+    path = _path_arg(args)
+    if not path:
+        return "ERROR creating file: missing path"
+    if os.path.exists(path):
+        return (
+            f"ERROR creating file: {path} already exists. "
+            "Use read_file followed by edit_file for a surgical change; never recreate it."
+        )
+    result = write_file(args)
+    try:
+        payload = json.loads(result)
+        if isinstance(payload, dict):
+            payload["tool"] = "create_file"
+            return json.dumps(payload)
+    except (TypeError, ValueError):
+        pass
+    return result
 
 
 def edit_file(args: dict) -> str:
@@ -351,6 +382,7 @@ def edit_file(args: dict) -> str:
                 _write_with_typing_effect(f, content)
             else:
                 f.write(content)
+        _refresh_exact_index(path)
         log("tool_result", {
             "tool": "edit_file",
             "path": path,
@@ -485,6 +517,12 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
         return c.replace(o, n, count), min(count, occurrences)
 
     # ── Attempt 1: exact match ────────────────────────────────────────────────
+    exact_occurrences = content.count(old)
+    if exact_occurrences > 1 and (count is None or count == 1):
+        raise ValueError(
+            f"text match is ambiguous ({exact_occurrences} occurrences). "
+            "Use a longer unique old snippet or explicitly set count."
+        )
     result, found = _do_replace(content, old, new)
     if found:
         return result, found
@@ -693,7 +731,7 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
 
 
 def register_file_tools(registry):
-    registry.register_local("create_file",        write_file)
+    registry.register_local("create_file",        create_file)
     registry.register_local("read_file",           read_file)
     registry.register_local("read_agent_history",  read_agent_history)
     registry.register_local("read_file_numbered",  read_file_numbered)

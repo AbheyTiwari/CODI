@@ -39,6 +39,7 @@ class TaskRequirements:
     must_have:  list[str]        = field(default_factory=list)
     must_not:   list[str]        = field(default_factory=list)
     files:      list[str]        = field(default_factory=list)
+    protected_files: list[str]   = field(default_factory=list)
 
     def framework_lock(self) -> list[str]:
         """
@@ -74,6 +75,8 @@ class TaskRequirements:
             lines.append("MUST NOT:  " + ", ".join(self.must_not))
         if self.files:
             lines.append("FILES:     " + ", ".join(self.files))
+        if self.protected_files:
+            lines.append("READ ONLY: " + ", ".join(self.protected_files))
         return "\n".join(lines) if lines else "(no constraints extracted)"
 
     def to_dict(self) -> dict:
@@ -82,6 +85,7 @@ class TaskRequirements:
             "must_have": self.must_have,
             "must_not":  self.must_not,
             "files":     self.files,
+            "protected_files": self.protected_files,
         }
 
 
@@ -131,6 +135,9 @@ class RunState:
     # ── Validation ────────────────────────────────────────────────────────────
     validation_passed: bool = False
     validation_notes:  str  = ""
+    validation_repair_instruction: str = ""
+    clarification_prompt: str = ""
+    validation_findings: list[dict[str, Any]] = field(default_factory=list)
     validation_requires_correction: bool = True
 
     # ── Final output ──────────────────────────────────────────────────────────

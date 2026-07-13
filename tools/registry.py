@@ -60,11 +60,13 @@ class ToolRegistry:
         Call this once at startup.
         """
         from tools.local.file_tools   import register_file_tools
+        from tools.local.code_index_tools import register_code_index_tools
         from tools.local.shell_tools  import register_shell_tools
         from tools.local.search_tools import register_search_tools
         from tools.mcp.mcp_tools      import register_mcp_tools
 
         register_file_tools(self)
+        register_code_index_tools(self)
         register_shell_tools(self)
         register_search_tools(self)
         register_mcp_tools(self, mode=mode)

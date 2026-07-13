@@ -290,6 +290,13 @@ class Dispatcher:
                 else:
                     output_text = f"{output_text}\n{warning}" if output_text else warning
             status = "error" if output_text.startswith(("ERROR", "WRITE REJECTED", "BLOCKED")) else "ok"
+            # Some MCP adapters serialize a remote failure as a successful
+            # text response (for example "### Error\nError: browser...").
+            # Treat that as a real tool failure; otherwise a failed browser
+            # check can incorrectly complete a verification plan step.
+            lowered_output = output_text.lower()
+            if "### error" in lowered_output or "browserbackend.calltool:" in lowered_output:
+                status = "error"
             # Most local tools return structured JSON.  A payload declaring
             # success:false is a real failure even though its serialized form
             # does not start with the word "ERROR".

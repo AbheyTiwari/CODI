@@ -67,6 +67,9 @@ class ContextBuilder:
         # Project shape is deterministic and required for every code-changing task.
         if not state.knowledge.project:
             self._run(state, "inspect_project", {"path": "."})
+            # Chroma remains the semantic search layer; SQLite supplies exact
+            # paths, declarations, and references for surgical changes.
+            self._run(state, "refresh_code_index", {"path": "."})
         if full_codebase:
             # A full-context session reads every eligible project file through
             # the normal tool boundary.  The collected prompt evidence remains

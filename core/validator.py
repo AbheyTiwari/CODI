@@ -8,11 +8,13 @@
 import json
 import os
 import subprocess
+import shutil
+import sys
 from langchain_core.messages import HumanMessage
 
 from context_trimmer import trim_tool_output
 from dispatcher import Dispatcher
-from llm_factory import get_refiner_llm, _FallbackLLM
+from llm_factory import get_validator_llm, _FallbackLLM
 from logger import log
 from state.temp_db import RunState
 from core.validation_utils import build_framework_contamination_errors
@@ -24,6 +26,11 @@ _STOPWORDS = {
     "editing", "make", "makes", "making", "update", "updates", "updating",
     "include", "includes", "including", "write", "writes", "writing",
     "file", "using", "so", "that", "it", "this",
+}
+
+_IMPLEMENTATION_TERMS = {
+    "add", "change", "create", "edit", "fix", "implement", "insert",
+    "modify", "remove", "replace", "style", "update", "write",
 }
 
 
@@ -40,6 +47,10 @@ def _detect_step_target_file(step: str) -> str | None:
         step,
     )
     return match.group(1).strip("'\"` ") if match else None
+
+
+def _step_requires_mutation(step: str) -> bool:
+    return bool(set(re.findall(r"[a-zA-Z]+", (step or "").lower())) & _IMPLEMENTATION_TERMS)
 
 # Validate prompt — tight JSON-only output expected.
 _VALIDATE_PROMPT = """
@@ -63,6 +74,30 @@ OR:
 JSON only:"""
 
 
+_VALIDATE_PROMPT = """
+You are the validator subagent in the dispatcher workflow.
+Task: {task}
+Requirements:
+{requirements}
+Plan progress: {plan_progress}
+Plan steps:
+{plan_steps}
+Tool results:
+{tool_results}
+
+Complete source of every file modified during this run:
+{changed_sources}
+
+Verify the code against the task, requirements, plan, and complete source. Do not
+approve code merely because it parses. If it fails, name the path and line when
+possible and give one minimal surgical repair instruction for the coder.
+Respond ONLY with JSON:
+{{"passed":true,"notes":"","repair_instruction":"","findings":[]}}
+OR:
+{{"passed":false,"notes":"specific failure","repair_instruction":"one exact surgical action for the coder","findings":[{{"path":"relative/path","line":12,"severity":"error","problem":"what is wrong","repair":"minimal change"}}]}}
+"""
+
+
 class Validator:
     def __init__(self):
         self.llm = None
@@ -70,7 +105,7 @@ class Validator:
     def _get_llm(self):
         if self.llm is None:
             try:
-                self.llm = get_refiner_llm()
+                self.llm = get_validator_llm()
             except Exception as e:
                 log("validator_llm_error", {"error": str(e)[:200]})
                 self.llm = _FallbackLLM("refiner llm unavailable")
@@ -101,6 +136,11 @@ class Validator:
         last = state.tool_results[-1] if state.tool_results else None
         if last and last.tool == "dispatcher" and last.output in ("noop", "done"):
             current_step = getattr(state, "current_step", "") or ""
+            if _step_requires_mutation(current_step):
+                reason = "Implementation step returned noop without a verified file modification."
+                self._fail(state, reason)
+                log("validation_decision", {"layer": "noop_rejected", "passed": False, "reason": reason})
+                return False
             keywords = _extract_step_keywords(current_step)
             target_file = _detect_step_target_file(current_step)
 
@@ -199,6 +239,16 @@ class Validator:
             })
             return False
 
+        python_quality_reason = self._python_quality_check(state)
+        if python_quality_reason:
+            self._fail(state, python_quality_reason)
+            log("validation_decision", {
+                "layer": "python_quality",
+                "passed": False,
+                "reason": trim_tool_output(python_quality_reason, max_tokens=15),
+            })
+            return False
+
         # ── Framework contamination checks on generated/modified content ───────────
         contamination_reason = self._framework_contamination_check(state)
         if contamination_reason:
@@ -261,6 +311,8 @@ class Validator:
         state.validation_requires_correction = False
         state.validation_classification = "success"
         state.validation_recommendation = "continue"
+        state.validation_repair_instruction = ""
+        state.validation_findings = []
 
     def _fail(self, state: RunState, notes: str, requires_correction: bool = True):
         state.validation_passed = False
@@ -281,6 +333,78 @@ class Validator:
             classification, recommendation = "incorrect_assumption", "gather_more_context"
         state.validation_classification = classification
         state.validation_recommendation = recommendation
+
+    @staticmethod
+    def _changed_source_context(state: RunState) -> tuple[str, str]:
+        """Read complete modified files for the independent semantic review."""
+        from config import VALIDATOR_CODE_CONTEXT_TOKENS
+
+        paths = list(state.files_written)
+        for result in state.tool_results:
+            if result.tool not in {"create_file", "write_file", "edit_file"}:
+                continue
+            try:
+                payload = json.loads(result.output)
+                path = payload.get("file_modified") or payload.get("path")
+                if path:
+                    paths.append(str(path))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        blocks: list[str] = []
+        used = 0
+        maximum = max(4_000, int(VALIDATOR_CODE_CONTEXT_TOKENS * 3.5))
+        omitted: list[str] = []
+        for path in dict.fromkeys(paths):
+            absolute = path if os.path.isabs(path) else os.path.join(working_dir, path)
+            try:
+                with open(absolute, "r", encoding="utf-8", errors="replace") as handle:
+                    source = handle.read()
+                relative = os.path.relpath(absolute, working_dir).replace("\\", "/")
+            except OSError:
+                continue
+            block = f"\n--- FILE: {relative} ---\n{source}\n--- END FILE: {relative} ---\n"
+            if used + len(block) > maximum:
+                omitted.append(relative)
+                continue
+            blocks.append(block)
+            used += len(block)
+        if omitted:
+            return "\n".join(blocks), "Validator source budget exceeded; unreviewed modified files: " + ", ".join(omitted)
+        return "\n".join(blocks) or "(no modified source files available)", ""
+
+    def _python_quality_check(self, state: RunState) -> str:
+        """Compile changed Python files and run Ruff when it is available."""
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        paths: list[str] = []
+        for result in state.tool_results:
+            if result.tool not in {"create_file", "write_file", "edit_file"} or result.status != "ok":
+                continue
+            try:
+                payload = json.loads(result.output)
+                path = payload.get("file_modified") or payload.get("path")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                path = None
+            if path and str(path).lower().endswith(".py"):
+                paths.append(str(path))
+
+        ruff = shutil.which("ruff")
+        for path in dict.fromkeys(paths):
+            absolute = path if os.path.isabs(path) else os.path.join(working_dir, path)
+            compile_result = subprocess.run(
+                [sys.executable, "-m", "py_compile", absolute],
+                cwd=working_dir, capture_output=True, text=True, timeout=20,
+            )
+            if compile_result.returncode:
+                return f"Python syntax check failed for {path}: {(compile_result.stderr or compile_result.stdout).strip()[:500]}"
+            if ruff:
+                lint_result = subprocess.run(
+                    [ruff, "check", "--output-format", "concise", absolute],
+                    cwd=working_dir, capture_output=True, text=True, timeout=20,
+                )
+                if lint_result.returncode:
+                    return f"Ruff lint failed for {path}: {(lint_result.stdout or lint_result.stderr).strip()[:500]}"
+        return ""
 
     def _generation_completion_check(self, state: RunState) -> str:
         """Fail fast when content-first generation did not provide its end marker."""
@@ -551,6 +675,12 @@ class Validator:
         """Ask the LLM if the task is semantically complete."""
         from context_trimmer import trim_tool_output
         
+        changed_sources, source_error = self._changed_source_context(state)
+        if source_error:
+            self._fail(state, source_error, requires_correction=False)
+            log("validation_decision", {"layer": "source_context", "passed": False, "reason": source_error})
+            return False
+
         prompt = _VALIDATE_PROMPT.format(
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
@@ -560,6 +690,7 @@ class Validator:
                 trim_tool_output(o, max_tokens=120)
                 for o in state.recent_tool_outputs(5)
             ),
+            changed_sources=changed_sources,
         )
         try:
             resp   = self._get_llm().invoke([HumanMessage(content=prompt)])
@@ -570,6 +701,10 @@ class Validator:
                 notes  = str(parsed.get("notes", ""))
                 state.validation_passed = passed
                 state.validation_notes  = notes
+                repair = str(parsed.get("repair_instruction", "")).strip()
+                findings = parsed.get("findings", [])
+                state.validation_repair_instruction = repair if not passed else ""
+                state.validation_findings = findings if isinstance(findings, list) else []
                 
                 log("validation_decision", {
                     "layer": "llm_semantic",

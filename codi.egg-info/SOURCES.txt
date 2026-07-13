@@ -33,8 +33,10 @@ core/quick_actions.py
 core/validation_utils.py
 core/validator.py
 state/__init__.py
+state/code_index.py
 state/knowledge.py
 state/temp_db.py
+test/test_code_index_and_surgical_edits.py
 test/test_content_diversity.py
 test/test_dispatcher_and_context.py
 test/test_executor_html_mount_heuristic.py
@@ -54,6 +56,7 @@ test/test_validator_structural.py
 tools/__init__.py
 tools/registry.py
 tools/local/__init__.py
+tools/local/code_index_tools.py
 tools/local/file_tools.py
 tools/local/project_inspector.py
 tools/local/search_tools.py

@@ -212,7 +212,7 @@
     ]
   },
   "stitch": {
-    "enabled": false,
+    "enabled": true,
     "description": "Google Stitch \u00e2\u20ac\u201d UI/UX code via HTTP MCP (disabled: needs STITCH_API_KEY)",
     "type": "http",
     "url": "https://stitch.googleapis.com/mcp",

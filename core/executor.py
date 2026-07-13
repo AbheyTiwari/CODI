@@ -214,6 +214,7 @@ _LARGE_CONTENT_EXTS = (".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".svg")
 _WRITE_TOOLS = {"write_file", "create_file"}
 
 _EDIT_KEYWORDS = ("edit", "update", "add", "modify", "insert", "append", "change", "fix", "remove", "debug", "style")
+_IMPLEMENTATION_VERBS = _EDIT_KEYWORDS + ("create", "implement", "replace", "write")
 
 _ADDITIVE_KEYWORDS = ("add", "insert", "implement", "introduce")
 _REPLACE_KEYWORDS = ("change", "replace", "update", "fix", "modify", "remove", "rename", "style", "debug")
@@ -229,6 +230,22 @@ _LINE_EDIT_KEYWORDS = (
 
 # Directories skipped when scanning for fuzzy-match candidates
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
+
+
+def _step_requires_mutation(step: str) -> bool:
+    lowered = (step or "").lower()
+    return any(re.search(rf"\b{re.escape(verb)}\b", lowered) for verb in _IMPLEMENTATION_VERBS)
+
+
+def _explicit_full_rewrite_requested(user_input: str) -> bool:
+    lowered = (user_input or "").lower()
+    return any(phrase in lowered for phrase in ("rewrite the entire", "replace the entire", "overwrite", "regenerate the entire"))
+
+
+def _path_is_protected(path: str, state: RunState) -> bool:
+    protected = getattr(state.requirements, "protected_files", []) or []
+    normalized = os.path.normcase(os.path.basename(path))
+    return any(normalized == os.path.normcase(os.path.basename(item)) for item in protected)
 
 
 def _resolve_existing_path(path: str) -> str | None:
@@ -430,6 +447,19 @@ class Executor:
             "\n".join(state.recent_tool_outputs(4)) or "(none yet)",
             max_tokens=800,
         )
+        # Include only the named source file for a one-function test step.
+        # This keeps the prompt compact while giving the model the behavior it
+        # must test, instead of relying on broad project context.
+        source_match = re.search(r"\bin\s+([A-Za-z0-9_./\\-]+\.py)\b", step)
+        if source_match:
+            source_path = source_match.group(1)
+            root = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+            absolute_source = source_path if os.path.isabs(source_path) else os.path.join(root, source_path)
+            try:
+                with open(absolute_source, "r", encoding="utf-8", errors="replace") as handle:
+                    context_str += f"\n\nSource under test ({source_path}):\n" + handle.read()[:16000]
+            except OSError:
+                pass
         prompt = _CONTENT_PROMPT.format(
             path=path,
             step=step,
@@ -470,6 +500,23 @@ class Executor:
             "action": "tool_call",
             "tools":  [{"name": tool, "args": {"path": path, "content": content}}],
         }
+        if tool == "create_file":
+            root = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+            absolute_target = path if os.path.isabs(path) else os.path.join(root, path)
+            if os.path.exists(absolute_target):
+                try:
+                    with open(absolute_target, "r", encoding="utf-8", errors="replace") as handle:
+                        existing = handle.read()
+                    action_bundle["tools"] = [{
+                        "name": "edit_file",
+                        "args": {"path": path, "old": existing, "new": existing.rstrip() + "\n\n" + content},
+                    }]
+                    tool = "edit_file"
+                    log("executor_test_content_append", {"path": path, "step": step[:160]})
+                except OSError as exc:
+                    error = f"Unable to read existing test file '{path}': {exc}"
+                    state.add_tool_result("edit_file", "error", error)
+                    return {"status": "error", "results": [{"tool": "edit_file", "status": "error", "output": error}], "error": error}
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -922,6 +969,64 @@ class Executor:
         # it here too, so the standard JSON path can't reintroduce the same
         # "file does not exist" looping bug through a different door.
         for t in action_bundle.get("tools", []):
+            if not isinstance(t, dict):
+                continue
+            tool_name = t.get("name")
+            args = t.get("args") or {}
+            target_path = str(args.get("path", ""))
+            if tool_name in _WRITE_TOOLS and target_path:
+                working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+                absolute_target = target_path if os.path.isabs(target_path) else os.path.join(working_dir, target_path)
+                if _path_is_protected(target_path, state):
+                    error = (
+                        f"Protected source file '{target_path}' cannot be changed for this task. "
+                        "Read it to understand behavior, then create or edit the requested test file instead."
+                    )
+                    state.add_tool_result(tool_name, "error", error)
+                    log("executor_protected_file_block", {"path": target_path, "step": step[:160]})
+                    return {"status": "error", "results": [{"tool": tool_name, "status": "error", "output": error}], "error": error}
+                # Models often plan to create a test file without accounting
+                # for a pre-existing placeholder.  Preserve the safe
+                # create_file contract, but transparently turn this specific
+                # recoverable case into an exact edit of the existing file.
+                # This avoids spending several repair iterations on the same
+                # predictable "already exists" failure.
+                if tool_name == "create_file" and os.path.exists(absolute_target):
+                    content = args.get("content")
+                    if isinstance(content, str) and content.strip():
+                        try:
+                            with open(absolute_target, "r", encoding="utf-8", errors="replace") as handle:
+                                existing_content = handle.read()
+                        except OSError as exc:
+                            error = f"Unable to read existing file '{target_path}' before editing: {exc}"
+                            state.add_tool_result("edit_file", "error", error)
+                            return {"status": "error", "results": [{"tool": "edit_file", "status": "error", "output": error}], "error": error}
+                        t["name"] = "edit_file"
+                        t["args"] = {"path": target_path, "old": existing_content, "new": content}
+                        log("executor_create_existing_converted_to_edit", {"path": target_path, "step": step[:160]})
+                        continue
+                if os.path.exists(absolute_target) and not _explicit_full_rewrite_requested(state.user_input):
+                    error = (
+                        f"Refusing to overwrite existing file '{target_path}'. Use read_file and edit_file for "
+                        "a surgical change, or require an explicit user request to rewrite the entire file."
+                    )
+                    state.add_tool_result(tool_name, "error", error)
+                    log("executor_existing_file_overwrite_block", {"path": target_path, "tool": tool_name, "step": step[:160]})
+                    return {"status": "error", "results": [{"tool": tool_name, "status": "error", "output": error}], "error": error}
+            if isinstance(t, dict) and t.get("name") in {"browser_navigate", "playwright_navigate"}:
+                url = str((t.get("args") or {}).get("url", ""))
+                if url.lower().startswith("file:"):
+                    error = (
+                        "Browser navigation to a local file URL is blocked. Read and edit the local "
+                        "file directly, or use a user-supplied running http:// URL for browser validation."
+                    )
+                    state.add_tool_result("browser_navigate", "error", error)
+                    log("executor_blocked_file_browser_url", {"url": url[:160], "step": step[:160]})
+                    return {
+                        "status": "error",
+                        "results": [{"tool": "browser_navigate", "status": "error", "output": error}],
+                        "error": error,
+                    }
             if not isinstance(t, dict) or t.get("name") != "edit_file":
                 continue
             args = t.get("args") or {}
@@ -970,6 +1075,18 @@ class Executor:
 
         if dispatch_result.get("signal") in ("noop", "done", "need_context"):
             signal = dispatch_result.get("signal", "noop")
+            if signal == "noop" and _step_requires_mutation(step):
+                error = (
+                    "Invalid noop for an implementation step. The coder must inspect the target "
+                    "and perform one verified create_file, write_file, or edit_file operation."
+                )
+                state.add_tool_result("dispatcher", "error", error)
+                log("executor_invalid_noop", {"step": step[:160], "action": action_bundle.get("action")})
+                return {
+                    "status": "error",
+                    "results": [{"tool": "dispatcher", "status": "error", "output": error}],
+                    "error": error,
+                }
             state.add_tool_result("dispatcher", "ok", signal)
             log("executor_dispatch_signal", {
                 "signal": signal,

@@ -100,10 +100,15 @@ def get_coder_llm():
     return _resolve("coder")
 
 
+def get_validator_llm():
+    """Independent validator invocation using the refiner model configuration."""
+    return _resolve("validator")
+
+
 def _resolve(role: str):
     """
     Route to the right LLM based on MODE.
-    role: "refiner" | "coder"
+    role: "refiner" | "coder" | "validator"
     """
     if MODE == "local":
         return _local_llm(role)
@@ -136,17 +141,17 @@ def _resolve(role: str):
 def _llamacpp_llm(role: str):
     from langchain_openai import ChatOpenAI
     from config import LLAMACPP_URL, LLAMACPP_REFINER_MODEL, LLAMACPP_CODER_MODEL, LLAMACPP_TIMEOUT
-    model = LLAMACPP_REFINER_MODEL if role == "refiner" else LLAMACPP_CODER_MODEL
+    model = LLAMACPP_CODER_MODEL if role == "coder" else LLAMACPP_REFINER_MODEL
     return ChatOpenAI(
         model=model,
         base_url=f"{LLAMACPP_URL.rstrip('/')}/v1",
         api_key="not-needed",
-        temperature=0.2 if role == "refiner" else 0.1,
+        temperature=0.1 if role == "coder" else 0.2,
         # Bound local generation so one stalled request does not consume two
         # full timeout windows and leave the agent appearing to only reason.
         timeout=LLAMACPP_TIMEOUT,
         max_retries=0,
-        max_tokens=700 if role == "refiner" else 1600,
+        max_tokens=1600 if role == "coder" else 1200,
     )
 
 # ── Local (Ollama) ────────────────────────────────────────────────────────────
@@ -160,12 +165,13 @@ def _local_llm(role: str):
     except Exception:
         return _FallbackLLM("langchain_ollama unavailable")
 
-    model   = REFINER_MODEL_LOCAL if role == "refiner" else CODER_MODEL_LOCAL
-    num_ctx = 4096 if role == "refiner" else 8192
+    from config import CODI_CONTEXT_WINDOW
+    model   = CODER_MODEL_LOCAL if role == "coder" else REFINER_MODEL_LOCAL
+    num_ctx = CODI_CONTEXT_WINDOW if role in {"coder", "validator"} else min(CODI_CONTEXT_WINDOW, 8192)
     llm = ChatOllama(
         model=model,
         base_url=OLLAMA_BASE_URL,
-        temperature=0.2 if role == "refiner" else 0.1,
+        temperature=0.1 if role == "coder" else 0.2,
         num_ctx=num_ctx,
         timeout=300,
         options={"think": OLLAMA_THINK},
@@ -186,12 +192,12 @@ def _air_llm(role: str):
     except Exception:
         return _FallbackLLM("langchain_openai unavailable")
 
-    model = AIR_LLM_REFINER_MODEL if role == "refiner" else AIR_LLM_CODER_MODEL
+    model = AIR_LLM_CODER_MODEL if role == "coder" else AIR_LLM_REFINER_MODEL
     return ChatOpenAI(
         model=model,
         base_url=f"{AIR_LLM_URL.rstrip('/')}/v1",
         api_key="not-needed",                   # Air LLM doesn't need a key
-        temperature=0.2 if role == "refiner" else 0.1,
+        temperature=0.1 if role == "coder" else 0.2,
         timeout=AIR_LLM_TIMEOUT,
         max_retries=1,
     )
@@ -200,8 +206,8 @@ def _air_llm(role: str):
 # ── Cloud ─────────────────────────────────────────────────────────────────────
 
 def _cloud_llm(role: str):
-    model = REFINER_MODEL_CLOUD if role == "refiner" else CODER_MODEL_CLOUD
-    temp  = 0.2 if role == "refiner" else 0.1
+    model = CODER_MODEL_CLOUD if role == "coder" else REFINER_MODEL_CLOUD
+    temp  = 0.1 if role == "coder" else 0.2
 
     if CLOUD_PROVIDER == "groq":
         try:

@@ -14,6 +14,13 @@ import os
 
 MODE = "llamacpp"    # local | hybrid | cloud | air | llamacpp
 
+# Maximum local context window supported by this machine.  Keep the model
+# server's own context setting at least this large when using llama.cpp.
+CODI_CONTEXT_WINDOW = 32768
+# The validator receives complete changed files, bounded below the model
+# window so its structured verdict still has room to be generated.
+VALIDATOR_CODE_CONTEXT_TOKENS = 24000
+
 # ── Cloud provider (used when MODE="cloud" or hybrid escalates) ───────────────
 # Options: "groq" | "anthropic" | "openai" | "gemini"
 CLOUD_PROVIDER = "gemini"

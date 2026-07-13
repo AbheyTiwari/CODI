@@ -47,8 +47,17 @@ from status_stream   import emit_status
 
 _FILE_MENTION_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b")
 
+_IMPLEMENTATION_VERBS = (
+    "add", "change", "create", "edit", "fix", "implement", "insert",
+    "modify", "remove", "replace", "style", "update", "write",
+)
 
-def _step_succeeded(state: RunState) -> bool:
+
+def _step_requires_mutation(step: str) -> bool:
+    return any(re.search(rf"\b{verb}\b", (step or "").lower()) for verb in _IMPLEMENTATION_VERBS)
+
+
+def _step_succeeded(state: RunState, step: str = "") -> bool:
     """
     Deterministic check: did the most recent tool action succeed?
     A step counts as done if the last tool result recorded is 'ok', OR if
@@ -60,6 +69,8 @@ def _step_succeeded(state: RunState) -> bool:
     if not state.tool_results:
         return False
     last = state.tool_results[-1]
+    if _step_requires_mutation(step):
+        return last.status == "ok" and last.tool in {"create_file", "write_file", "edit_file"}
     if last.status == "ok":
         return True
     # dispatcher noop/duplicate-write signals also count as step success —
@@ -310,7 +321,10 @@ class CodiAgent:
             if state.exceeds_max():
                 _agent_status("Reached max iterations; stopping.")
                 log("agent_max_iterations", {"iterations": state.iteration})
-                state.status = "complete"
+                # Reaching the safety cap is not a successful completion.
+                # Keeping this as "complete" made the UI claim success even
+                # when validation still had outstanding repair work.
+                state.status = "failed"
                 break
 
             # Improver decides what to do next
@@ -356,7 +370,7 @@ class CodiAgent:
             # recent tool action for THIS step succeed? This is independent
             # of whether the overall task is finished — do not let the
             # semantic validator gate this.
-            if _step_succeeded(state):
+            if _step_succeeded(state, step):
                 state.mark_step_complete(step)
                 log("step_marked_complete", {"step": step[:120], "completed_count": len(state.completed_steps)})
 
@@ -372,10 +386,23 @@ class CodiAgent:
 
             # Validation failed — ask Improver to correct only real failures
             if not state.validation_passed and state.iteration < state.max_iterations and getattr(state, "validation_requires_correction", True):
+                repair_key = "__validation_repair__"
+                state.repair_attempts[repair_key] = state.repair_attempts.get(repair_key, 0) + 1
+                if state.repair_attempts[repair_key] >= 3:
+                    state.status = "awaiting_context"
+                    state.clarification_prompt = (
+                        "I could not safely complete this after three repair attempts. "
+                        f"The last failure was: {state.validation_notes}\n\n"
+                        "Please clarify the intended behavior or provide the missing dependency/configuration. "
+                        "I will keep the original plan and continue from the failing step.\n\n"
+                        f"Original plan: {state.plan or '(no plan summary available)'}"
+                    )
+                    log("agent_clarification_required", {"attempts": 3, "notes": state.validation_notes[:200]})
+                    return state.clarification_prompt
                 _agent_status(f"Validation needs repair: {state.validation_notes[:120]}")
-                correction = str(self.improver.improve(state))
+                correction = state.validation_repair_instruction or str(self.improver.improve(state))
                 log("agent_correction", {"correction": correction[:100]})
-                state.plan = f"{state.plan}\n[CORRECTION]: {correction}"
+                state.validation_repair_instruction = correction
 
         # ── Phase 4: Final summary ────────────────────────────────────────────
         # THIS WAS PREVIOUSLY MISSING. The loop above only sets state.status

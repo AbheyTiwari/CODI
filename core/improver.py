@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import ast
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_factory import get_refiner_llm
@@ -85,6 +86,15 @@ Rules:
   Plan EDIT steps only — do NOT plan to create them again.
 - For simple single-file tasks, ONE step is enough.
 - Be specific: name the file, name the tool, name the content.
+- Every implementation step MUST name at least one target file. Never use a
+  vague step such as "Add CSS" or "Implement JavaScript"; say exactly where
+  it will be added. A read-only action is not an implementation step.
+- Do not plan browser navigation, screenshots, or `file:` URLs for local
+  files. Use source reads and the semantic validator unless the user supplied
+  a running http:// or https:// application URL.
+- For a unit-test request, the named source file is READ ONLY. Plan a new or
+  existing test file (for example `test_main.py`) and tests that import the
+  source; never write, recreate, or replace the source file.
 
 Example (simple):
 {{"plan":"Create a greeting HTML page","steps":["Write hello.html with full HTML greeting Versha and Shubham"]}}
@@ -160,6 +170,39 @@ def _extract_file_refs(text: str) -> list[str]:
     return _unique([m.group(1).strip("'\"` ") for m in re.finditer(pattern, text or "")])
 
 
+_VERIFICATION_WORDS = ("verify", "validate", "test", "check", "screenshot")
+_IMPLEMENTATION_WORDS = ("add", "change", "create", "edit", "fix", "implement", "insert", "modify", "remove", "replace", "style", "update", "write")
+
+
+def _normalize_plan_steps(steps: list[str], requirements: TaskRequirements) -> list[str]:
+    """Make every implementation step file-targeted before execution begins."""
+    normalized: list[str] = []
+    known_files = _unique(requirements.files)
+    for raw_step in steps:
+        step = _as_text(raw_step).strip()
+        if not step:
+            continue
+        lowered = step.lower()
+        # Browser MCP cannot open file:// URLs. Local HTML is verified from
+        # source unless the user explicitly supplied a running web URL.
+        if any(term in lowered for term in ("browser", "reload the page", "screenshot")):
+            target = _extract_file_refs(step) or known_files
+            if target:
+                step = f"Read {target[0]} and verify its HTML structure and requested content"
+                lowered = step.lower()
+        is_verification = any(word in lowered for word in _VERIFICATION_WORDS)
+        needs_file = any(re.search(rf"\b{word}\b", lowered) for word in _IMPLEMENTATION_WORDS)
+        if needs_file and not is_verification and not _extract_file_refs(step):
+            if len(known_files) == 1:
+                step = f"{step} in {known_files[0]}"
+            else:
+                # Leave an explicit blocker in the plan rather than letting a
+                # weak model silently choose noop for an ungrounded task.
+                step = f"Inspect project and identify the target file before: {step}"
+        normalized.append(step)
+    return normalized
+
+
 def _deterministic_requirements(task: str) -> TaskRequirements:
     lowered = (task or "").lower()
     framework = None
@@ -183,6 +226,75 @@ def _deterministic_requirements(task: str) -> TaskRequirements:
         reqs.must_have.append(f"{framework} implementation")
         reqs.must_not.extend(reqs.framework_lock())
     return reqs
+
+
+def _is_unit_test_task(task: str) -> bool:
+    lowered = (task or "").lower()
+    return "unit test" in lowered or "unittest" in lowered or "pytest" in lowered or "test case" in lowered
+
+
+def _is_broad_every_function_request(task: str) -> bool:
+    lowered = (task or "").lower()
+    return _is_unit_test_task(task) and any(phrase in lowered for phrase in (
+        "each function", "every function", "all functions", "each of functions",
+    ))
+
+
+def _function_by_function_test_steps() -> list[str]:
+    """Use Python AST so a small model receives one function-sized task at a time."""
+    root = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+    steps: list[str] = []
+    skipped = {".git", ".venv", "venv", "node_modules", "__pycache__", ".codi"}
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in skipped]
+        for filename in sorted(files):
+            if not filename.endswith(".py") or filename.startswith("test_"):
+                continue
+            absolute = os.path.join(directory, filename)
+            try:
+                with open(absolute, "r", encoding="utf-8", errors="replace") as handle:
+                    tree = ast.parse(handle.read())
+            except (OSError, SyntaxError):
+                continue
+            source = os.path.relpath(absolute, root).replace("\\", "/")
+            target = f"test_{os.path.splitext(filename)[0]}.py"
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    steps.append(
+                        f"Create or update {target} with unit tests only for function {node.name} in {source}"
+                    )
+    if steps:
+        steps.append("Run the focused Python tests and report any failing function")
+    return steps
+
+
+def _test_file_for(source_file: str, project_files: list[str]) -> str:
+    stem, extension = os.path.splitext(os.path.basename(source_file))
+    filename = f"test_{stem}{extension or '.py'}"
+    normalized = [str(path).replace("\\", "/") for path in project_files]
+    for directory in ("tests", "test"):
+        if any(path.startswith(f"{directory}/") for path in normalized):
+            return f"{directory}/{filename}"
+    return filename
+
+
+def _enforce_test_intent(steps: list[str], requirements: TaskRequirements) -> list[str]:
+    """Keep test generation additive: source is read-only, test file is the target."""
+    if not requirements.protected_files or not requirements.files:
+        return steps
+    source_file = requirements.protected_files[0]
+    test_file = requirements.files[0]
+    adjusted: list[str] = []
+    test_written = False
+    for step in steps:
+        lowered = step.lower()
+        if any(word in lowered for word in ("run ", "verify", "validate", "pytest", "unittest")):
+            adjusted.append(f"Run the focused tests in {test_file} against {source_file}")
+            continue
+        verb = "Edit" if test_written else "Create"
+        adjusted.append(f"{verb} {test_file} with focused unit tests for behavior in {source_file}")
+        test_written = True
+    return adjusted
 
 
 def _files_from_tool_results(state: RunState) -> list[str]:
@@ -315,6 +427,13 @@ class Improver:
 
     def _extract_requirements(self, state: RunState):
         state.requirements = _deterministic_requirements(state.user_input)
+        if _is_unit_test_task(state.user_input):
+            source_files = [path for path in _extract_file_refs(state.user_input) if path.lower().endswith(".py")]
+            if source_files:
+                source_file = source_files[0]
+                project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+                state.requirements.protected_files = [source_file]
+                state.requirements.files = [_test_file_for(source_file, project_files)]
         log("improver_requirements", {
             "source": "deterministic",
             "requirements": state.requirements.to_dict(),
@@ -324,6 +443,14 @@ class Improver:
         from dispatcher import Dispatcher
 
         self._extract_requirements(state)
+
+        if _is_broad_every_function_request(state.user_input):
+            steps = _function_by_function_test_steps()
+            if steps:
+                state.plan = "Generate and verify unit tests one function at a time."
+                state.plan_steps = steps
+                log("plan_created", {"plan_source": "function_inventory", "steps": len(steps)})
+                return {"plan": state.plan, "steps": steps}
 
         prompt = _PLAN_PROMPT.format(
             task=state.user_input,
@@ -341,10 +468,12 @@ class Improver:
             state.plan = _as_text(parsed.get("plan", ""))
             raw_steps  = parsed.get("steps", [])
             if isinstance(raw_steps, list):
-                state.plan_steps = [_as_text(s) for s in raw_steps if _as_text(s)]
+                state.plan_steps = _enforce_test_intent(_normalize_plan_steps(
+                    [_as_text(s) for s in raw_steps if _as_text(s)], state.requirements
+                ), state.requirements)
             else:
                 s = _as_text(raw_steps)
-                state.plan_steps = [s] if s else []
+                state.plan_steps = _enforce_test_intent(_normalize_plan_steps([s] if s else [], state.requirements), state.requirements)
             log("plan_created", {
                 "plan_source": "json",
                 "steps": len(state.plan_steps),
@@ -363,7 +492,7 @@ class Improver:
             if line:
                 steps.append(line)
         state.plan       = raw[:200]
-        state.plan_steps = steps[:5]
+        state.plan_steps = _enforce_test_intent(_normalize_plan_steps(steps[:5], state.requirements), state.requirements)
 
         log("plan_created", {
             "plan_source": "fallback",
@@ -381,6 +510,17 @@ class Improver:
         from dispatcher import Dispatcher
         from context_trimmer import trim_tool_output
         done_count = len(state.completed_steps)
+
+        if state.validation_repair_instruction:
+            repair = state.validation_repair_instruction
+            state.validation_repair_instruction = ""
+            log("step_selected", {
+                "step": trim_tool_output(repair, max_tokens=30),
+                "source": "validator_repair",
+                "iteration": state.iteration,
+                "done": False,
+            })
+            return {"step": repair, "done": False}
 
         if state.plan_steps and "[CORRECTION]" not in (state.plan or ""):
             selected_step = next(
@@ -507,7 +647,14 @@ class Improver:
         successes = len([r for r in state.tool_results if r.status == "ok"])
         failures = len([r for r in state.tool_results if r.status == "error"])
 
-        if files:
+        stopped_at_limit = state.exceeds_max() and not state.validation_passed
+        if stopped_at_limit or state.status == "failed":
+            output = "Stopped before completion."
+            if stopped_at_limit:
+                output += " Reached the maximum number of iterations."
+            if state.validation_notes:
+                output += f" Last validation issue: {state.validation_notes}"
+        elif files:
             output = "Done. Changed: " + ", ".join(files[:8]) + "."
         elif successes:
             output = f"Done. Completed {successes} tool action(s)."
