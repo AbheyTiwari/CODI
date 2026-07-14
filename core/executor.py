@@ -52,7 +52,7 @@ Available tools:
 {tools}
 
 Output ONLY the corrected JSON. Use exactly this structure:
-{{"action":"tool_call","tools":[{{"name":"TOOL_NAME","args":{{ARGS}}}}]}}
+{{"action":"tool_call","reason":"short justification","tools":[{{"name":"TOOL_NAME","args":{{ARGS}}}}]}}
 
 Or if nothing to do: {{"action":"noop"}}
 
@@ -96,7 +96,7 @@ Requirements:
 {requirements}
 
 Output ONLY this JSON — no prose, no fences:
-{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
 
 Rules:
 - "old" MUST be a contiguous substring that appears character-for-character in the file content shown above.
@@ -121,7 +121,7 @@ Task: {step}
 
 Look at the file content above character by character and pick a short
 substring that ACTUALLY EXISTS in it. Output ONLY this JSON:
-{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM FILE ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM FILE ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
 
 JSON only:"""
 
@@ -144,15 +144,15 @@ Requirements:
 Output ONLY JSON using ONE of these forms — no prose, no fences:
 
 To replace a contiguous range of lines:
-{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","replace_lines":{{"start":N,"end":M,"content":"new code here"}}}}}}]}}
+{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","replace_lines":{{"start":N,"end":M,"content":"new code here"}}}}}}]}}
 
 To delete a contiguous range of lines:
-{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","delete_lines":{{"start":N,"end":M}}}}}}]}}
+{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","delete_lines":{{"start":N,"end":M}}}}}}]}}
 
 To insert new code before line N (use the line number that should come
 immediately AFTER the inserted code; to insert at the very end of the file,
 use line number = total_lines + 1):
-{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","insert_at_line":{{"line":N,"content":"new code here"}}}}}}]}}
+{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","insert_at_line":{{"line":N,"content":"new code here"}}}}}}]}}
 
 Rules:
 - Line numbers MUST come directly from the numbered content above — never guess or estimate them.
@@ -452,6 +452,23 @@ class Executor:
             tool_names=self.registry.list_names(),
         ))
 
+    def _log_justification(self, step: str, action_bundle: dict | None) -> None:
+        """Record the executor's stated reason for its tool choice.
+
+        Every tool_call bundle is required (by the executor system prompt) to
+        carry a "reason" field. This makes the ReAct "why this tool, why not
+        another" requirement auditable via /logs without introducing any new
+        approval or blocking machinery — dispatch() already ignores unknown
+        top-level keys, so this is purely observational.
+        """
+        if not isinstance(action_bundle, dict):
+            return
+        reason = action_bundle.get("reason")
+        if reason:
+            log("tool_justification", {"step": step[:160], "reason": str(reason)[:240]})
+        elif action_bundle.get("action") in ("tool_call", "parallel"):
+            log("tool_justification_missing", {"step": step[:160]})
+
     def _repair_action_bundle(self, step: str, raw: str, state: RunState) -> dict | None:
         prompt = _REPAIR_PROMPT.format(
             step=step,
@@ -531,6 +548,7 @@ class Executor:
 
         action_bundle = {
             "action": "tool_call",
+            "reason": f"content-first write of {path} (fresh or large file, no exact-text edit possible)",
             "tools":  [{"name": tool, "args": {"path": path, "content": content}}],
         }
         if tool == "create_file":
@@ -550,6 +568,8 @@ class Executor:
                     error = f"Unable to read existing test file '{path}': {exc}"
                     state.add_tool_result("edit_file", "error", error)
                     return {"status": "error", "results": [{"tool": "edit_file", "status": "error", "output": error}], "error": error}
+
+        self._log_justification(step, action_bundle)
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -762,8 +782,11 @@ class Executor:
 
         action_bundle = {
             "action": "tool_call",
+            "reason": f"additive append to {path} (step is additive-only, no existing text to replace)",
             "tools": [{"name": "edit_file", "args": {"path": path, "append": new_code}}],
         }
+
+        self._log_justification(step, action_bundle)
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -822,6 +845,8 @@ class Executor:
                 "results": [{"tool": "edit_file", "status": "error", "output": error}],
                 "error": error,
             }
+
+        self._log_justification(path, action_bundle)
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -968,6 +993,8 @@ class Executor:
                 "results": [{"tool": "coder", "status": "error", "output": error}],
                 "error":   error,
             }
+
+        self._log_justification(step, action_bundle)
 
         tools_to_call = []
         if isinstance(action_bundle, dict) and "tools" in action_bundle:

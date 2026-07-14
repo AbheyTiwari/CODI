@@ -132,6 +132,16 @@ class RunState:
     project_manifest: dict[str, Any] = field(default_factory=lambda: {"package": None, "files_created": {}})
     plan_confirmed:  bool = True
 
+    # ── LLM backend health ──────────────────────────────────────────────────
+    # Incremented by agent.py each time Improver.next_step()/.improve()
+    # reports that the underlying LLM call itself failed (connection error,
+    # timeout, backend unreachable) rather than the model returning a real
+    # (possibly empty) response. Used to distinguish "the planner decided
+    # there's nothing left to do" from "the backend never answered" — these
+    # were previously conflated, causing runs to silently report success
+    # when the configured LLM backend was simply down.
+    llm_backend_errors: int = 0
+
     # ── Validation ────────────────────────────────────────────────────────────
     validation_passed: bool = False
     validation_notes:  str  = ""

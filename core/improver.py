@@ -366,7 +366,7 @@ def _files_from_tool_results(state: RunState) -> list[str]:
     """
     files = []
     for result in state.tool_results:
-        if result.tool not in ("create_file", "write_file", "edit_file"):
+        if result.tool not in ("create_file", "write_file", "edit_file", "apply_patch"):
             continue
         if result.status != "ok":
             continue  # <-- the fix: skip failed attempts entirely
@@ -387,10 +387,72 @@ def _files_from_tool_results(state: RunState) -> list[str]:
     return _unique(files)
 
 
+def classify_plan_risk(state: RunState) -> dict:
+    """
+    Deterministic risk classification for a proposed plan — no LLM call, no
+    guessing. Runs purely against state.requirements.files and the actual
+    filesystem, so the result is reproducible and auditable.
+
+    Returns:
+        {
+          "risk": "low" | "medium" | "high",
+          "files_to_create": [...],   # files that do not yet exist on disk
+          "files_to_modify": [...],   # files that already exist on disk
+        }
+
+    Risk heuristic (intentionally simple and explainable):
+      - 0-1 target files, no framework lock  -> low
+      - 2-4 target files, OR any framework lock -> medium
+      - 5+ target files -> high
+    A framework lock always raises a would-be "low" to "medium" because a
+    single-file change can still fail structurally (wrong stack entirely),
+    which the deterministic contamination checker in core/validator.py
+    already treats as a hard failure, not a soft warning.
+    """
+    working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+    files = _unique(state.requirements.files or [])
+
+    creates: list[str] = []
+    modifies: list[str] = []
+    for f in files:
+        absolute = f if os.path.isabs(f) else os.path.join(working_dir, f)
+        if os.path.exists(absolute):
+            modifies.append(f)
+        else:
+            creates.append(f)
+
+    file_count = len(files)
+    if file_count <= 1:
+        risk = "low"
+    elif file_count <= 4:
+        risk = "medium"
+    else:
+        risk = "high"
+
+    if state.requirements.framework and risk == "low":
+        risk = "medium"
+
+    result = {"risk": risk, "files_to_create": creates, "files_to_modify": modifies}
+    log("plan_risk_classified", {
+        "risk": risk,
+        "creates": len(creates),
+        "modifies": len(modifies),
+        "framework": state.requirements.framework,
+    })
+    return result
+
+
 class Improver:
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
         self.llm      = get_refiner_llm()
+        # FIX: set on every _call() invocation — None means the last call
+        # either succeeded or hasn't been made yet; a string means the LLM
+        # request itself failed (connection error, timeout, backend down).
+        # Callers (next_step in particular) must check this BEFORE treating
+        # an empty response as "nothing to do" / "task complete" — those are
+        # not the same thing as "the backend never answered".
+        self._last_llm_error: str | None = None
 
     def _orchestrator_sys(self) -> SystemMessage:
         return SystemMessage(content=_ORCHESTRATOR_SYSTEM.format(
@@ -399,10 +461,12 @@ class Improver:
 
     def _call(self, prompt: str, system: SystemMessage | None = None) -> str:
         sys_msg = system or self._orchestrator_sys()
+        self._last_llm_error = None
         try:
             resp = self.llm.invoke([sys_msg, HumanMessage(content=prompt)])
             return resp.content.strip()
         except Exception as e:
+            self._last_llm_error = str(e)
             log("improver_error", {"error": str(e)})
             return ""
 
@@ -529,6 +593,21 @@ class Improver:
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
         state.record_llm("improver_plan_raw", raw)
 
+        if self._last_llm_error is not None:
+            # The planning LLM call itself failed (connection error, timeout,
+            # backend down) — this is NOT the same as "the model decided
+            # there is nothing to plan". Surface it plainly instead of
+            # silently producing an empty plan that downstream code (agent.py,
+            # the plan.md confirmation gate) will interpret as a legitimate
+            # zero-step plan.
+            state.plan = f"[PLANNING FAILED] LLM backend error: {self._last_llm_error}"
+            state.plan_steps = []
+            log("plan_created", {
+                "plan_source": "llm_backend_error",
+                "error": self._last_llm_error[:200],
+            })
+            return {"plan": state.plan, "steps": []}
+
         from context_trimmer import trim_tool_output
         parsed = Dispatcher.parse_llm_json(raw)
         if isinstance(parsed, dict) and "steps" in parsed:
@@ -573,7 +652,16 @@ class Improver:
     # ── Phase 3: Decide next step ─────────────────────────────────────────────
 
     def next_step(self, state: RunState) -> dict:
-        """Return {"step": str, "done": bool} for the current iteration."""
+        """Return {"step": str, "done": bool} for the current iteration.
+
+        FIX: also returns "llm_error": str when the underlying LLM call
+        itself failed. agent.py MUST check this before treating an empty
+        step + done=False as task completion — previously a connection
+        error to the LLM backend produced an empty step string, which the
+        `if done or not step:` check in agent.py silently interpreted as
+        "planner says the task is complete", reporting success on a run
+        that never actually did anything.
+        """
         from dispatcher import Dispatcher
         from context_trimmer import trim_tool_output
         done_count = len(state.completed_steps)
@@ -613,6 +701,8 @@ class Improver:
                 if last_error and prior_attempts > 0:
                     state.validation_notes = last_error.output
                     correction = self.improve(state)
+                    if self._last_llm_error is not None:
+                        return {"step": "", "done": False, "llm_error": self._last_llm_error}
                     state.step_attempts[selected_step] = prior_attempts + 1
                     log("step_selected", {
                         "step": trim_tool_output(correction, max_tokens=20),
@@ -647,6 +737,14 @@ class Improver:
         )
         raw = self._call(prompt)
         state.record_llm("improver_next_step", raw)
+
+        if self._last_llm_error is not None:
+            log("step_selected", {
+                "iteration": state.iteration,
+                "source": "llm_backend_error",
+                "error": self._last_llm_error[:200],
+            })
+            return {"step": "", "done": False, "llm_error": self._last_llm_error}
 
         parsed = Dispatcher.parse_llm_json(raw)
         selected_step = None
@@ -751,6 +849,10 @@ class Improver:
         )
         state.record_llm("improver_improve", raw)
 
+        if self._last_llm_error is not None:
+            log("improver_correction", {"source": "llm_backend_error", "error": self._last_llm_error[:200]})
+            return ""
+
         parsed = Dispatcher.parse_llm_json(raw)
         reasoning = ""
         if isinstance(parsed, dict):
@@ -769,6 +871,13 @@ class Improver:
     def summarize(self, state: RunState) -> str:
         """Produce the final user-facing output without an LLM round trip."""
         if not state.tool_results:
+            if getattr(state, "llm_backend_errors", 0) > 0:
+                return (
+                    "Stopped — the LLM backend was unreachable and no tool "
+                    "executions could be attempted. Check that your configured "
+                    "backend (llama.cpp / Ollama / cloud provider) is running "
+                    "and reachable, then retry."
+                )
             return "Task completed with no tool executions."
 
         files = _files_from_tool_results(state)

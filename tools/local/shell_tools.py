@@ -131,6 +131,71 @@ def run_command(args: dict) -> str:
         return json.dumps({"success": False, "tool": "run_command", "error": str(e), "command": command})
 
 
+def git_status(args: dict = None) -> str:
+    """Show git status (porcelain v1, with branch info) for the working
+    directory. Use this before/after edits to see what changed. Args: none."""
+    log("tool_call", {"tool": "git_status"})
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-b"],
+            cwd=_working_dir(),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        output = result.stdout.strip() or "(clean working tree)"
+        payload = {
+            "success": result.returncode == 0,
+            "tool": "git_status",
+            "output": trim_tool_output(output, max_tokens=400),
+        }
+        if result.returncode != 0:
+            payload["error"] = (result.stderr or "git status failed").strip()[:300]
+        log("tool_result", {"tool": "git_status", "status": "ok" if result.returncode == 0 else "error"})
+        return json.dumps(payload)
+    except FileNotFoundError:
+        return json.dumps({"success": False, "tool": "git_status", "error": "git not found on PATH"})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"success": False, "tool": "git_status", "error": "timed out after 15s"})
+    except Exception as e:
+        return json.dumps({"success": False, "tool": "git_status", "error": str(e)})
+
+
+def git_diff(args: dict = None) -> str:
+    """Show the unstaged git diff, optionally scoped to a single path.
+    Args: path (optional relative file path)."""
+    a = args if isinstance(args, dict) else {}
+    cmd = ["git", "diff"]
+    if a.get("path"):
+        cmd += ["--", a["path"]]
+
+    log("tool_call", {"tool": "git_diff", "path": a.get("path", "")})
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=_working_dir(),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        output = result.stdout.strip() or "(no differences)"
+        payload = {
+            "success": result.returncode == 0,
+            "tool": "git_diff",
+            "output": trim_tool_output(output, max_tokens=800),
+        }
+        if result.returncode != 0:
+            payload["error"] = (result.stderr or "git diff failed").strip()[:300]
+        log("tool_result", {"tool": "git_diff", "status": "ok" if result.returncode == 0 else "error"})
+        return json.dumps(payload)
+    except FileNotFoundError:
+        return json.dumps({"success": False, "tool": "git_diff", "error": "git not found on PATH"})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"success": False, "tool": "git_diff", "error": "timed out after 15s"})
+    except Exception as e:
+        return json.dumps({"success": False, "tool": "git_diff", "error": str(e)})
+
+
 def _ask_permission(command: str) -> bool:
     """
     Ask the user, directly on the terminal, whether CODI may open a separate
@@ -326,3 +391,5 @@ def run_command_external(args: dict) -> str:
 def register_shell_tools(registry):
     registry.register_local("run_command", run_command)
     registry.register_local("run_command_external", run_command_external)
+    registry.register_local("git_status", git_status)
+    registry.register_local("git_diff", git_diff)

@@ -25,6 +25,15 @@
 # _run() is what turns "the loop finished" into an actual answer. Without
 # it, invoke() returns output=None and the caller prints "No output
 # returned." even after files were written successfully.
+#
+# LLM-BACKEND-DOWN HANDLING (added):
+#   Improver.next_step() / .improve() now return an "llm_error" key when the
+#   underlying LLM call itself failed (connection error, timeout, backend
+#   unreachable) rather than the model genuinely returning nothing. Treating
+#   that as "step empty -> task complete" (the previous behavior) silently
+#   reported success on runs where the backend never responded at all. The
+#   loop below now retries up to _MAX_LLM_BACKEND_ERRORS times, then fails
+#   the run explicitly with a message naming the actual problem.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import re
@@ -35,7 +44,7 @@ from core.mission_analyzer import MissionAnalyzer
 from core.context_builder import ContextBuilder
 from core.execution_reflector import ExecutionReflector
 from core.executor  import Executor
-from core.improver  import Improver
+from core.improver  import Improver, classify_plan_risk
 from core.planner   import Planner
 from core.quick_actions import try_fast_file_task
 from core.validator import Validator
@@ -51,6 +60,12 @@ _IMPLEMENTATION_VERBS = (
     "add", "change", "create", "edit", "fix", "implement", "insert",
     "modify", "remove", "replace", "style", "update", "write",
 )
+
+# How many consecutive LLM-backend failures (connection errors, timeouts)
+# the execution loop tolerates before giving up and reporting the real
+# problem, instead of silently looping to max_iterations or — worse —
+# treating the resulting empty step as "task complete".
+_MAX_LLM_BACKEND_ERRORS = 3
 
 
 def _step_requires_mutation(step: str) -> bool:
@@ -70,7 +85,7 @@ def _step_succeeded(state: RunState, step: str = "") -> bool:
         return False
     last = state.tool_results[-1]
     if _step_requires_mutation(step):
-        return last.status == "ok" and last.tool in {"create_file", "write_file", "edit_file"}
+        return last.status == "ok" and last.tool in {"create_file", "write_file", "edit_file", "apply_patch"}
     if last.status == "ok":
         return True
     # dispatcher noop/duplicate-write signals also count as step success —
@@ -256,6 +271,24 @@ class CodiAgent:
             # ── Phase 2: Create plan ────────────────────────────────────────────
             _agent_status("Creating an execution plan.")
             self.improver.create_plan(state, context)
+
+            # FIX: if the planning LLM call itself failed (connection error /
+            # timeout — see core/improver.py create_plan()), the plan text is
+            # tagged with "[PLANNING FAILED]" and plan_steps is empty. This
+            # must surface as a clear failure to the user, not silently
+            # proceed to write an empty plan.md and ask for confirmation on
+            # nothing.
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                _agent_status("Planning failed — LLM backend unreachable.")
+                log("agent_planning_backend_failure", {"plan": state.plan[:200]})
+                return (
+                    f"{state.plan}\n\n"
+                    "The planning step could not reach the configured LLM backend. "
+                    "Check that it is running and reachable (see config.py MODE / "
+                    "LLAMACPP_URL / OLLAMA_BASE_URL), then retry."
+                )
+
             if state.plan_steps:
                 _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
             log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan})
@@ -266,11 +299,32 @@ class CodiAgent:
                     os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
                 )
                 plan_context = state.knowledge.plan_context()
+                risk_info = classify_plan_risk(state)
+
                 lines = [f"# Plan: {state.plan}", "", "## Mission", analysis.goal, "", "## Understanding", state.knowledge.summary_for_prompt(), "", "## Architecture", "```json", str(plan_context["dependency_graph"]), "```", "", "## Files inspected"]
                 lines.extend(f"- {path}" for path in plan_context["files_inspected"])
+
+                lines.extend(["", "## Capabilities"])
+                lines.append(f"- Framework: {state.requirements.framework or 'none locked'}")
+                lines.extend(f"- {m}" for m in state.requirements.must_have) or lines.append("- (none extracted)")
+
+                lines.extend(["", "## Files to Create"])
+                lines.extend(f"- {f}" for f in risk_info["files_to_create"]) if risk_info["files_to_create"] else lines.append("- (none)")
+
+                lines.extend(["", "## Files to Modify"])
+                lines.extend(f"- {f}" for f in risk_info["files_to_modify"]) if risk_info["files_to_modify"] else lines.append("- (none)")
+
+                lines.extend(["", "## Dependencies"])
+                lines.extend(f"- {mn}" for mn in state.requirements.must_not) if state.requirements.must_not else lines.append("- (none)")
+
                 lines.extend(["", "## Assumptions"] + [f"- {value}" for value in analysis.assumptions])
                 lines.extend(["", "## Unknowns"] + [f"- {value}" for value in plan_context["unknowns"]])
-                lines.extend(["", "## Risks"] + [f"- {value}" for value in plan_context["risks"]])
+
+                lines.extend(["", "## Risks"])
+                lines.append(f"- Level: {risk_info['risk']}")
+                lines.append(f"- Confidence: {analysis.confidence:.2f}")
+                lines.extend(f"- {value}" for value in plan_context["risks"])
+
                 lines.extend(["", "## Execution Strategy"])
                 for i, s in enumerate(state.plan_steps, 1):
                     lines.append(f"{i}. {s}")
@@ -282,9 +336,9 @@ class CodiAgent:
                     log("plan_md_write_error", {"error": str(e)})
 
                 state.status = "awaiting_plan_confirmation"
-                _agent_status("Plan ready — waiting for user confirmation.")
+                _agent_status(f"Plan ready (risk: {risk_info['risk']}) — waiting for user confirmation.")
                 return (
-                    f"Plan written to {plan_path}. Review it, then type 'y' to run it, "
+                    f"Plan written to {plan_path} (risk: {risk_info['risk']}). Review it, then type 'y' to run it, "
                     f"or give me a new instruction to replan."
                 )
 
@@ -312,6 +366,15 @@ class CodiAgent:
             context = state.knowledge.summary_for_prompt()
             _agent_status("Creating an execution plan.")
             self.improver.create_plan(state, context)
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                _agent_status("Planning failed — LLM backend unreachable.")
+                log("agent_planning_backend_failure", {"plan": state.plan[:200]})
+                return (
+                    f"{state.plan}\n\n"
+                    "The planning step could not reach the configured LLM backend. "
+                    "Check that it is running and reachable, then retry."
+                )
 
         state.status = "running"
 
@@ -334,6 +397,30 @@ class CodiAgent:
             next_decision = self.improver.next_step(state)
             if not isinstance(next_decision, dict):
                 next_decision = {"step": str(next_decision), "done": False}
+
+            llm_error = next_decision.get("llm_error")
+            if llm_error:
+                # FIX: an empty step here means the LLM backend call itself
+                # failed — NOT that the planner decided the task is done.
+                # Previously this fell straight into `if done or not step:`
+                # below and silently reported "task complete" after a single
+                # failed connection attempt. Retry a bounded number of times,
+                # then fail explicitly with the real reason.
+                state.llm_backend_errors += 1
+                _agent_status(
+                    f"LLM backend error ({state.llm_backend_errors}/{_MAX_LLM_BACKEND_ERRORS}): {llm_error[:120]}"
+                )
+                log("agent_llm_backend_error", {
+                    "iteration": state.iteration,
+                    "count": state.llm_backend_errors,
+                    "error": llm_error[:300],
+                })
+                if state.llm_backend_errors >= _MAX_LLM_BACKEND_ERRORS:
+                    state.status = "failed"
+                    state.validation_notes = f"LLM backend unreachable after {state.llm_backend_errors} attempts: {llm_error}"
+                    break
+                continue  # retry — do not count this as a completed/failed step
+
             step = str(next_decision.get("step", "") or "")
             done = bool(next_decision.get("done", False))
 

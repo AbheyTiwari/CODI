@@ -15,7 +15,6 @@ pyvenv.cfg
 .env
 .agent_history
 codi.log
-\codi.egg-info
 codi.egg-info/
 
 # Local database and vector store artifacts

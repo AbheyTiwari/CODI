@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import re
 import subprocess
 import time
 import traceback
@@ -25,107 +26,6 @@ def inspect_file(args) -> str:
     # canonical structured inspector.
     return json.dumps(_inspect_file(args), ensure_ascii=False)
 
-    path = _path_arg(args)
-    if not path:
-        return json.dumps({
-            "success": False,
-            "error": "missing path"
-        })
-
-    if not os.path.exists(path):
-        return json.dumps({
-            "success": False,
-            "error": "file not found"
-        })
-
-    ext = os.path.splitext(path)[1].lower()
-
-    try:
-
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            source = f.read()
-
-        result = {
-            "success": True,
-            "file": path,
-            "extension": ext,
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "constants": [],
-            "entrypoint": "__main__" in source
-        }
-
-        if ext == ".py":
-
-            tree = ast.parse(source)
-
-            for node in tree.body:
-
-                if isinstance(node, ast.Import):
-
-                    for alias in node.names:
-                        result["imports"].append(alias.name)
-
-                elif isinstance(node, ast.ImportFrom):
-
-                    result["imports"].append(node.module)
-
-                elif isinstance(node, ast.Assign):
-
-                    for target in node.targets:
-
-                        if isinstance(target, ast.Name):
-
-                            if target.id.isupper():
-                                result["constants"].append(target.id)
-
-                elif isinstance(node, ast.FunctionDef):
-
-                    result["functions"].append({
-                        "name": node.name,
-                        "line": node.lineno,
-                        "args": [a.arg for a in node.args.args]
-                    })
-
-                elif isinstance(node, ast.ClassDef):
-
-                    cls = {
-                        "name": node.name,
-                        "line": node.lineno,
-                        "methods": []
-                    }
-
-                    for child in node.body:
-
-                        if isinstance(child, ast.FunctionDef):
-
-                            cls["methods"].append({
-                                "name": child.name,
-                                "line": child.lineno,
-                                "args": [a.arg for a in child.args.args]
-                            })
-
-                    result["classes"].append(cls)
-
-        else:
-
-            result["lines"] = len(source.splitlines())
-
-        log("tool_result", {
-            "tool": "inspect_file",
-            "file": path,
-            "status": "ok"
-        })
-
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-
-        return json.dumps({
-            "success": False,
-            "error": str(e)
-        })
 
 def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELAY):
     """Write content to file character by character with a typing effect.
@@ -401,6 +301,129 @@ def edit_file(args: dict) -> str:
         return json.dumps(result)
     except Exception as e:
         return json.dumps({"success": False, "tool": "edit_file", "error": str(e), "path": path})
+
+
+# ── Unified diff / patch apply ────────────────────────────────────────────────
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def apply_patch(args: dict) -> str:
+    """Apply a unified diff (one or more @@ hunks) to a file. Prefer this over
+    a full rewrite when a change touches several scattered locations in one
+    file — each hunk is anchored to its own context lines, so it is safer
+    than reconstructing the whole file. Args: path, patch (unified diff text,
+    '@@ -start,count +start,count @@' hunks with ' ', '+', '-' prefixed lines)."""
+    path = _path_arg(args)
+    if not path:
+        return "ERROR applying patch: missing path"
+    patch_text = args.get("patch") or args.get("diff") or ""
+    if not patch_text:
+        return "ERROR applying patch: missing patch text"
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            original_lines = f.readlines()
+    except FileNotFoundError:
+        original_lines = []
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+
+    log("tool_call", {"tool": "apply_patch", "path": path})
+
+    try:
+        new_lines = _apply_unified_diff(original_lines, patch_text)
+    except ValueError as e:
+        return f"ERROR applying patch to {path}: {e}"
+
+    content = "".join(new_lines)
+    syntax_warning = _python_syntax_check(path, content)
+    if not syntax_warning:
+        syntax_warning = _java_structural_check(path, content)
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        _refresh_exact_index(path)
+        result = {
+            "success":       True,
+            "tool":          "apply_patch",
+            "file_modified": path,
+            "syntax_ok":     not bool(syntax_warning),
+        }
+        if syntax_warning:
+            result["syntax_warning"] = syntax_warning
+        log("tool_result", {"tool": "apply_patch", "path": path, "status": "ok"})
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"success": False, "tool": "apply_patch", "error": str(e), "path": path})
+
+
+def _apply_unified_diff(original_lines: list[str], patch_text: str) -> list[str]:
+    """
+    Minimal, dependency-free unified-diff applier for single-file patches
+    containing one or more '@@ -start,count +start,count @@' hunks.
+
+    Design notes:
+    - Hunks are applied bottom-to-top (highest old_start first) so that
+      earlier hunks' line numbers remain valid even after later hunks
+      change the file's total line count.
+    - Context lines (prefixed with a single space) and deletion lines
+      (prefixed '-') both consume one line from the original file at the
+      hunk's current cursor; addition lines (prefixed '+') are inserted
+      without consuming an original line.
+    - Out-of-bounds hunks raise ValueError so the caller can surface a
+      clear error instead of silently corrupting the file.
+    """
+    hunks: list[dict] = []
+    current: dict | None = None
+
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith(("--- ", "+++ ")):
+            continue
+        match = _HUNK_HEADER_RE.match(raw_line)
+        if match:
+            if current is not None:
+                hunks.append(current)
+            current = {"old_start": int(match.group(1)), "lines": []}
+            continue
+        if current is not None:
+            current["lines"].append(raw_line)
+
+    if current is not None:
+        hunks.append(current)
+    if not hunks:
+        raise ValueError("no valid @@ hunks found in patch text")
+
+    result = list(original_lines)
+
+    for hunk in sorted(hunks, key=lambda h: h["old_start"], reverse=True):
+        start = hunk["old_start"] - 1
+        old_count = 0
+        new_block: list[str] = []
+
+        for line in hunk["lines"]:
+            if line.startswith("-"):
+                old_count += 1
+            elif line.startswith("+"):
+                text = line[1:]
+                new_block.append(text if text.endswith("\n") else text + "\n")
+            elif line.startswith(" "):
+                old_count += 1
+                text = line[1:]
+                new_block.append(text if text.endswith("\n") else text + "\n")
+            # blank lines with no prefix are ignored defensively
+
+        if start < 0 or start + old_count > len(result):
+            raise ValueError(
+                f"hunk at line {hunk['old_start']} out of bounds for current file "
+                f"({len(result)} lines) — file may have changed since the patch was generated"
+            )
+
+        result[start:start + old_count] = new_block
+
+    return result
 
 
 def list_files(args) -> str:
@@ -737,6 +760,7 @@ def register_file_tools(registry):
     registry.register_local("read_file_numbered",  read_file_numbered)
     registry.register_local("write_file",          write_file)
     registry.register_local("edit_file",           edit_file)
+    registry.register_local("apply_patch",         apply_patch)
     registry.register_local("list_files",          list_files)
     registry.register_local("create_directory",    create_directory)
     registry.register_local("inspect_file",         inspect_file)
