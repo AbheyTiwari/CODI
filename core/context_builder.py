@@ -1,7 +1,10 @@
 """Iterative, evidence-gated discovery before a plan may be created."""
 from __future__ import annotations
 
+import difflib
 import json
+import os
+import re
 from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -27,6 +30,76 @@ class ContextState:
     context: str = ""
     complete: bool = False
     source_evidence: list[str] = field(default_factory=list)
+    # Files the mission explicitly named that could not be resolved against
+    # any known project path, even fuzzily. This is distinct from a generic
+    # "unknown" — it means planning must not proceed on a silent guess.
+    missing_requested_files: list[str] = field(default_factory=list)
+    needs_user_clarification: bool = False
+    clarification_question: str = ""
+
+# The Mission Analyzer's files_needed list is meant to hold actual project
+# file paths, but a small model sometimes fills it with capability/dependency
+# descriptions instead — e.g. "Library or service for PDF extraction" for a
+# brand-new feature that names no existing file at all. Those are not file
+# paths and must never be run through the missing-file hard-stop below; doing
+# so previously blocked a plain "add a new feature" request by demanding the
+# user "confirm the exact file path" for something that was never a file.
+
+
+def _looks_like_file_path(candidate: str) -> bool:
+    """
+    True only for strings that plausibly reference an actual file path,
+    not prose capability/dependency descriptions like "Library or service
+    for PDF extraction". A real path (even a Windows path with spaces in a
+    folder name, e.g. "...\\cyientist AI\\app\\api\\ingest.py") always ends
+    in a short recognizable extension and has few consecutive prose words;
+    a description sentence has many.
+    """
+    candidate = candidate.strip().strip("'\"`")
+    if not candidate or len(candidate) > 260:
+        return False
+    # Must end in a plausible file extension — this is the strongest signal
+    # and is what every genuine path has, spaces in directories or not.
+    ext_match = re.search(r"\.([A-Za-z0-9]{1,6})$", candidate)
+    if not ext_match:
+        return False
+    known_exts = {
+        "py", "js", "ts", "jsx", "tsx", "html", "css", "json", "md", "txt",
+        "svg", "sh", "yml", "yaml", "toml", "cfg", "ini", "env", "log",
+        "sql", "db", "csv", "xlsx", "docx", "pdf", "png", "jpg", "jpeg",
+        "gitignore",
+    }
+    if ext_match.group(1).lower() not in known_exts:
+        return False
+    # Reject prose: a genuine path has at most a couple of "words" separated
+    # by spaces (e.g. a folder named "cyientist AI"), whereas a capability
+    # description reads as a full sentence/phrase with several words and
+    # often prepositions like "for"/"to"/"and".
+    word_count = len(candidate.split())
+    if word_count > 4:
+        return False
+    if re.search(r"\b(for|service|library|elements?|feature)\b", candidate, re.IGNORECASE):
+        return False
+    return True
+
+
+def _resolve_close_path(requested: str, known_paths: set[str]) -> str | None:
+    """
+    If `requested` doesn't exact-match anything in known_paths, look for the
+    closest-matching known path by basename similarity. Mirrors the
+    executor's edit-path fuzzy resolution, so a near-miss filename (case,
+    typo, different directory than the model assumed) doesn't get written
+    off as "not present" when the real file is one character away.
+    """
+    if requested in known_paths:
+        return requested
+    target_name = os.path.basename(requested)
+    by_basename = {os.path.basename(p): p for p in known_paths}
+    matches = difflib.get_close_matches(target_name, list(by_basename.keys()), n=1, cutoff=0.75)
+    if matches:
+        return by_basename[matches[0]]
+    return None
+
 
 class ContextBuilder:
     def __init__(self, tool_registry: ToolRegistry | None = None):
@@ -90,14 +163,56 @@ class ContextBuilder:
         # high-value deterministic step for a 7B model and avoids repeated
         # discovery turns for files that were already named by the task.
         known_paths = {str(path).replace("\\", "/") for path in state.knowledge.project.get("files", [])}
+        filelike_requested = []
         for path in mission.files_needed:
-            if isinstance(path, str) and path:
-                normalized = path.replace("\\", "/")
-                if normalized in known_paths:
-                    self._run(state, "inspect_file", {"path": path})
-                    self._run(state, "read_file", {"path": path})
-                else:
-                    state.knowledge.add_unknown(f"Requested file is not present: {path}")
+            if not (isinstance(path, str) and path):
+                continue
+            if not _looks_like_file_path(path):
+                # Not a real path — e.g. "Library or service for PDF
+                # extraction", a dependency/capability note the Mission
+                # Analyzer sometimes puts in files_needed for brand-new
+                # features. Nothing to resolve; must never feed the
+                # missing-file hard-stop below.
+                continue
+            filelike_requested.append(path)
+            normalized = path.replace("\\", "/")
+            resolved = _resolve_close_path(normalized, known_paths)
+            if resolved:
+                self._run(state, "inspect_file", {"path": resolved})
+                self._run(state, "read_file", {"path": resolved})
+            else:
+                # No exact match and no close fuzzy match — this file is
+                # genuinely not identifiable in the project. Track it
+                # explicitly instead of silently dropping it into
+                # "unknowns" and continuing, which previously let an
+                # edit task plan against a guessed substitute file.
+                state.missing_requested_files.append(path)
+                state.knowledge.add_unknown(f"Requested file is not present: {path}")
+        # Hard stop: if the mission named specific, real-looking file path(s)
+        # (the normal case for a single-file edit task) and NONE could be
+        # resolved, even fuzzily, planning must not proceed on a silent
+        # substitute guess. Ask the user instead of quietly continuing on
+        # weak evidence. A new-feature request with no actual file paths
+        # named (only capability descriptions) never reaches this branch.
+        if filelike_requested and len(state.missing_requested_files) == len(filelike_requested):
+            state.needs_user_clarification = True
+            state.clarification_question = (
+                "I couldn't find "
+                + (
+                    f"the file '{state.missing_requested_files[0]}'"
+                    if len(state.missing_requested_files) == 1
+                    else f"any of these files: {', '.join(state.missing_requested_files)}"
+                )
+                + " in the current project directory. Could you confirm the exact "
+                "file path, or let me know if it should be created as a new file?"
+            )
+            state.complete = False
+            log("context_missing_requested_file", {
+                "missing": state.missing_requested_files,
+                "mission_goal": mission.goal[:160] if getattr(mission, "goal", None) else "",
+            })
+            return state
+
         for _ in range(max_iterations):
             action = self._decide(state, mission, history)
             if not action:
@@ -141,7 +256,21 @@ class ContextBuilder:
         if state.complete and state.confidence < 0.90:
             state.confidence = 0.90
             state.knowledge.summaries.append("Planning permitted from verified project and file evidence.")
-        state.context = state.knowledge.summary_for_prompt() + "\n\n" + "\n\n".join(state.source_evidence)[-70000:]
+        # Source code goes FIRST, metadata summary AFTER. This matters
+        # because create_plan() only ever shows the planner LLM the first
+        # ~6000 chars of this string (a hard local-model context budget
+        # constraint, not a bug to just remove). With metadata first (as
+        # this was previously ordered), a project of even moderate size
+        # fills that 6000-char window entirely with import/symbol lists
+        # before a single line of actual source code appears — meaning the
+        # planner reasons about *descriptions* of files, never their real
+        # content, which is exactly the "doesn't read the actual code"
+        # problem. Putting source first means the highest-value evidence
+        # (the real code) survives truncation instead of the cheapest,
+        # most-replaceable evidence (AST metadata) crowding it out.
+        source_block = "\n\n".join(state.source_evidence)[-70000:]
+        metadata_block = state.knowledge.summary_for_prompt()
+        state.context = source_block + "\n\n" + metadata_block if source_block else metadata_block
         if not state.complete:
             state.knowledge.add_unknown("Context confidence/evidence threshold was not met; planning is blocked.")
         log("context_complete", {"confidence": state.confidence, "complete": state.complete, "actions": state.actions})

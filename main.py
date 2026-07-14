@@ -360,6 +360,61 @@ def _pt_style():
     return PTStyle.from_dict({"prompt": f"fg:{c} bold", "": "fg:#cccccc"})
 
 
+def _looks_incomplete(text: str) -> bool:
+    """
+    Heuristic check for input that was cut off mid-paste.
+
+    Some terminals (older cmd.exe, certain IDE-embedded terminals, tmux
+    without bracketed-paste passthrough) don't wrap pastes in bracketed-paste
+    escape sequences. When that happens, every newline inside a pasted block
+    of text is delivered to prompt_toolkit as a literal Enter keypress, so a
+    long multi-sentence prompt gets submitted one fragment at a time instead
+    of as a single block -- and the first fragment (often ending mid-quote,
+    mid-parenthesis, or mid-sentence) is silently treated as "the" input.
+
+    This does not detect every case, but catches the common signals: an odd
+    number of un-escaped quote characters, or unbalanced brackets/parens,
+    which is exactly what a mid-sentence chop produces.
+    """
+    if not text:
+        return False
+    # Ignore slash-commands entirely -- these are meant to be short and exact.
+    if text.strip().startswith("/"):
+        return False
+    stripped_escapes = re.sub(r"\\.", "", text)
+    for quote_char in ('"', "'"):
+        if stripped_escapes.count(quote_char) % 2 == 1:
+            return True
+    for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
+        if stripped_escapes.count(opener) != stripped_escapes.count(closer):
+            return True
+    return False
+
+
+def _collect_full_input(session: "PromptSession", first_line: str) -> str:
+    """
+    If the first submitted line looks chopped mid-paste, keep prompting with
+    a continuation marker and append lines (joined with a space, since the
+    split happened at what should have been a run-on sentence) until the
+    combined text looks complete, or the user submits a blank line to force
+    it through as-is.
+    """
+    combined = first_line
+    guard = 0
+    while _looks_incomplete(combined) and guard < 20:
+        guard += 1
+        try:
+            more = session.prompt(
+                [("class:prompt", "  ... ")], style=_pt_style()
+            )
+        except (KeyboardInterrupt, EOFError):
+            break
+        if more == "":
+            break
+        combined = f"{combined} {more}".strip()
+    return combined
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print_banner()
@@ -406,6 +461,11 @@ def main():
 
         if not user_input:
             continue
+
+        if _looks_incomplete(user_input):
+            user_input = _collect_full_input(session, user_input).strip()
+            if not user_input:
+                continue
 
         # Guard against obviously pasted terminal output
         if (

@@ -239,7 +239,25 @@ def _step_requires_mutation(step: str) -> bool:
 
 def _explicit_full_rewrite_requested(user_input: str) -> bool:
     lowered = (user_input or "").lower()
-    return any(phrase in lowered for phrase in ("rewrite the entire", "replace the entire", "overwrite", "regenerate the entire"))
+    phrases = (
+        "rewrite the entire",
+        "replace the entire",
+        "overwrite",
+        "overide",       # common typo for "override"/"overwrite"
+        "override",
+        "regenerate the entire",
+        "replace all",
+        "replace any and all",
+        "override any and all",
+        "overide any and all",
+        "delete all old",
+        "remove all old",
+        "start from scratch",
+        "from scratch",
+        "wipe and",
+        "clean slate",
+    )
+    return any(phrase in lowered for phrase in phrases)
 
 
 def _path_is_protected(path: str, state: RunState) -> bool:
@@ -329,6 +347,9 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
         tool = "create_file" if "create" in step_lower else "write_file"
         return tool, path
 
+    write_keywords = ("write", "create", "save", "generate", "produce", "output")
+    has_write_signal = any(kw in step_lower for kw in write_keywords)
+
     if any(re.search(rf"\b{re.escape(kw)}\b", step_lower) for kw in _EDIT_KEYWORDS):
         working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
         abs_path = path if os.path.isabs(path) else os.path.join(working_dir, path)
@@ -340,16 +361,28 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
         if resolved:
             return "edit_file", resolved
 
-        # File doesn't exist and no close match found — do NOT silently
-        # fall through to write/create detection (that would create a new
-        # file the user never asked for) or to the standard JSON path
-        # (which would just loop on "file does not exist"). Signal the
-        # caller explicitly so execute_step can fail fast with a clear
-        # message instead of burning iterations.
-        return "edit_file_missing", path
+        # File doesn't exist and no close match found. If the step ALSO
+        # carries a write/create signal (e.g. "style script.js and
+        # styles.css for the portfolio" — "style" is an edit keyword but
+        # the file is brand new and the plan clearly means create it),
+        # fall through to create/write detection instead of hard-failing.
+        # This is what previously caused every non-first file in a
+        # multi-file build plan to dead-end as "edit_file_missing" purely
+        # because its step text happened to contain a generic word like
+        # "style", "add", or "update" alongside the (nonexistent) filename.
+        if has_write_signal:
+            log("executor_edit_keyword_fallback_to_create", {
+                "path": path, "step": step[:160],
+            })
+        else:
+            # Genuinely edit-only language (no create/write signal at all)
+            # against a file that doesn't exist and has no close match —
+            # this really is an ambiguous/missing-target case. Signal the
+            # caller explicitly so execute_step can fail fast with a clear
+            # message instead of burning iterations.
+            return "edit_file_missing", path
 
-    write_keywords = ("write", "create", "save", "generate", "produce", "output")
-    if not any(kw in step_lower for kw in write_keywords):
+    if not has_write_signal:
         return None, None
 
     tool = "create_file" if "create" in step_lower else "write_file"
@@ -1006,6 +1039,28 @@ class Executor:
                         log("executor_create_existing_converted_to_edit", {"path": target_path, "step": step[:160]})
                         continue
                 if os.path.exists(absolute_target) and not _explicit_full_rewrite_requested(state.user_input):
+                    # Instead of dead-ending the step with a terminal error
+                    # (which used to burn all repair attempts on a step that
+                    # never got a chance to actually change anything), convert
+                    # this into a real edit: read the current content and turn
+                    # the write into an append/merge via edit_file, the same
+                    # recoverable-conversion pattern already used above for
+                    # create_file-against-existing. This keeps the "don't
+                    # silently clobber existing files" safety property while
+                    # still making forward progress on the step.
+                    content = args.get("content")
+                    if tool_name in _WRITE_TOOLS and isinstance(content, str) and content.strip():
+                        try:
+                            with open(absolute_target, "r", encoding="utf-8", errors="replace") as handle:
+                                existing_content = handle.read()
+                        except OSError as exc:
+                            error = f"Unable to read existing file '{target_path}' before editing: {exc}"
+                            state.add_tool_result("edit_file", "error", error)
+                            return {"status": "error", "results": [{"tool": "edit_file", "status": "error", "output": error}], "error": error}
+                        t["name"] = "edit_file"
+                        t["args"] = {"path": target_path, "old": existing_content, "new": content}
+                        log("executor_write_existing_converted_to_edit", {"path": target_path, "tool": tool_name, "step": step[:160]})
+                        continue
                     error = (
                         f"Refusing to overwrite existing file '{target_path}'. Use read_file and edit_file for "
                         "a surgical change, or require an explicit user request to rewrite the entire file."

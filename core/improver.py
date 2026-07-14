@@ -174,6 +174,54 @@ _VERIFICATION_WORDS = ("verify", "validate", "test", "check", "screenshot")
 _IMPLEMENTATION_WORDS = ("add", "change", "create", "edit", "fix", "implement", "insert", "modify", "remove", "replace", "style", "update", "write")
 
 
+def _best_file_match(step: str, known_files: list[str]) -> str | None:
+    """
+    Deterministically pick the most plausible target file for a step that
+    mentions no explicit file path, using simple keyword overlap between the
+    step text and each candidate file's name/path segments.
+
+    This replaces a previous approach that injected a literal
+    "list files and identify which file this targets" step into the plan.
+    That text was written as an instruction for an LLM to reason about, but
+    the executor treated it as an ordinary implementation step with nothing
+    concrete to write — the coder correctly had no file to act on, called
+    list_files exactly as instructed, and then had no further action,
+    producing a noop that burned all repair attempts on a step that could
+    never have succeeded. Resolving the file here, deterministically, at
+    plan-normalization time means every step handed to the executor always
+    names a real target before execution ever starts.
+    """
+    if not known_files:
+        return None
+    if len(known_files) == 1:
+        return known_files[0]
+
+    step_words = set(re.findall(r"[a-z0-9]+", step.lower()))
+    # Drop generic verbs/filler so they don't dilute the match against
+    # every candidate equally.
+    step_words -= set(_IMPLEMENTATION_WORDS) | {"the", "to", "and", "for", "this", "a", "an", "of", "in"}
+
+    best_file = None
+    best_score = 0
+    for candidate in known_files:
+        base = os.path.basename(candidate).lower()
+        stem = re.sub(r"\.[a-z0-9]+$", "", base)
+        candidate_words = set(re.findall(r"[a-z0-9]+", stem.replace("_", " ").replace("-", " ")))
+        score = len(step_words & candidate_words)
+        if score > best_score:
+            best_score = score
+            best_file = candidate
+
+    if best_file and best_score > 0:
+        return best_file
+
+    # No keyword overlap at all — fall back to the first known file rather
+    # than leaving the step unresolved. This is a deliberate best-effort
+    # guess, but it's still an executable one; the old behavior (an
+    # unexecutable "go figure out the file" step) was strictly worse.
+    return known_files[0]
+
+
 def _normalize_plan_steps(steps: list[str], requirements: TaskRequirements) -> list[str]:
     """Make every implementation step file-targeted before execution begins."""
     normalized: list[str] = []
@@ -193,13 +241,21 @@ def _normalize_plan_steps(steps: list[str], requirements: TaskRequirements) -> l
         is_verification = any(word in lowered for word in _VERIFICATION_WORDS)
         needs_file = any(re.search(rf"\b{word}\b", lowered) for word in _IMPLEMENTATION_WORDS)
         if needs_file and not is_verification and not _extract_file_refs(step):
-            if len(known_files) == 1:
-                step = f"{step} in {known_files[0]}"
+            resolved_file = _best_file_match(step, known_files)
+            if resolved_file:
+                log("improver_step_file_resolved", {
+                    "step": step[:160], "resolved_file": resolved_file,
+                })
+                normalized.append(f"{step} in {resolved_file}")
             else:
-                # Leave an explicit blocker in the plan rather than letting a
-                # weak model silently choose noop for an ungrounded task.
-                step = f"Inspect project and identify the target file before: {step}"
-        normalized.append(step)
+                # No known files at all to resolve against (e.g. a
+                # from-scratch project with nothing indexed yet) — leave
+                # the step as-is rather than injecting an unexecutable
+                # placeholder; the executor's own file-detection can still
+                # pick up an explicit path if the coder names one.
+                normalized.append(step)
+        else:
+            normalized.append(step)
     return normalized
 
 
@@ -452,11 +508,22 @@ class Improver:
                 log("plan_created", {"plan_source": "function_inventory", "steps": len(steps)})
                 return {"plan": state.plan, "steps": steps}
 
+        # Was a naive context[:6000] head-cut. context_builder now places
+        # actual source code first and the cheap AST-metadata summary last,
+        # specifically so the highest-value evidence survives truncation —
+        # but a pure head-cut still throws away everything past 6000 chars,
+        # which for a multi-file task could mean only the first read file's
+        # source ever reaches the planner. Using trim_tool_output's head+tail
+        # split keeps a meaningful chunk of the earliest-read source AND a
+        # meaningful chunk of whatever comes later (other files' source, or
+        # the metadata summary if source is short), rather than silently
+        # dropping the entire second half of the collected evidence.
+        from context_trimmer import trim_tool_output
         prompt = _PLAN_PROMPT.format(
             task=state.user_input,
             requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
-            context=wrap_prompt_data(context[:6000]),
+            context=wrap_prompt_data(trim_tool_output(context, max_tokens=1700)),
         )
 
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
@@ -528,6 +595,38 @@ class Improver:
                 None,
             )
             if selected_step:
+                # If the immediately preceding tool result was an error and
+                # this is the same plan step we already tried (attempts > 0),
+                # don't blindly hand the coder the identical instruction
+                # again — that's how a blocked write (e.g. "refusing to
+                # overwrite") turns into N identical failed retries burning
+                # the iteration budget with nothing learned in between.
+                # Instead, reason about the failure via improve() and hand
+                # back a concrete correction step grounded in the actual
+                # error, then retry with that reasoning applied.
+                last_error = next(
+                    (r for r in reversed(state.tool_results) if r.status == "error"),
+                    None,
+                )
+                prior_attempts = state.step_attempts.get(selected_step, 0)
+
+                if last_error and prior_attempts > 0:
+                    state.validation_notes = last_error.output
+                    correction = self.improve(state)
+                    state.step_attempts[selected_step] = prior_attempts + 1
+                    log("step_selected", {
+                        "step": trim_tool_output(correction, max_tokens=20),
+                        "matched_plan": False,
+                        "iteration": state.iteration,
+                        "done": False,
+                        "plan_steps_remaining": max(0, len(state.plan_steps) - done_count),
+                        "source": "repeated_step_failure_reasoned_correction",
+                        "original_step": trim_tool_output(selected_step, max_tokens=20),
+                        "prior_attempts": prior_attempts,
+                    })
+                    return {"step": correction, "done": False}
+
+                state.step_attempts[selected_step] = prior_attempts + 1
                 log("step_selected", {
                     "step": trim_tool_output(selected_step, max_tokens=20),
                     "matched_plan": True,
@@ -609,13 +708,40 @@ class Improver:
                 "needs to be created first with write_file/create_file.",
             ]
 
+        if "refusing to overwrite" in notes.lower():
+            lines += [
+                "CRITICAL: The target file already exists and create_file was blocked",
+                "to protect it from accidental clobbering. Two valid fixes:",
+                "  1. If the user's task genuinely called for a full replacement",
+                "     (e.g. said 'override'/'overwrite'/'replace all'/'start fresh'),",
+                "     switch to edit_file: read the existing file's exact current",
+                "     content with read_file, then edit_file with old=<that exact",
+                "     content> and new=<the full new content>.",
+                "  2. If a full rewrite was NOT actually intended, use edit_file to",
+                "     make the specific surgical change instead of a full replace.",
+                "Do NOT call create_file on this path again — it will be blocked",
+                "identically every time. Name the exact tool (edit_file) and path",
+                "in your correction.",
+            ]
+
+        if "protected" in notes.lower() and "cannot be changed" in notes.lower():
+            lines += [
+                "CRITICAL: This file is protected and cannot be modified for this",
+                "task. Re-read the actual task — it likely wants a different file",
+                "created or edited (e.g. a companion test file), not this one.",
+            ]
+
         lines += [
             "",
             "Last tool outputs for context:",
             *state.recent_tool_outputs(3),
             "",
-            "Describe the SPECIFIC fix in one sentence.",
-            'Respond ONLY with JSON: {"correction":"exact fix instruction"}',
+            "Think step by step first, silently: what is the ROOT CAUSE of this",
+            "failure (not just its symptom), and why would repeating the exact",
+            "same action fail again the same way? Then decide the concrete fix.",
+            "",
+            "Respond ONLY with JSON in this exact shape:",
+            '{"reasoning":"one sentence root-cause diagnosis","correction":"exact fix instruction naming the tool and path"}',
             "JSON only:",
         ]
 
@@ -626,14 +752,16 @@ class Improver:
         state.record_llm("improver_improve", raw)
 
         parsed = Dispatcher.parse_llm_json(raw)
+        reasoning = ""
         if isinstance(parsed, dict):
             correction = _as_text(parsed.get("correction", raw))
+            reasoning = _as_text(parsed.get("reasoning", ""))
         elif parsed:
             correction = _as_text(parsed)
         else:
             correction = f"FAILED: {notes}. Fix required: {reqs.as_prompt_block()}"
 
-        log("improver_correction", {"correction": correction[:200]})
+        log("improver_correction", {"correction": correction[:200], "reasoning": reasoning[:200]})
         return correction
 
     # ── Phase 5: Final summary ────────────────────────────────────────────────

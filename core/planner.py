@@ -188,7 +188,21 @@ def classify_intent(text: str) -> str:
     t = (text or "").lower()
     words = _tokens(t)
     has_file       = bool(FILE_PATH_RE.search(text))
-    has_read_verb  = any(v in t for v in READ_VERBS) or _fuzzy_verb_hit(words, READ_VERBS)
+    # A read verb only counts as genuine read-intent when it appears near
+    # the START of the instruction (the user's actual ask), not buried deep
+    # in a long sentence describing unrelated downstream behavior. Without
+    # this, a request like "...upload files and the Chatbot should be able
+    # to read answer from those files" was misclassified as pure "read"
+    # intent purely because the word "read" appeared 20+ words in, despite
+    # the sentence's actual leading intent being "add [a feature]".
+    # ACTION_TRIGGERS/EDIT_VERBS-style words anywhere still count normally;
+    # this narrowing applies only to READ_VERBS since those are the ones
+    # that can otherwise downgrade a build/edit task to explain-only.
+    _lead_window = " ".join(t.split()[:12])
+    has_read_verb  = (
+        any(v in _lead_window for v in READ_VERBS)
+        or _fuzzy_verb_hit(_tokens(_lead_window), READ_VERBS)
+    )
     has_edit_verb  = any(v in t for v in EDIT_VERBS) or _fuzzy_verb_hit(words, EDIT_VERBS)
     has_build_verb = any(v in t for v in BUILD_VERBS) or _fuzzy_verb_hit(words, BUILD_VERBS)
     file_mentions  = len(FILE_PATH_RE.findall(text))

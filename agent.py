@@ -244,6 +244,8 @@ class CodiAgent:
             if not context_state.complete:
                 state.status = "awaiting_context"
                 _agent_status("Context is incomplete; planning is blocked.")
+                if getattr(context_state, "needs_user_clarification", False) and context_state.clarification_question:
+                    return context_state.clarification_question
                 return (
                     "I inspected the project and its saved .agent_history, but I still need context "
                     "to plan safely. Reply with the missing details, or type 'no' to continue using "
@@ -394,7 +396,7 @@ class CodiAgent:
                         "I could not safely complete this after three repair attempts. "
                         f"The last failure was: {state.validation_notes}\n\n"
                         "Please clarify the intended behavior or provide the missing dependency/configuration. "
-                        "I will keep the original plan and continue from the failing step.\n\n"
+                        "I've paused here — send a follow-up with that info and I'll resume from the failing step.\n\n"
                         f"Original plan: {state.plan or '(no plan summary available)'}"
                     )
                     log("agent_clarification_required", {"attempts": 3, "notes": state.validation_notes[:200]})
