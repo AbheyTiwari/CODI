@@ -459,9 +459,29 @@ class CodiAgent:
             # recent tool action for THIS step succeed? This is independent
             # of whether the overall task is finished — do not let the
             # semantic validator gate this.
+            #
+            # IMPORTANT: mark completion against state.target_plan_step, the
+            # ORIGINAL plan_steps entry this attempt was satisfying — NOT
+            # against `step`, the text actually sent to the executor. After
+            # a validation failure, core/improver.py's next_step() rewrites
+            # `step` into a repair/correction instruction ("edit_file the
+            # 'refusing to overwrite' issue in index.html", etc). If that
+            # rewritten text were what got appended to completed_steps, a
+            # SUCCESSFUL retry would still never match anything in
+            # state.plan_steps (an exact-string list) — the step remains
+            # permanently "not completed", the plan-progress validation
+            # guard keeps failing it, and the run silently burns every
+            # remaining iteration before reporting "Stopped before
+            # completion... 1 plan step(s) not yet completed" even though
+            # every tool call in the log actually succeeded.
             if _step_succeeded(state, step):
-                state.mark_step_complete(step)
-                log("step_marked_complete", {"step": step[:120], "completed_count": len(state.completed_steps)})
+                completed_target = state.target_plan_step or step
+                state.mark_step_complete(completed_target)
+                log("step_marked_complete", {
+                    "step": completed_target[:120],
+                    "executed_as": step[:120] if step != completed_target else None,
+                    "completed_count": len(state.completed_steps),
+                })
 
             # Validator now answers ONLY "is the overall task done?" —
             # not "did this step succeed" (that's already been decided above).

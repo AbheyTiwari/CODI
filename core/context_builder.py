@@ -22,6 +22,17 @@ already taken and never request a file that is reported missing.
 Return JSON only: {\"action\":\"inspect_file\",\"path\":\"...\",\"reason\":\"short evidence need\"}.
 For done include {\"action\":\"done\",\"confidence\":0.95,\"summary\":\"...\"}."""
 
+# Penalty applied to confidence per unresolved "unknown" the discovery
+# process recorded (a failed tool call, a repeated/blocked action, a
+# genuinely missing requested file, etc). Previously confidence was floored
+# UP to 0.90 whenever state.complete was true, regardless of how many
+# unknowns remained unresolved — so a run that had e.g. a failed
+# inspect_file call still reported confidence=1.00 if the LLM's own "done"
+# call happened to say so. This constant makes each unresolved unknown cost
+# real, visible confidence instead of being silently absorbed by the floor.
+_CONFIDENCE_PENALTY_PER_UNKNOWN = 0.12
+_MIN_FLOOR_CONFIDENCE = 0.55
+
 @dataclass
 class ContextState:
     confidence: float = 0.0
@@ -99,6 +110,23 @@ def _resolve_close_path(requested: str, known_paths: set[str]) -> str | None:
     if matches:
         return by_basename[matches[0]]
     return None
+
+
+def _penalized_confidence(raw_confidence: float, unknown_count: int) -> float:
+    """
+    Apply a deterministic penalty per unresolved unknown so a discovery run
+    with failed/blocked tool calls can never report full confidence just
+    because the discovery-controller LLM's own "done" call said so, or
+    because the completion floor below would otherwise round it up.
+
+    This does not replace the floor logic in build() — it clips the value
+    BEFORE the floor is applied, so a genuinely evidence-backed run with
+    zero unknowns still gets floored up to a workable minimum, while a run
+    with several unresolved unknowns is visibly and proportionally less
+    confident instead of being indistinguishable from a clean run.
+    """
+    penalty = min(0.9, unknown_count * _CONFIDENCE_PENALTY_PER_UNKNOWN)
+    return max(0.0, min(raw_confidence, 1.0) - penalty)
 
 
 class ContextBuilder:
@@ -222,8 +250,21 @@ class ContextBuilder:
                 break
             name = str(action.get("action", "done")).lower()
             if name == "done":
-                state.confidence = float(action.get("confidence", 0.0))
+                # Clip the LLM's self-reported confidence against the actual
+                # number of unresolved unknowns BEFORE storing it. Without
+                # this, a run that hit e.g. a failed inspect_file call still
+                # ends up reporting confidence=1.00 purely because the
+                # discovery-controller LLM said so — the unknown was tracked
+                # in state.knowledge.unknowns but nothing ever read that list
+                # when computing confidence.
+                raw_confidence = float(action.get("confidence", 0.0))
+                state.confidence = _penalized_confidence(raw_confidence, len(state.knowledge.unknowns))
                 state.knowledge.summaries.append(str(action.get("summary", "")))
+                log("context_confidence_penalized", {
+                    "raw_confidence": raw_confidence,
+                    "unknown_count": len(state.knowledge.unknowns),
+                    "penalized_confidence": state.confidence,
+                })
                 break
             if name not in {"inspect_file", "search_codebase", "read_file"}:
                 state.knowledge.add_unknown(f"Unsupported context action: {name}")
@@ -243,8 +284,15 @@ class ContextBuilder:
             self._run(state, "read_agent_history", {})
             action = self._decide(state, mission, history)
             if action and str(action.get("action", "")).lower() == "done":
-                state.confidence = float(action.get("confidence", 0.0))
+                raw_confidence = float(action.get("confidence", 0.0))
+                state.confidence = _penalized_confidence(raw_confidence, len(state.knowledge.unknowns))
                 state.knowledge.summaries.append(str(action.get("summary", "")))
+                log("context_confidence_penalized", {
+                    "raw_confidence": raw_confidence,
+                    "unknown_count": len(state.knowledge.unknowns),
+                    "penalized_confidence": state.confidence,
+                    "source": "post_history",
+                })
         # Planning is evidence-gated, not model-confidence-gated. A 7B model
         # can emit weak confidence or malformed JSON despite the project and
         # relevant files already being inspected.
@@ -253,9 +301,18 @@ class ContextBuilder:
         # legitimately create every file it names, so requiring an existing
         # inspected file wrongly blocks new projects and empty directories.
         state.complete = has_project
-        if state.complete and state.confidence < 0.90:
-            state.confidence = 0.90
-            state.knowledge.summaries.append("Planning permitted from verified project and file evidence.")
+        if state.complete and state.confidence < _MIN_FLOOR_CONFIDENCE:
+            # Floor confidence so a project/file-evidence-backed run is never
+            # blocked purely by a low or missing self-reported number — but
+            # the floor is now BELOW the old 0.90, and is applied AFTER the
+            # unknown-count penalty above, not instead of it. A run with
+            # several unresolved unknowns will floor at 0.55 (visibly
+            # "planning permitted, but shaky"), not silently jump to 0.90+.
+            state.confidence = _MIN_FLOOR_CONFIDENCE
+            state.knowledge.summaries.append(
+                "Planning permitted from verified project and file evidence "
+                "(confidence floored at minimum working threshold)."
+            )
         # Source code goes FIRST, metadata summary AFTER. This matters
         # because create_plan() only ever shows the planner LLM the first
         # ~6000 chars of this string (a hard local-model context budget
@@ -273,5 +330,5 @@ class ContextBuilder:
         state.context = source_block + "\n\n" + metadata_block if source_block else metadata_block
         if not state.complete:
             state.knowledge.add_unknown("Context confidence/evidence threshold was not met; planning is blocked.")
-        log("context_complete", {"confidence": state.confidence, "complete": state.complete, "actions": state.actions})
+        log("context_complete", {"confidence": state.confidence, "complete": state.complete, "actions": state.actions, "unknown_count": len(state.knowledge.unknowns)})
         return state

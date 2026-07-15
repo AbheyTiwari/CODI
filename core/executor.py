@@ -52,7 +52,7 @@ Available tools:
 {tools}
 
 Output ONLY the corrected JSON. Use exactly this structure:
-{{"action":"tool_call","reason":"short justification","tools":[{{"name":"TOOL_NAME","args":{{ARGS}}}}]}}
+{{"action":"tool_call","tools":[{{"name":"TOOL_NAME","args":{{ARGS}}}}]}}
 
 Or if nothing to do: {{"action":"noop"}}
 
@@ -96,7 +96,7 @@ Requirements:
 {requirements}
 
 Output ONLY this JSON — no prose, no fences:
-{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
 
 Rules:
 - "old" MUST be a contiguous substring that appears character-for-character in the file content shown above.
@@ -121,7 +121,42 @@ Task: {step}
 
 Look at the file content above character by character and pick a short
 substring that ACTUALLY EXISTS in it. Output ONLY this JSON:
-{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM FILE ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT TEXT COPIED FROM FILE ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+
+JSON only:"""
+
+# Used specifically when the previous failure was an AMBIGUOUS match (the
+# snippet exists, but more than once) rather than a not-found match. The
+# tool now reports exactly where each occurrence is, so the model can pick
+# text that includes enough of the surrounding context to be unique instead
+# of blindly resubmitting the same short (still-ambiguous) snippet.
+_EDIT_AMBIGUOUS_REPAIR_PROMPT = """\
+Your previous edit_file call FAILED because "old" matched MORE THAN ONCE in
+the file — it was not specific enough to identify a single location.
+
+File to edit: {path}
+
+CURRENT FULL CONTENT OF THE FILE:
+{file_content}
+
+Your previous (ambiguous) "old" value was:
+{failed_old}
+
+Here is exactly where that text was found (line number + surrounding
+context for each occurrence) — use this to see what's DIFFERENT about the
+occurrence you actually want to target:
+{occurrence_detail}
+
+Task: {step}
+
+Pick a longer "old" snippet that includes enough surrounding, unique context
+(e.g. a nearby unique attribute, id, class, or preceding/following line) so
+it matches EXACTLY ONE location — the one relevant to this task. Do not
+reuse the same short snippet. Output ONLY this JSON:
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"EXACT UNIQUE TEXT COPIED FROM FILE ABOVE","new":"REPLACEMENT TEXT"}}}}]}}
+
+If you genuinely want to change every occurrence, instead output:
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","old":"TEXT","new":"REPLACEMENT","count":"all"}}}}]}}
 
 JSON only:"""
 
@@ -144,15 +179,15 @@ Requirements:
 Output ONLY JSON using ONE of these forms — no prose, no fences:
 
 To replace a contiguous range of lines:
-{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","replace_lines":{{"start":N,"end":M,"content":"new code here"}}}}}}]}}
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","replace_lines":{{"start":N,"end":M,"content":"new code here"}}}}}}]}}
 
 To delete a contiguous range of lines:
-{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","delete_lines":{{"start":N,"end":M}}}}}}]}}
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","delete_lines":{{"start":N,"end":M}}}}}}]}}
 
 To insert new code before line N (use the line number that should come
 immediately AFTER the inserted code; to insert at the very end of the file,
 use line number = total_lines + 1):
-{{"action":"tool_call","reason":"short justification","tools":[{{"name":"edit_file","args":{{"path":"{path}","insert_at_line":{{"line":N,"content":"new code here"}}}}}}]}}
+{{"action":"tool_call","tools":[{{"name":"edit_file","args":{{"path":"{path}","insert_at_line":{{"line":N,"content":"new code here"}}}}}}]}}
 
 Rules:
 - Line numbers MUST come directly from the numbered content above — never guess or estimate them.
@@ -216,7 +251,15 @@ _WRITE_TOOLS = {"write_file", "create_file"}
 _EDIT_KEYWORDS = ("edit", "update", "add", "modify", "insert", "append", "change", "fix", "remove", "debug", "style")
 _IMPLEMENTATION_VERBS = _EDIT_KEYWORDS + ("create", "implement", "replace", "write")
 
-_ADDITIVE_KEYWORDS = ("add", "insert", "implement", "introduce")
+# "include"/"incorporate" added: a step phrased as "Edit index.html to
+# include the timeline and card elements" is purely additive (bolt new
+# markup onto an existing file) but previously had NO word in this list,
+# so it fell through to the generic replace-anchor path (_EDIT_PROMPT),
+# which asks the coder to reproduce a large/whole-file "old" snippet
+# verbatim — exactly the fragile, failure-prone route this additive path
+# exists to avoid. "include" and "incorporate" are common phrasings for
+# "add this to the file" and belong here, not in _REPLACE_KEYWORDS.
+_ADDITIVE_KEYWORDS = ("add", "insert", "implement", "introduce", "include", "incorporate")
 _REPLACE_KEYWORDS = ("change", "replace", "update", "fix", "modify", "remove", "rename", "style", "debug")
 
 # Steps that reference specific lines, blocks, or named code units are routed
@@ -452,23 +495,6 @@ class Executor:
             tool_names=self.registry.list_names(),
         ))
 
-    def _log_justification(self, step: str, action_bundle: dict | None) -> None:
-        """Record the executor's stated reason for its tool choice.
-
-        Every tool_call bundle is required (by the executor system prompt) to
-        carry a "reason" field. This makes the ReAct "why this tool, why not
-        another" requirement auditable via /logs without introducing any new
-        approval or blocking machinery — dispatch() already ignores unknown
-        top-level keys, so this is purely observational.
-        """
-        if not isinstance(action_bundle, dict):
-            return
-        reason = action_bundle.get("reason")
-        if reason:
-            log("tool_justification", {"step": step[:160], "reason": str(reason)[:240]})
-        elif action_bundle.get("action") in ("tool_call", "parallel"):
-            log("tool_justification_missing", {"step": step[:160]})
-
     def _repair_action_bundle(self, step: str, raw: str, state: RunState) -> dict | None:
         prompt = _REPAIR_PROMPT.format(
             step=step,
@@ -548,7 +574,6 @@ class Executor:
 
         action_bundle = {
             "action": "tool_call",
-            "reason": f"content-first write of {path} (fresh or large file, no exact-text edit possible)",
             "tools":  [{"name": tool, "args": {"path": path, "content": content}}],
         }
         if tool == "create_file":
@@ -568,8 +593,6 @@ class Executor:
                     error = f"Unable to read existing test file '{path}': {exc}"
                     state.add_tool_result("edit_file", "error", error)
                     return {"status": "error", "results": [{"tool": "edit_file", "status": "error", "output": error}], "error": error}
-
-        self._log_justification(step, action_bundle)
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -702,7 +725,21 @@ class Executor:
 
         result = self._run_edit_attempt(prompt, path, state, label="coder_edit_first")
 
-        if self._edit_failed_text_not_found(result):
+        if self._edit_failed_ambiguous(result):
+            failed_args = self._last_edit_args(result)
+            failed_old = (failed_args or {}).get("old", "")
+            occurrence_detail = self._last_edit_error(result) or "(occurrence detail unavailable)"
+
+            repair_prompt = _EDIT_AMBIGUOUS_REPAIR_PROMPT.format(
+                path=path,
+                file_content=wrap_prompt_data(file_content, path=path),
+                failed_old=failed_old[:600],
+                occurrence_detail=occurrence_detail,
+                step=step,
+            )
+            log("executor_edit_ambiguous_repair", {"path": path, "failed_old": failed_old[:120]})
+            result = self._run_edit_attempt(repair_prompt, path, state, label="coder_edit_ambiguous_repair")
+        elif self._edit_failed_text_not_found(result):
             failed_args = self._last_edit_args(result)
             failed_old = (failed_args or {}).get("old", "")[:300]
 
@@ -715,7 +752,7 @@ class Executor:
             log("executor_edit_repair", {"path": path, "failed_old": failed_old[:120]})
             result = self._run_edit_attempt(repair_prompt, path, state, label="coder_edit_repair")
 
-        if self._edit_failed_text_not_found(result):
+        if self._edit_failed_text_not_found(result) or self._edit_failed_ambiguous(result):
             log("executor_edit_fallback_append", {"path": path, "step": step[:120]})
             return self._execute_additive_append(step, path, file_content, state)
 
@@ -782,11 +819,8 @@ class Executor:
 
         action_bundle = {
             "action": "tool_call",
-            "reason": f"additive append to {path} (step is additive-only, no existing text to replace)",
             "tools": [{"name": "edit_file", "args": {"path": path, "append": new_code}}],
         }
-
-        self._log_justification(step, action_bundle)
 
         violation = self._framework_violation(state, action_bundle)
         if violation:
@@ -846,8 +880,6 @@ class Executor:
                 "error": error,
             }
 
-        self._log_justification(path, action_bundle)
-
         violation = self._framework_violation(state, action_bundle)
         if violation:
             state.add_tool_result("edit_file", "error", violation)
@@ -867,6 +899,15 @@ class Executor:
     def _edit_failed_text_not_found(result: dict) -> bool:
         for r in result.get("results", []):
             if r.get("status") == "error" and "text not found" in (r.get("output") or ""):
+                return True
+        return False
+
+    @staticmethod
+    def _edit_failed_ambiguous(result: dict) -> bool:
+        """True when the edit_file failure was specifically an ambiguous
+        match (snippet found, but more than once) rather than not-found."""
+        for r in result.get("results", []):
+            if r.get("status") == "error" and "text match is ambiguous" in (r.get("output") or ""):
                 return True
         return False
 
@@ -896,7 +937,7 @@ class Executor:
     def _last_edit_error(result: dict) -> str | None:
         for r in result.get("results", []):
             if r.get("tool") == "edit_file" and r.get("status") == "error":
-                return (r.get("output") or "")[:300]
+                return (r.get("output") or "")[:600]
         return None
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -993,8 +1034,6 @@ class Executor:
                 "results": [{"tool": "coder", "status": "error", "output": error}],
                 "error":   error,
             }
-
-        self._log_justification(step, action_bundle)
 
         tools_to_call = []
         if isinstance(action_bundle, dict) and "tools" in action_bundle:

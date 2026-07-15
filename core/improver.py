@@ -669,6 +669,11 @@ class Improver:
         if state.validation_repair_instruction:
             repair = state.validation_repair_instruction
             state.validation_repair_instruction = ""
+            # target_plan_step is deliberately left untouched here — a
+            # validator repair is always in service of whichever plan step
+            # was already selected in a prior iteration (that's what got
+            # validated and failed). Overwriting it with the repair text
+            # would reproduce the exact bug this field exists to prevent.
             log("step_selected", {
                 "step": trim_tool_output(repair, max_tokens=30),
                 "source": "validator_repair",
@@ -700,6 +705,7 @@ class Improver:
 
                 if last_error and prior_attempts > 0:
                     state.validation_notes = last_error.output
+                    state.target_plan_step = selected_step
                     correction = self.improve(state)
                     if self._last_llm_error is not None:
                         return {"step": "", "done": False, "llm_error": self._last_llm_error}
@@ -717,6 +723,7 @@ class Improver:
                     return {"step": correction, "done": False}
 
                 state.step_attempts[selected_step] = prior_attempts + 1
+                state.target_plan_step = selected_step
                 log("step_selected", {
                     "step": trim_tool_output(selected_step, max_tokens=20),
                     "matched_plan": True,
@@ -761,6 +768,8 @@ class Improver:
 
         if selected_step and state.plan_steps:
             matched_plan = any(selected_step.strip() == ps.strip() for ps in state.plan_steps)
+            if matched_plan:
+                state.target_plan_step = selected_step
 
         log("step_selected", {
             "step": trim_tool_output(selected_step, max_tokens=20),

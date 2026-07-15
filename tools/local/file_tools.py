@@ -26,6 +26,107 @@ def inspect_file(args) -> str:
     # canonical structured inspector.
     return json.dumps(_inspect_file(args), ensure_ascii=False)
 
+    path = _path_arg(args)
+    if not path:
+        return json.dumps({
+            "success": False,
+            "error": "missing path"
+        })
+
+    if not os.path.exists(path):
+        return json.dumps({
+            "success": False,
+            "error": "file not found"
+        })
+
+    ext = os.path.splitext(path)[1].lower()
+
+    try:
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+
+        result = {
+            "success": True,
+            "file": path,
+            "extension": ext,
+            "imports": [],
+            "classes": [],
+            "functions": [],
+            "constants": [],
+            "entrypoint": "__main__" in source
+        }
+
+        if ext == ".py":
+
+            tree = ast.parse(source)
+
+            for node in tree.body:
+
+                if isinstance(node, ast.Import):
+
+                    for alias in node.names:
+                        result["imports"].append(alias.name)
+
+                elif isinstance(node, ast.ImportFrom):
+
+                    result["imports"].append(node.module)
+
+                elif isinstance(node, ast.Assign):
+
+                    for target in node.targets:
+
+                        if isinstance(target, ast.Name):
+
+                            if target.id.isupper():
+                                result["constants"].append(target.id)
+
+                elif isinstance(node, ast.FunctionDef):
+
+                    result["functions"].append({
+                        "name": node.name,
+                        "line": node.lineno,
+                        "args": [a.arg for a in node.args.args]
+                    })
+
+                elif isinstance(node, ast.ClassDef):
+
+                    cls = {
+                        "name": node.name,
+                        "line": node.lineno,
+                        "methods": []
+                    }
+
+                    for child in node.body:
+
+                        if isinstance(child, ast.FunctionDef):
+
+                            cls["methods"].append({
+                                "name": child.name,
+                                "line": child.lineno,
+                                "args": [a.arg for a in child.args.args]
+                            })
+
+                    result["classes"].append(cls)
+
+        else:
+
+            result["lines"] = len(source.splitlines())
+
+        log("tool_result", {
+            "tool": "inspect_file",
+            "file": path,
+            "status": "ok"
+        })
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        })
 
 def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELAY):
     """Write content to file character by character with a typing effect.
@@ -303,129 +404,6 @@ def edit_file(args: dict) -> str:
         return json.dumps({"success": False, "tool": "edit_file", "error": str(e), "path": path})
 
 
-# ── Unified diff / patch apply ────────────────────────────────────────────────
-
-_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-
-
-def apply_patch(args: dict) -> str:
-    """Apply a unified diff (one or more @@ hunks) to a file. Prefer this over
-    a full rewrite when a change touches several scattered locations in one
-    file — each hunk is anchored to its own context lines, so it is safer
-    than reconstructing the whole file. Args: path, patch (unified diff text,
-    '@@ -start,count +start,count @@' hunks with ' ', '+', '-' prefixed lines)."""
-    path = _path_arg(args)
-    if not path:
-        return "ERROR applying patch: missing path"
-    patch_text = args.get("patch") or args.get("diff") or ""
-    if not patch_text:
-        return "ERROR applying patch: missing patch text"
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            original_lines = f.readlines()
-    except FileNotFoundError:
-        original_lines = []
-    except Exception as e:
-        return f"ERROR reading {path}: {e}"
-
-    log("tool_call", {"tool": "apply_patch", "path": path})
-
-    try:
-        new_lines = _apply_unified_diff(original_lines, patch_text)
-    except ValueError as e:
-        return f"ERROR applying patch to {path}: {e}"
-
-    content = "".join(new_lines)
-    syntax_warning = _python_syntax_check(path, content)
-    if not syntax_warning:
-        syntax_warning = _java_structural_check(path, content)
-
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        _refresh_exact_index(path)
-        result = {
-            "success":       True,
-            "tool":          "apply_patch",
-            "file_modified": path,
-            "syntax_ok":     not bool(syntax_warning),
-        }
-        if syntax_warning:
-            result["syntax_warning"] = syntax_warning
-        log("tool_result", {"tool": "apply_patch", "path": path, "status": "ok"})
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"success": False, "tool": "apply_patch", "error": str(e), "path": path})
-
-
-def _apply_unified_diff(original_lines: list[str], patch_text: str) -> list[str]:
-    """
-    Minimal, dependency-free unified-diff applier for single-file patches
-    containing one or more '@@ -start,count +start,count @@' hunks.
-
-    Design notes:
-    - Hunks are applied bottom-to-top (highest old_start first) so that
-      earlier hunks' line numbers remain valid even after later hunks
-      change the file's total line count.
-    - Context lines (prefixed with a single space) and deletion lines
-      (prefixed '-') both consume one line from the original file at the
-      hunk's current cursor; addition lines (prefixed '+') are inserted
-      without consuming an original line.
-    - Out-of-bounds hunks raise ValueError so the caller can surface a
-      clear error instead of silently corrupting the file.
-    """
-    hunks: list[dict] = []
-    current: dict | None = None
-
-    for raw_line in patch_text.splitlines():
-        if raw_line.startswith(("--- ", "+++ ")):
-            continue
-        match = _HUNK_HEADER_RE.match(raw_line)
-        if match:
-            if current is not None:
-                hunks.append(current)
-            current = {"old_start": int(match.group(1)), "lines": []}
-            continue
-        if current is not None:
-            current["lines"].append(raw_line)
-
-    if current is not None:
-        hunks.append(current)
-    if not hunks:
-        raise ValueError("no valid @@ hunks found in patch text")
-
-    result = list(original_lines)
-
-    for hunk in sorted(hunks, key=lambda h: h["old_start"], reverse=True):
-        start = hunk["old_start"] - 1
-        old_count = 0
-        new_block: list[str] = []
-
-        for line in hunk["lines"]:
-            if line.startswith("-"):
-                old_count += 1
-            elif line.startswith("+"):
-                text = line[1:]
-                new_block.append(text if text.endswith("\n") else text + "\n")
-            elif line.startswith(" "):
-                old_count += 1
-                text = line[1:]
-                new_block.append(text if text.endswith("\n") else text + "\n")
-            # blank lines with no prefix are ignored defensively
-
-        if start < 0 or start + old_count > len(result):
-            raise ValueError(
-                f"hunk at line {hunk['old_start']} out of bounds for current file "
-                f"({len(result)} lines) — file may have changed since the patch was generated"
-            )
-
-        result[start:start + old_count] = new_block
-
-    return result
-
-
 def list_files(args) -> str:
     """List files recursively in a directory."""
     if isinstance(args, str):
@@ -515,6 +493,39 @@ def _normalize_whitespace(text: str) -> str:
     return "\n".join(line.rstrip() for line in lines)
 
 
+def _line_number_at(content: str, char_index: int) -> int:
+    """1-indexed line number of a character offset within content."""
+    return content.count("\n", 0, char_index) + 1
+
+
+def _occurrence_contexts(content: str, needle: str, max_occurrences: int = 6) -> list[dict]:
+    """
+    Return line numbers + a short surrounding snippet for every occurrence of
+    `needle` in `content`. Used to build an actionable disambiguation hint
+    when a replacement is rejected as ambiguous — without this, the repair
+    prompt only knows "there are 2 occurrences" and has no way to tell which
+    extra characters would make its next `old` guess unique.
+    """
+    occurrences = []
+    start = 0
+    while True:
+        pos = content.find(needle, start)
+        if pos == -1:
+            break
+        line_no = _line_number_at(content, pos)
+        # Grab a little context before/after so the model can see what
+        # differs between occurrences (e.g. one is in <head>, one is in a
+        # <script> block, one is inside a comment, etc.)
+        ctx_start = max(0, pos - 40)
+        ctx_end = min(len(content), pos + len(needle) + 40)
+        snippet = content[ctx_start:ctx_end].replace("\n", "\\n")
+        occurrences.append({"line": line_no, "context": snippet})
+        start = pos + max(len(needle), 1)
+        if len(occurrences) >= max_occurrences:
+            break
+    return occurrences
+
+
 def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tuple[str, int]:
     """
     Replace old with new inside content.
@@ -527,6 +538,11 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
 
     Never silently corrupts the file — if all attempts fail, raises ValueError
     so the agent knows to retry with the correct old string.
+
+    On an ambiguous match, the ValueError message includes the line number
+    and surrounding context of every occurrence found, so a repair prompt
+    has enough information to pick a snippet that's actually unique instead
+    of blindly resubmitting the same (still-ambiguous) text.
     """
     if old == "":
         raise ValueError("old text for replacement cannot be empty")
@@ -539,13 +555,19 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
             return c.replace(o, n), occurrences
         return c.replace(o, n, count), min(count, occurrences)
 
+    def _ambiguous_error(source: str, needle: str, occurrences: int) -> ValueError:
+        contexts = _occurrence_contexts(source, needle)
+        lines = "; ".join(f"line {c['line']}: ...{c['context']}..." for c in contexts)
+        return ValueError(
+            f"text match is ambiguous ({occurrences} occurrences). "
+            "Use a longer unique old snippet or explicitly set count. "
+            f"Occurrences found at: {lines}"
+        )
+
     # ── Attempt 1: exact match ────────────────────────────────────────────────
     exact_occurrences = content.count(old)
     if exact_occurrences > 1 and (count is None or count == 1):
-        raise ValueError(
-            f"text match is ambiguous ({exact_occurrences} occurrences). "
-            "Use a longer unique old snippet or explicitly set count."
-        )
+        raise _ambiguous_error(content, old, exact_occurrences)
     result, found = _do_replace(content, old, new)
     if found:
         return result, found
@@ -555,6 +577,9 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
     norm_old     = _normalize_whitespace(old)
     norm_new     = _normalize_whitespace(new)
 
+    norm_occurrences = norm_content.count(norm_old)
+    if norm_occurrences > 1 and (count is None or count == 1):
+        raise _ambiguous_error(norm_content, norm_old, norm_occurrences)
     result, found = _do_replace(norm_content, norm_old, norm_new)
     if found:
         log("edit_fuzzy_match", {"reason": "trailing_whitespace", "old": old[:60]})
@@ -569,6 +594,9 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
     coll_old     = _collapse(norm_old)
     coll_new     = _collapse(norm_new)
 
+    coll_occurrences = coll_content.count(coll_old)
+    if coll_occurrences > 1 and (count is None or count == 1):
+        raise _ambiguous_error(coll_content, coll_old, coll_occurrences)
     result, found = _do_replace(coll_content, coll_old, coll_new)
     if found:
         log("edit_fuzzy_match", {"reason": "indentation_collapse", "old": old[:60]})
@@ -576,6 +604,171 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
 
     # ── All attempts failed ───────────────────────────────────────────────────
     raise ValueError(f"text not found (tried exact + whitespace normalization): {old[:80]}")
+
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@"
+)
+
+
+def _parse_unified_diff(patch_text: str) -> list[dict]:
+    """
+    Parse a unified diff into a list of hunks:
+      {"old_start": int, "old_len": int, "new_start": int, "new_len": int,
+       "lines": [(" "|"+"|"-", text), ...]}
+    Tolerant of a leading '--- a/...' / '+++ b/...' file-header pair (ignored —
+    the target path always comes from the tool's own "path" arg, never parsed
+    out of the diff, so a model-supplied header can't redirect the write).
+    Raises ValueError with a specific, actionable message on malformed input.
+    """
+    if not patch_text or not patch_text.strip():
+        raise ValueError("patch is empty")
+
+    lines = patch_text.splitlines()
+    hunks: list[dict] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- ") or line.startswith("+++ "):
+            i += 1
+            continue
+        match = _HUNK_HEADER_RE.match(line)
+        if not match:
+            i += 1
+            continue
+        old_start = int(match.group("old_start"))
+        old_len = int(match.group("old_len") or 1)
+        new_start = int(match.group("new_start"))
+        new_len = int(match.group("new_len") or 1)
+        i += 1
+        body: list[tuple[str, str]] = []
+        while i < len(lines) and not _HUNK_HEADER_RE.match(lines[i]) and not lines[i].startswith(("--- ", "+++ ")):
+            raw = lines[i]
+            if raw.startswith(("+", "-", " ")):
+                body.append((raw[0], raw[1:]))
+            elif raw == "":
+                body.append((" ", ""))
+            else:
+                # Tolerate a missing leading space on unchanged lines — small
+                # models frequently drop it. Treat as context.
+                body.append((" ", raw))
+            i += 1
+        hunks.append({
+            "old_start": old_start, "old_len": old_len,
+            "new_start": new_start, "new_len": new_len,
+            "lines": body,
+        })
+
+    if not hunks:
+        raise ValueError("no valid @@ hunk headers found in patch")
+    return hunks
+
+
+def _apply_hunks(original: str, hunks: list[dict]) -> str:
+    """
+    Apply parsed unified-diff hunks to `original`, sequentially, verifying
+    each hunk's context/removal lines match the file at the claimed position
+    before mutating anything. Applied in ascending order of old_start with a
+    cumulative line-offset so each hunk's declared position (which refers to
+    the ORIGINAL file) maps correctly onto the progressively-edited buffer.
+    Raises ValueError naming the hunk and expected-vs-actual context on any
+    mismatch, so the coder LLM gets a concrete, actionable repair signal
+    (mirroring _replace_text's ambiguous-match diagnostics above). Never
+    partially applies on failure — the caller only writes on full success.
+    """
+    result_lines = original.splitlines(keepends=True)
+    offset = 0
+
+    for index, hunk in enumerate(sorted(hunks, key=lambda h: h["old_start"])):
+        start_idx = hunk["old_start"] - 1 + offset
+        if start_idx < 0 or start_idx > len(result_lines):
+            raise ValueError(
+                f"hunk {index + 1} @@ -{hunk['old_start']} out of bounds "
+                f"(file currently has {len(result_lines)} lines)"
+            )
+
+        cursor = start_idx
+        new_segment: list[str] = []
+        for kind, text in hunk["lines"]:
+            line_with_nl = text if text.endswith("\n") else text + "\n"
+            if kind == " ":
+                if cursor >= len(result_lines) or result_lines[cursor].rstrip("\n") != text.rstrip("\n"):
+                    actual = result_lines[cursor].rstrip("\n") if cursor < len(result_lines) else "<EOF>"
+                    raise ValueError(
+                        f"hunk {index + 1} context mismatch at line {cursor + 1}: "
+                        f"expected {text!r}, found {actual!r}"
+                    )
+                new_segment.append(result_lines[cursor])
+                cursor += 1
+            elif kind == "-":
+                if cursor >= len(result_lines) or result_lines[cursor].rstrip("\n") != text.rstrip("\n"):
+                    actual = result_lines[cursor].rstrip("\n") if cursor < len(result_lines) else "<EOF>"
+                    raise ValueError(
+                        f"hunk {index + 1} removal mismatch at line {cursor + 1}: "
+                        f"expected to remove {text!r}, found {actual!r}"
+                    )
+                cursor += 1
+            elif kind == "+":
+                new_segment.append(line_with_nl)
+
+        result_lines[start_idx:cursor] = new_segment
+        offset += len(new_segment) - (cursor - start_idx)
+
+    return "".join(result_lines)
+
+
+def apply_patch(args: dict) -> str:
+    """Apply a unified diff (one or more @@ hunks) to an existing file.
+    Args: path, patch (unified diff text). Prefer this over write_file/edit_file
+    when a change touches several scattered locations in the same file —
+    each hunk is verified against actual file content before anything is
+    written, and the whole patch is rejected atomically if any hunk fails
+    to match (no partial writes)."""
+    path = _path_arg(args)
+    if not path:
+        return "ERROR applying patch: missing path"
+    if not os.path.exists(path):
+        return f"ERROR applying patch: {path} does not exist. Use create_file for new files."
+
+    patch_text = ""
+    if isinstance(args, dict):
+        patch_text = args.get("patch") or args.get("diff") or ""
+
+    log("tool_call", {"tool": "apply_patch", "path": path, "patch_len": len(patch_text)})
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            original = f.read()
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+
+    try:
+        hunks = _parse_unified_diff(patch_text)
+        new_content = _apply_hunks(original, hunks)
+    except ValueError as e:
+        return f"ERROR applying patch to {path}: {e}"
+
+    syntax_warning = _python_syntax_check(path, new_content)
+    if not syntax_warning:
+        syntax_warning = _java_structural_check(path, new_content)
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        _refresh_exact_index(path)
+        log("tool_result", {"tool": "apply_patch", "path": path, "status": "ok", "hunks": len(hunks)})
+        result = {
+            "success": True,
+            "tool": "apply_patch",
+            "file_modified": path,
+            "hunks_applied": len(hunks),
+            "syntax_ok": not bool(syntax_warning),
+        }
+        if syntax_warning:
+            result["syntax_warning"] = syntax_warning
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"success": False, "tool": "apply_patch", "error": str(e), "path": path})
 
 
 def _coerce_count(value) -> int | None:

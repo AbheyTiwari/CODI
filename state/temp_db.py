@@ -160,6 +160,17 @@ class RunState:
     # ── Completed steps (ground truth, not iteration count) ───────────────────
     completed_steps: list[str] = field(default_factory=list)
     current_step: str = ""
+    # The ORIGINAL entry from plan_steps that the current execution attempt
+    # is trying to satisfy. This is intentionally separate from
+    # `current_step` / the "step" text handed to the executor: next_step()
+    # can rewrite that text into a validator-repair instruction or a
+    # reasoned correction (see core/improver.py next_step()), and if
+    # mark_step_complete() were called with that REWRITTEN text instead of
+    # the original plan_steps entry, a successful retry would never match
+    # anything in plan_steps — the step stays "not completed" forever and
+    # the run burns every remaining iteration on a task that actually
+    # finished. See agent.py's execution loop for where this is consumed.
+    target_plan_step: str = ""
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
