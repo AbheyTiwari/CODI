@@ -337,9 +337,20 @@ def _is_narrow_literal_edit(step: str) -> bool:
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
 
 
+def _clean_step_text(step: str) -> str:
+    """Strip filenames and path references from the step text to prevent
+    false-positive verb matches (e.g., 'change.md' matching 'change', or
+    'style.css' matching 'style')."""
+    # Remove things like change.md, styles.css
+    cleaned = re.sub(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b", " ", step or "")
+    # Strip punctuation
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return cleaned
+
+
 def _step_requires_mutation(step: str) -> bool:
-    lowered = (step or "").lower()
-    return any(re.search(rf"\b{re.escape(verb)}\b", lowered) for verb in _IMPLEMENTATION_VERBS)
+    cleaned = _clean_step_text(step)
+    return any(re.search(rf"\b{re.escape(verb)}\b", cleaned.lower()) for verb in _IMPLEMENTATION_VERBS)
 
 
 def _explicit_full_rewrite_requested(user_input: str) -> bool:

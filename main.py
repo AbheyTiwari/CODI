@@ -293,10 +293,20 @@ def render_response(output: str, tool_outputs: list = None):
     t = _t()
     console.print()
     if tool_outputs:
-        for line in tool_outputs[-5:]:
-            name, _, rest = line.partition(":")
+        for item in tool_outputs[-5:]:
+            if isinstance(item, dict):
+                name = item.get("tool", "")
+                status = item.get("status", "ok")
+                rest = item.get("output", "")
+            else:
+                name, _, rest = str(item).partition(":")
+                status = "error" if "error" in name.lower() or "error" in rest.lower() else "ok"
+
             row = Text()
-            row.append(f"  ✓  {name.strip()}", style=t["accent"])
+            if status == "ok" or status == "success":
+                row.append(f"  ✓  {name.strip()}", style=t["accent"])
+            else:
+                row.append(f"  ✗  {name.strip()}", style="red")
             row.append(f"  {rest.strip()[:80]}", style="dim")
             console.print(row)
         console.print()

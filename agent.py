@@ -79,8 +79,20 @@ _IMPLEMENTATION_VERBS = (
 _MAX_LLM_BACKEND_ERRORS = 3
 
 
+def _clean_step_text(step: str) -> str:
+    """Strip filenames and path references from the step text to prevent
+    false-positive verb matches (e.g., 'change.md' matching 'change', or
+    'style.css' matching 'style')."""
+    # Remove things like change.md, styles.css
+    cleaned = re.sub(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b", " ", step or "")
+    # Strip punctuation
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return cleaned
+
+
 def _step_requires_mutation(step: str) -> bool:
-    return any(re.search(rf"\b{verb}\b", (step or "").lower()) for verb in _IMPLEMENTATION_VERBS)
+    cleaned = _clean_step_text(step)
+    return any(re.search(rf"\b{verb}\b", cleaned.lower()) for verb in _IMPLEMENTATION_VERBS)
 
 
 def _step_succeeded(state: RunState, step: str = "") -> bool:
@@ -95,13 +107,17 @@ def _step_succeeded(state: RunState, step: str = "") -> bool:
     if not state.tool_results:
         return False
     last = state.tool_results[-1]
+
+    # Dispatcher noop/duplicate-write signals also count as step success —
+    # they mean "nothing left to do here," not "this failed". Check this first,
+    # before _step_requires_mutation exits early.
+    if last.tool == "dispatcher" and last.output in ("noop", "done"):
+        return True
+
     if _step_requires_mutation(step):
         return last.status == "ok" and last.tool in {"create_file", "write_file", "edit_file", "apply_patch"}
+    
     if last.status == "ok":
-        return True
-    # dispatcher noop/duplicate-write signals also count as step success —
-    # they mean "nothing left to do here," not "this failed"
-    if last.tool == "dispatcher" and last.output in ("noop", "done"):
         return True
     return False
 
@@ -188,7 +204,7 @@ class CodiAgent:
 
         return {
             "output":       output,
-            "tool_outputs": state.recent_tool_outputs(n=10),
+            "tool_outputs": [{"tool": r.tool, "status": r.status, "output": r.output} for r in state.tool_results[-10:]],
             "state":        state,
         }
 

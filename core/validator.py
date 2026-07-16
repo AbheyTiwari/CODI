@@ -49,8 +49,20 @@ def _detect_step_target_file(step: str) -> str | None:
     return match.group(1).strip("'\"` ") if match else None
 
 
+def _clean_step_text(step: str) -> str:
+    """Strip filenames and path references from the step text to prevent
+    false-positive verb matches (e.g., 'change.md' matching 'change', or
+    'style.css' matching 'style')."""
+    # Remove things like change.md, styles.css
+    cleaned = re.sub(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b", " ", step or "")
+    # Strip punctuation
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return cleaned
+
+
 def _step_requires_mutation(step: str) -> bool:
-    return bool(set(re.findall(r"[a-zA-Z]+", (step or "").lower())) & _IMPLEMENTATION_TERMS)
+    cleaned = _clean_step_text(step)
+    return bool(set(re.findall(r"[a-zA-Z]+", cleaned.lower())) & _IMPLEMENTATION_TERMS)
 
 # Validate prompt — tight JSON-only output expected.
 _VALIDATE_PROMPT = """
