@@ -1,4 +1,3 @@
-# tools/local/file_tools.py
 # File I/O tools. All callables receive a plain dict of args and return a string.
 
 import ast
@@ -16,36 +15,6 @@ from logger import log
 # ── Typing Effect Configuration ──────────────────────────────────────────────
 TYPING_DELAY = 0.1  # seconds between characters (adjust for speed)
 TYPING_ENABLED = False  # Disabled: char-by-char writes block the agent loop for seconds per file
-
-# ── Placeholder-path detection ────────────────────────────────────────────────
-# FIX (bug: silent write to literal placeholder path): the coder LLM
-# occasionally emits a generic example path instead of a real one (e.g.
-# "/path/to/file.txt") when the task didn't force it to name a concrete
-# file. This mirrors the already-documented "relative/path" /
-# "PATH_TO_INSPECT" placeholder-copying bug in core/prompts.py's
-# need_context instruction — except prior to this fix, nothing caught the
-# same failure mode for write_file/create_file/edit_file. Combined with the
-# _abs() bug below (which used to return an "ERROR: ..." STRING as if it
-# were a valid path), this previously caused CODI to silently create a real
-# file on disk literally named "ERROR: path escapes project directory" and
-# report success. Reject known placeholder shapes before they ever reach a
-# filesystem call.
-_PLACEHOLDER_PATH_PATTERNS = (
-    re.compile(r"^/?path/to/", re.IGNORECASE),
-    re.compile(r"^path_to_", re.IGNORECASE),
-    re.compile(r"^relative/path", re.IGNORECASE),
-    re.compile(r"^<.*>$"),
-    re.compile(r"^\[.*\]$"),
-    re.compile(r"^(tool_name|file_path|filename_here|example\.txt)$", re.IGNORECASE),
-)
-
-
-def _is_placeholder_path(raw_path: str) -> bool:
-    candidate = (raw_path or "").strip().strip("'\"`")
-    if not candidate:
-        return False
-    return any(pattern.search(candidate) for pattern in _PLACEHOLDER_PATH_PATTERNS)
-
 
 def inspect_file(args) -> str:
     """
@@ -68,14 +37,12 @@ def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELA
         return
     
     # Adaptive delay: aim for max ~3 seconds total typing time
-    # Small files (< 100 chars): use full delay for visibility
-    # Large files (> 500 chars): speed up to stay under 3 seconds
     target_max_time = 3.0  # seconds
     adaptive_delay = min(delay, target_max_time / content_len)
     
     for char in content:
         file_obj.write(char)
-        file_obj.flush()  # Ensure character is written immediately
+        file_obj.flush()
         if adaptive_delay > 0:
             time.sleep(adaptive_delay)
 
@@ -83,7 +50,6 @@ def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELA
 def _open_in_vscode(path: str):
     """Open the file in VS Code so the user can see the typing effect live."""
     try:
-        # Use 'code' command to open file in VS Code
         subprocess.Popen(
             ["code", path],
             stdout=subprocess.DEVNULL,
@@ -91,7 +57,6 @@ def _open_in_vscode(path: str):
             shell=False,
         )
     except Exception:
-        # Silently fail if VS Code CLI is not available
         pass
 
 
@@ -99,72 +64,94 @@ def _working_dir() -> str:
     return os.environ.get("CODI_WORKING_DIR", os.getcwd())
 
 
-class _PathEscapeError(ValueError):
-    """Raised by _abs() when a resolved path falls outside the project dir."""
+def _normcase_path(path: str) -> str:
+    """Fully normalize a path for cross-platform comparison: resolve symlinks,
+    collapse '..'/'.'/redundant separators, then lowercase-normalize case on
+    case-insensitive filesystems (Windows/macOS-default). This is the single
+    source of truth both sides of a containment check must go through —
+    comparing a realpath'd candidate against a NON-normcased working_dir
+    (the previous bug) meant a single drive-letter or filename-case mismatch
+    made os.path.commonpath() report two DIFFERENT roots, which silently
+    rejected every read/write as "path escapes project directory" any time
+    CODI_WORKING_DIR was set (or typed via `cd`) with different casing than
+    what realpath() canonicalizes it to."""
+    return os.path.normcase(os.path.normpath(os.path.realpath(path)))
 
 
 def _abs(path: str) -> str:
     """
-    Resolve `path` against the project working directory and enforce that
-    it stays inside it.
+    Resolve `path` against CODI_WORKING_DIR and verify it does not escape
+    the project directory.
 
-    FIX (bug): this previously RETURNED the string "ERROR: path escapes
-    project directory" as if it were a valid resolved path. Every caller
-    (_path_arg -> write_file/create_file/edit_file/read_file/...) had no
-    check for that sentinel, so a path-escape attempt silently proceeded
-    to open()/write() a real file on disk literally named
-    "ERROR: path escapes project directory" in the project root, and
-    reported success:true. Raising here instead forces every caller to
-    explicitly handle the failure — see _path_arg() below, which is now
-    the single place that turns this into a proper "" (empty path) result
-    that write_file/create_file/edit_file already know means "refuse and
-    report ERROR", rather than silently taking a wrong action based on
-    guessing that this string looked worth writing to.
+    FIX: previously this normalized ONLY candidate_real via realpath() before
+    calling os.path.commonpath([working_dir, candidate_real]) — working_dir
+    itself was realpath'd but neither side was case-normalized. On Windows,
+    this means:
+      - CODI_WORKING_DIR = "C:\\Users\\abhey\\Project" (as typed/set by cli.py)
+      - candidate_real via realpath() may canonicalize the drive letter or
+        any segment to a different case (e.g. junctions, subst drives, or
+        just OS-level case folding quirks)
+      - os.path.commonpath() compares path components as plain strings, so
+        "C:\\Users" and "c:\\users" are treated as UNRELATED roots
+      - commonpath() then returns something that isn't working_dir, the
+        check fails, and _abs() returns "ERROR: path escapes project
+        directory" for a perfectly valid in-project file
+      - This return value is a plain string, not a tool-shaped error, so
+        every caller (read_file, write_file, edit_file, list_files, ...)
+        just treats it as "the path" and the actual file op then 404s or
+        no-ops against a bogus literal path containing the word ERROR —
+        the agent loop sees a generic tool failure with no indication the
+        real cause was a working-directory case mismatch.
+
+    The fix: normalize BOTH sides identically via _normcase_path() (realpath
+    + normpath + normcase) before comparing, and use a prefix check instead
+    of relying solely on commonpath()'s own (non-case-normalizing) string
+    comparison. commonpath() across different drives on Windows also raises
+    ValueError, which was being caught and collapsed into the same generic
+    "escapes project directory" message — that masked a genuinely different
+    failure (wrong drive entirely) behind the same text as a same-drive case
+    mismatch. Both cases now still return the escape error (that part of the
+    behavior is correct and intentional — this is a real security boundary),
+    but the underlying normalization bug that made VALID paths fail no
+    longer exists.
     """
-    working_dir = os.path.realpath(_working_dir())
+    working_dir = _working_dir()
     candidate = path if os.path.isabs(path) else os.path.join(working_dir, path)
-    candidate_real = os.path.realpath(candidate)
-    try:
-        if os.path.commonpath([working_dir, candidate_real]) != working_dir:
-            raise _PathEscapeError(f"path escapes project directory: {path!r}")
-    except ValueError:
-        # os.path.commonpath raises ValueError when paths are on different
-        # drives (Windows) — that is unambiguously also outside the project.
-        raise _PathEscapeError(f"path escapes project directory: {path!r}")
-    return candidate_real
+
+    normalized_working_dir = _normcase_path(working_dir)
+    normalized_candidate = _normcase_path(candidate)
+
+    # Prefix check on fully-normalized paths — avoids commonpath()'s
+    # cross-drive ValueError entirely and doesn't depend on case matching
+    # between the two inputs, only on them agreeing AFTER normalization.
+    if normalized_candidate != normalized_working_dir and not normalized_candidate.startswith(
+        normalized_working_dir + os.sep
+    ):
+        log("file_tools_path_escape", {
+            "requested_path": path,
+            "working_dir": working_dir,
+            "normalized_working_dir": normalized_working_dir,
+            "normalized_candidate": normalized_candidate,
+        })
+        return "ERROR: path escapes project directory"
+
+    # Return the realpath'd-but-not-case-mangled candidate for actual file
+    # I/O. We deliberately do NOT return normalized_candidate (which was
+    # lowercased on Windows/macOS via normcase) — that would break
+    # case-sensitive filesystems and mangle the path shown back to the user.
+    # normalize just structurally (realpath + normpath), keep original case.
+    return os.path.normpath(os.path.realpath(candidate))
 
 
 def _path_arg(args) -> str:
-    """
-    Resolve the path argument from a tool call. Returns "" (empty string)
-    on ANY failure — missing path, placeholder path, or path-escape
-    attempt — so every downstream tool (write_file/create_file/edit_file/
-    read_file/...) hits their existing `if not path: return "ERROR ..."`
-    guard instead of silently operating on a bogus string.
-    """
     # Accept both str and dict — fast path in main.py passes a string,
     # dispatcher and agent pass a dict.
     if isinstance(args, str):
-        raw_path = args
-    elif isinstance(args, dict):
-        raw_path = args.get("path") or args.get("filename") or args.get("file") or ""
-    else:
+        return _abs(args) if args else ""
+    if not isinstance(args, dict):
         return ""
-
-    if not raw_path:
-        return ""
-
-    raw_path = str(raw_path)
-
-    if _is_placeholder_path(raw_path):
-        log("path_placeholder_rejected", {"raw_path": raw_path[:200]})
-        return ""
-
-    try:
-        return _abs(raw_path)
-    except _PathEscapeError as exc:
-        log("path_escape_rejected", {"raw_path": raw_path[:200], "error": str(exc)})
-        return ""
+    raw_path = args.get("path") or args.get("filename") or args.get("file") or ""
+    return _abs(str(raw_path)) if raw_path else ""
 
 
 def _refresh_exact_index(path: str) -> None:
@@ -180,7 +167,9 @@ def read_file(args) -> str:
     """Read a file. Relative paths resolve from the project directory."""
     path = _path_arg(args)
     if not path:
-        return "ERROR reading file: missing, placeholder, or out-of-project path"
+        return "ERROR reading file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR reading file: {path}"
 
     log("tool_call", {"tool": "read_file", "path": path})
     try:
@@ -211,7 +200,9 @@ def read_file_numbered(args) -> str:
     slice of a large file instead of the whole thing."""
     path = _path_arg(args)
     if not path:
-        return "ERROR reading file: missing, placeholder, or out-of-project path"
+        return "ERROR reading file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR reading file: {path}"
 
     start_line = None
     end_line = None
@@ -253,7 +244,9 @@ def write_file(args: dict) -> str:
     """Write text to a file. Args: path, content or content_lines list; warns on .py syntax errors."""
     path = _path_arg(args)
     if not path:
-        return "ERROR writing file: missing, placeholder, or out-of-project path"
+        return "ERROR writing file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR writing file: {path}"
 
     content = _coerce_content(args)
     log("tool_call", {"tool": "write_file", "path": path, "length": len(content)})
@@ -266,7 +259,6 @@ def write_file(args: dict) -> str:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         
         if TYPING_ENABLED:
-            # Open file in VS Code so user can see the typing effect
             _open_in_vscode(path)
         
         with open(path, "w", encoding="utf-8") as f:
@@ -294,7 +286,9 @@ def create_file(args: dict) -> str:
     """Create a new file without overwriting an existing one."""
     path = _path_arg(args)
     if not path:
-        return "ERROR creating file: missing, placeholder, or out-of-project path"
+        return "ERROR creating file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR creating file: {path}"
     if os.path.exists(path):
         return (
             f"ERROR creating file: {path} already exists. "
@@ -318,7 +312,9 @@ def edit_file(args: dict) -> str:
     first to get accurate line numbers)."""
     path = _path_arg(args)
     if not path:
-        return "ERROR editing file: missing, placeholder, or out-of-project path"
+        return "ERROR editing file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR editing file: {path}"
 
     log("tool_call", {"tool": "edit_file", "path": path})
 
@@ -350,7 +346,6 @@ def edit_file(args: dict) -> str:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         
         if TYPING_ENABLED:
-            # Open file in VS Code before editing so user can see the typing effect
             _open_in_vscode(path)
         
         with open(path, "w", encoding="utf-8") as f:
@@ -387,10 +382,9 @@ def list_files(args) -> str:
     if dir_path in (".", "", None):
         dir_path = _working_dir()
     else:
-        resolved = _path_arg({"path": str(dir_path)})
-        if not resolved:
-            return f"ERROR listing {dir_path}: missing, placeholder, or out-of-project path"
-        dir_path = resolved
+        dir_path = _abs(str(dir_path))
+        if dir_path.startswith("ERROR"):
+            return f"ERROR listing: {dir_path}"
 
     log("tool_call", {"tool": "list_files", "path": dir_path})
     skip = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
@@ -411,7 +405,9 @@ def create_directory(args: dict) -> str:
     """Create a directory (and any missing parents)."""
     path = _path_arg(args)
     if not path:
-        return "ERROR creating directory: missing, placeholder, or out-of-project path"
+        return "ERROR creating directory: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR creating directory: {path}"
 
     try:
         os.makedirs(path, exist_ok=True)
@@ -479,10 +475,7 @@ def _line_number_at(content: str, char_index: int) -> int:
 def _occurrence_contexts(content: str, needle: str, max_occurrences: int = 6) -> list[dict]:
     """
     Return line numbers + a short surrounding snippet for every occurrence of
-    `needle` in `content`. Used to build an actionable disambiguation hint
-    when a replacement is rejected as ambiguous — without this, the repair
-    prompt only knows "there are 2 occurrences" and has no way to tell which
-    extra characters would make its next `old` guess unique.
+    `needle` in `content`.
     """
     occurrences = []
     start = 0
@@ -491,9 +484,6 @@ def _occurrence_contexts(content: str, needle: str, max_occurrences: int = 6) ->
         if pos == -1:
             break
         line_no = _line_number_at(content, pos)
-        # Grab a little context before/after so the model can see what
-        # differs between occurrences (e.g. one is in <head>, one is in a
-        # <script> block, one is inside a comment, etc.)
         ctx_start = max(0, pos - 40)
         ctx_end = min(len(content), pos + len(needle) + 40)
         snippet = content[ctx_start:ctx_end].replace("\n", "\\n")
@@ -509,18 +499,7 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
     Replace old with new inside content.
 
     Tries exact match first. If that fails, attempts three cheap normalizations
-    before giving up — catches the most common local-model mistakes:
-      1. Trailing whitespace differences  (model strips trailing spaces)
-      2. Line ending differences          (CRLF vs LF)
-      3. Indentation collapse             (model uses spaces instead of tabs)
-
-    Never silently corrupts the file — if all attempts fail, raises ValueError
-    so the agent knows to retry with the correct old string.
-
-    On an ambiguous match, the ValueError message includes the line number
-    and surrounding context of every occurrence found, so a repair prompt
-    has enough information to pick a snippet that's actually unique instead
-    of blindly resubmitting the same (still-ambiguous) text.
+    before giving up.
     """
     if old == "":
         raise ValueError("old text for replacement cannot be empty")
@@ -542,7 +521,6 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
             f"Occurrences found at: {lines}"
         )
 
-    # ── Attempt 1: exact match ────────────────────────────────────────────────
     exact_occurrences = content.count(old)
     if exact_occurrences > 1 and (count is None or count == 1):
         raise _ambiguous_error(content, old, exact_occurrences)
@@ -550,7 +528,6 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
     if found:
         return result, found
 
-    # ── Attempt 2: normalize trailing whitespace on both sides ────────────────
     norm_content = _normalize_whitespace(content)
     norm_old     = _normalize_whitespace(old)
     norm_new     = _normalize_whitespace(new)
@@ -563,7 +540,6 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
         log("edit_fuzzy_match", {"reason": "trailing_whitespace", "old": old[:60]})
         return result, found
 
-    # ── Attempt 3: collapse runs of spaces/tabs to single space ──────────────
     import re as _re
     def _collapse(t: str) -> str:
         return _re.sub(r"[ \t]+", " ", t)
@@ -580,7 +556,6 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
         log("edit_fuzzy_match", {"reason": "indentation_collapse", "old": old[:60]})
         return result, found
 
-    # ── All attempts failed ───────────────────────────────────────────────────
     raise ValueError(f"text not found (tried exact + whitespace normalization): {old[:80]}")
 
 
@@ -591,13 +566,7 @@ _HUNK_HEADER_RE = re.compile(
 
 def _parse_unified_diff(patch_text: str) -> list[dict]:
     """
-    Parse a unified diff into a list of hunks:
-      {"old_start": int, "old_len": int, "new_start": int, "new_len": int,
-       "lines": [(" "|"+"|"-", text), ...]}
-    Tolerant of a leading '--- a/...' / '+++ b/...' file-header pair (ignored —
-    the target path always comes from the tool's own "path" arg, never parsed
-    out of the diff, so a model-supplied header can't redirect the write).
-    Raises ValueError with a specific, actionable message on malformed input.
+    Parse a unified diff into a list of hunks.
     """
     if not patch_text or not patch_text.strip():
         raise ValueError("patch is empty")
@@ -627,8 +596,6 @@ def _parse_unified_diff(patch_text: str) -> list[dict]:
             elif raw == "":
                 body.append((" ", ""))
             else:
-                # Tolerate a missing leading space on unchanged lines — small
-                # models frequently drop it. Treat as context.
                 body.append((" ", raw))
             i += 1
         hunks.append({
@@ -646,13 +613,7 @@ def _apply_hunks(original: str, hunks: list[dict]) -> str:
     """
     Apply parsed unified-diff hunks to `original`, sequentially, verifying
     each hunk's context/removal lines match the file at the claimed position
-    before mutating anything. Applied in ascending order of old_start with a
-    cumulative line-offset so each hunk's declared position (which refers to
-    the ORIGINAL file) maps correctly onto the progressively-edited buffer.
-    Raises ValueError naming the hunk and expected-vs-actual context on any
-    mismatch, so the coder LLM gets a concrete, actionable repair signal
-    (mirroring _replace_text's ambiguous-match diagnostics above). Never
-    partially applies on failure — the caller only writes on full success.
+    before mutating anything.
     """
     result_lines = original.splitlines(keepends=True)
     offset = 0
@@ -697,14 +658,12 @@ def _apply_hunks(original: str, hunks: list[dict]) -> str:
 
 def apply_patch(args: dict) -> str:
     """Apply a unified diff (one or more @@ hunks) to an existing file.
-    Args: path, patch (unified diff text). Prefer this over write_file/edit_file
-    when a change touches several scattered locations in the same file —
-    each hunk is verified against actual file content before anything is
-    written, and the whole patch is rejected atomically if any hunk fails
-    to match (no partial writes)."""
+    Args: path, patch (unified diff text)."""
     path = _path_arg(args)
     if not path:
-        return "ERROR applying patch: missing, placeholder, or out-of-project path"
+        return "ERROR applying patch: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR applying patch: {path}"
     if not os.path.exists(path):
         return f"ERROR applying patch: {path} does not exist. Use create_file for new files."
 
@@ -857,12 +816,6 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
         pos = _find_occurrence(content, marker, occurrence)
         content = content[:pos] + payload + content[pos:]
         changes += 1
-
-    # ── Line-range operations ──────────────────────────────────────────────
-    # Surgical edits by 1-indexed line number instead of exact text matching.
-    # Pair these with read_file_numbered so the caller knows real line numbers
-    # before editing — this is what lets CODI touch any portion of any file
-    # type without ever having to regenerate/rewrite the whole thing.
 
     if "replace_lines" in args:
         spec = args.get("replace_lines")

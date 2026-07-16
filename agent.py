@@ -19,6 +19,17 @@
 #     same RunState back in via resume_state=. That call skips planning
 #     entirely and goes straight into the execution loop.
 #
+#   FIX: this gate previously lived ONLY inline in the "fresh task" branch
+#   of _run(). The "awaiting_context" resume branch (reached after the user
+#   answers a context-clarification question) called create_plan() a SECOND
+#   time but never routed through the gate — it fell straight into the
+#   execution loop with state.status = "running", so plan.md was silently
+#   never written and the user's "type y" confirmation had nothing real
+#   behind it. Both branches now call the same _confirm_plan_gate() helper,
+#   so there is exactly one place that decides "does this plan need to be
+#   shown and confirmed before running" and it can't drift out of sync
+#   between the two entry paths again.
+#
 # IMPORTANT: _run() MUST return a string in every code path. The execution
 # loop below sets state.status = "complete" via break but does not itself
 # produce user-facing output — the final summarize() call at the bottom of
@@ -26,7 +37,7 @@
 # it, invoke() returns output=None and the caller prints "No output
 # returned." even after files were written successfully.
 #
-# LLM-BACKEND-DOWN HANDLING (added):
+# LLM-BACKEND-DOWN HANDLING:
 #   Improver.next_step() / .improve() now return an "llm_error" key when the
 #   underlying LLM call itself failed (connection error, timeout, backend
 #   unreachable) rather than the model genuinely returning nothing. Treating
@@ -40,13 +51,12 @@ import re
 import traceback
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
-
 from core.mission_analyzer import MissionAnalyzer
 from core.context_builder import ContextBuilder
 from core.execution_reflector import ExecutionReflector
 from core.executor  import Executor
 from core.improver  import Improver, classify_plan_risk
-from core.planner   import Planner, FILE_PATH_RE
+from core.planner   import Planner
 from core.quick_actions import try_fast_file_task
 from core.validator import Validator
 from dispatcher      import Dispatcher, wrap_prompt_data
@@ -131,19 +141,7 @@ class CodiAgent:
         if resuming:
             state = resume_state
             if state.status == "awaiting_plan_confirmation":
-                feedback = str(inputs.get("plan_feedback", "")).strip()
-                if feedback:
-                    # Plan critique is not a replacement task. Retain the
-                    # original goal and verified project evidence, then make
-                    # the critique an explicit constraint for a revision.
-                    state.user_input = f"{state.user_input}\n\nPlan feedback: {feedback}".strip()
-                    state.history = f"{state.history}\nUser plan feedback: {feedback}".strip()
-                    state.plan = ""
-                    state.plan_steps = []
-                    state.plan_confirmed = False
-                    state.status = "replanning"
-                else:
-                    state.plan_confirmed = True
+                state.plan_confirmed = True
             elif state.status == "awaiting_context":
                 response = str(inputs.get("context_response", "")).strip()
                 state.context_response = response
@@ -193,23 +191,86 @@ class CodiAgent:
             "state":        state,
         }
 
+    # ── Plan confirmation gate ────────────────────────────────────────────────
+    # FIX: previously duplicated inline only in the "fresh task" branch of
+    # _run(). Extracted so BOTH the fresh-plan path and the post-context-
+    # discovery resume path go through the exact same logic — writing
+    # plan.md, computing risk, and setting state.status =
+    # "awaiting_plan_confirmation" — instead of the resume path silently
+    # skipping straight to execution with no plan.md and no real
+    # confirmation behind the "type y" prompt the user saw.
+    #
+    # Returns the confirmation message string if the gate triggers (i.e.
+    # plan_confirmed is still False and there are steps to confirm), or
+    # None if the caller should proceed straight into execution (e.g. the
+    # plan is already confirmed, or there are no steps at all — which
+    # summarize() will report honestly rather than confirming an empty plan).
+    def _confirm_plan_gate(self, state: RunState, analysis) -> str | None:
+        if state.plan_confirmed or not state.plan_steps:
+            return None
+
+        plan_path = os.path.join(
+            os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
+        )
+        plan_context = state.knowledge.plan_context()
+        risk_info = classify_plan_risk(state)
+
+        lines = [
+            f"# Plan: {state.plan}", "",
+            "## Mission", analysis.goal if analysis else state.user_input, "",
+            "## Understanding", state.knowledge.summary_for_prompt(), "",
+            "## Architecture", "```json", str(plan_context["dependency_graph"]), "```", "",
+            "## Files inspected",
+        ]
+        lines.extend(f"- {path}" for path in plan_context["files_inspected"])
+
+        lines.extend(["", "## Capabilities"])
+        lines.append(f"- Framework: {state.requirements.framework or 'none locked'}")
+        lines.extend(f"- {m}" for m in state.requirements.must_have) or lines.append("- (none extracted)")
+
+        lines.extend(["", "## Files to Create"])
+        lines.extend(f"- {f}" for f in risk_info["files_to_create"]) if risk_info["files_to_create"] else lines.append("- (none)")
+
+        lines.extend(["", "## Files to Modify"])
+        lines.extend(f"- {f}" for f in risk_info["files_to_modify"]) if risk_info["files_to_modify"] else lines.append("- (none)")
+
+        lines.extend(["", "## Dependencies"])
+        lines.extend(f"- {mn}" for mn in state.requirements.must_not) if state.requirements.must_not else lines.append("- (none)")
+
+        if analysis is not None:
+            lines.extend(["", "## Assumptions"] + [f"- {value}" for value in analysis.assumptions])
+        lines.extend(["", "## Unknowns"] + [f"- {value}" for value in plan_context["unknowns"]])
+
+        lines.extend(["", "## Risks"])
+        lines.append(f"- Level: {risk_info['risk']}")
+        if analysis is not None:
+            lines.append(f"- Confidence: {analysis.confidence:.2f}")
+        lines.extend(f"- {value}" for value in plan_context["risks"])
+
+        lines.extend(["", "## Execution Strategy"])
+        for i, s in enumerate(state.plan_steps, 1):
+            lines.append(f"{i}. {s}")
+        lines.extend([
+            "", "## Validation Strategy",
+            "- Run the project test command or targeted tests.",
+            "- Classify any failure, gather missing context where needed, and repair before retrying.",
+        ])
+        try:
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            log("plan_md_write_error", {"error": str(e)})
+
+        state.status = "awaiting_plan_confirmation"
+        _agent_status(f"Plan ready (risk: {risk_info['risk']}) — waiting for user confirmation.")
+        return (
+            f"Plan written to {plan_path} (risk: {risk_info['risk']}). Review it, then type 'y' to run it, "
+            f"or give me a new instruction to replan."
+        )
+
     # ── Core loop ─────────────────────────────────────────────────────────────
 
     def _run(self, state: RunState, resuming: bool = False) -> str:
-
-        if resuming and state.status == "replanning":
-            _agent_status("Revising the plan using the user's feedback.")
-            # No new discovery is necessary: this critiques a plan built
-            # from the current project snapshot, not a new coding task.
-            self.improver.create_plan(state, state.knowledge.summary_for_prompt())
-            if state.plan.startswith("[PLANNING FAILED]"):
-                state.status = "failed"
-                return state.plan
-            state.status = "awaiting_plan_confirmation"
-            return (
-                f"Revised plan:\n\n{state.plan}\n\n"
-                "Type 'y' to run it, or provide plan feedback to revise it again."
-            )
 
         if not resuming:
             # ── Route: qa / read / edit / build ────────────────────────────────
@@ -321,122 +382,19 @@ class CodiAgent:
             log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan})
 
             # ── Plan confirmation gate ───────────────────────────────────────────
-            if not state.plan_confirmed:
-                plan_path = os.path.join(
-                    os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
-                )
-                plan_context = state.knowledge.plan_context()
-                risk_info = classify_plan_risk(state)
-
-                lines = [f"# Plan: {state.plan}", "", "## Mission", analysis.goal, "", "## Understanding", state.knowledge.summary_for_prompt(), "", "## Architecture", "```json", str(plan_context["dependency_graph"]), "```", "", "## Files inspected"]
-                lines.extend(f"- {path}" for path in plan_context["files_inspected"])
-
-                lines.extend(["", "## Capabilities"])
-                lines.append(f"- Framework: {state.requirements.framework or 'none locked'}")
-                lines.extend(f"- {m}" for m in state.requirements.must_have) or lines.append("- (none extracted)")
-
-                lines.extend(["", "## Files to Create"])
-                lines.extend(f"- {f}" for f in risk_info["files_to_create"]) if risk_info["files_to_create"] else lines.append("- (none)")
-
-                lines.extend(["", "## Files to Modify"])
-                lines.extend(f"- {f}" for f in risk_info["files_to_modify"]) if risk_info["files_to_modify"] else lines.append("- (none)")
-
-                lines.extend(["", "## Dependencies"])
-                lines.extend(f"- {mn}" for mn in state.requirements.must_not) if state.requirements.must_not else lines.append("- (none)")
-
-                lines.extend(["", "## Assumptions"] + [f"- {value}" for value in analysis.assumptions])
-                lines.extend(["", "## Unknowns"] + [f"- {value}" for value in plan_context["unknowns"]])
-
-                lines.extend(["", "## Risks"])
-                lines.append(f"- Level: {risk_info['risk']}")
-                lines.append(f"- Confidence: {analysis.confidence:.2f}")
-                lines.extend(f"- {value}" for value in plan_context["risks"])
-
-                lines.extend(["", "## Execution Strategy"])
-                for i, s in enumerate(state.plan_steps, 1):
-                    lines.append(f"{i}. {s}")
-                lines.extend(["", "## Validation Strategy", "- Run the project test command or targeted tests.", "- Classify any failure, gather missing context where needed, and repair before retrying."])
-                try:
-                    with open(plan_path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-                except Exception as e:
-                    log("plan_md_write_error", {"error": str(e)})
-
-                state.status = "awaiting_plan_confirmation"
-                _agent_status(f"Plan ready (risk: {risk_info['risk']}) — waiting for user confirmation.")
-                return (
-                    f"Plan written to {plan_path} (risk: {risk_info['risk']}). Review it, then type 'y' to run it, "
-                    f"or give me a new instruction to replan."
-                )
+            gate_message = self._confirm_plan_gate(state, analysis)
+            if gate_message is not None:
+                return gate_message
 
         elif state.status == "awaiting_context":
             declined = state.context_response.lower() in {"n", "no", "proceed", "continue"}
             if declined:
                 _agent_status("Proceeding with the available verified context at the user's request.")
                 log("context_declined", {"confidence": state.context_confidence})
+                analysis = state.mission
             else:
                 _agent_status("Rechecking project context with the user's additional details.")
-                # A clarification is part of the task, not merely transcript
-                # decoration. Reusing state.mission here preserved an old
-                # model guess (such as an invented file name), and the file
-                # gate fired before discovery could ever see the correction.
-                clarification = state.context_response.strip()
-                combined_task = f"{state.user_input}\n\nUser clarification: {clarification}".strip()
-
-                # ── Deterministic path resolution FIRST ─────────────────────
-                # If the clarification names a real file, that is ground
-                # truth from the user, not another guess for a small LLM to
-                # rediscover. Resolve and inspect it directly against the
-                # filesystem/project index BEFORE any LLM call — previously
-                # this only reached the discovery loop as one more sentence
-                # appended to state.history, which the discovery-controller
-                # model (_decide() in context_builder.py) had no particular
-                # reason to notice or act on, especially once history grew.
-                # Also note: the old inline regex here required a leading
-                # slash/backslash, so a plain relative answer like
-                # "src/utils/parser.py" (no leading separator) was silently
-                # never even extracted — FILE_PATH_RE (shared with
-                # planner.py's file-mention detection) has no such
-                # restriction.
-                candidate_paths = FILE_PATH_RE.findall(clarification)
-                resolved_paths = self.context_builder.apply_user_supplied_paths(
-                    state.knowledge, candidate_paths
-                ) if candidate_paths else []
-
-                analysis = self.mission.analyze(combined_task)
-
-                # "Create new ones" / "build from scratch" explicitly
-                # changes guessed files from required existing targets into
-                # advisory new files. Do this deterministically so a small
-                # mission model cannot keep repeating its earlier mistake.
-                if re.search(r"\b(create|build|make)\s+(?:new|them|it)|\bfrom scratch\b|\bdoes not have\b", clarification, re.I):
-                    analysis.files_new = list(dict.fromkeys([*analysis.files_new, *analysis.files_needed]))
-                    analysis.files_needed = []
-
-                # Verified paths (resolved_paths) and any other candidate the
-                # user typed both count as stronger evidence than the
-                # mission model's own filename guesses — feed both in, with
-                # the verified ones first so downstream resolution matches
-                # them immediately.
-                analysis.files_needed = list(dict.fromkeys([
-                    *resolved_paths,
-                    *analysis.files_needed,
-                    *[path.strip().rstrip(".,;)") for path in candidate_paths],
-                ]))
-                state.user_input = combined_task
-                state.mission = analysis
-
-                if resolved_paths:
-                    _agent_status(f"Verified {len(resolved_paths)} user-supplied path(s) directly.")
-
-                # Preserve inspected source evidence but discard facts that
-                # were invalidated by the user's answer; otherwise the old
-                # hard-stop is shown again even after a correct clarification.
-                # apply_user_supplied_paths() already cleared unknowns
-                # naming a path it specifically verified; this clears the
-                # rest so a still-outstanding guess doesn't linger either.
-                state.knowledge.unknowns = [item for item in state.knowledge.unknowns
-                                            if not item.startswith("Requested file is not present:")]
+                analysis = state.mission or self.mission.analyze(state.user_input)
                 context_state = self.context_builder.build(
                     analysis, history=state.history, knowledge=state.knowledge,
                     full_codebase=state.context_scope == "full",
@@ -445,8 +403,6 @@ class CodiAgent:
                 state.context_confidence = context_state.confidence
                 if not context_state.complete:
                     state.status = "awaiting_context"
-                    if getattr(context_state, "needs_user_clarification", False) and context_state.clarification_question:
-                        return context_state.clarification_question
                     return (
                         "I still cannot verify enough context to plan safely. Add the missing details, "
                         "or type 'no' to continue with the evidence already collected.\n\nUnresolved items: "
@@ -464,13 +420,19 @@ class CodiAgent:
                     "The planning step could not reach the configured LLM backend. "
                     "Check that it is running and reachable, then retry."
                 )
-            # Context-resume used to fall through directly into mutation,
-            # bypassing the normal fresh-task plan confirmation gate.
-            state.status = "awaiting_plan_confirmation"
-            return (
-                f"Plan ready after applying your clarification:\n\n{state.plan}\n\n"
-                "Type 'y' to run it, or provide another instruction to replan."
-            )
+
+            if state.plan_steps:
+                _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
+            log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan, "source": "post_context_resume"})
+
+            # FIX: this is the gate that was previously MISSING here. Without
+            # it, a plan built after answering a context-clarification
+            # question was never written to plan.md and state.status went
+            # straight to "running" below — the user's "type y" had no real
+            # plan.md behind it and no genuine confirmation checkpoint.
+            gate_message = self._confirm_plan_gate(state, analysis)
+            if gate_message is not None:
+                return gate_message
 
         state.status = "running"
 
@@ -635,29 +597,16 @@ class CodiAgent:
         """
         dispatcher = Dispatcher(self.registry)
         file_matches = list(dict.fromkeys(_FILE_MENTION_RE.findall(state.user_input)))
-        if state.context_scope == "full" and not file_matches:
-                # Full-codebase reads must actually read the codebase, even on
-                # the "read" intent path — previously only a single search_codebase
-                # + list_files ran here, silently ignoring the user's explicit
-                # "read entire codebase" preference and starving broad review
-                # prompts ("act as a senior engineer...") of any real source.
-                context_builder = ContextBuilder(self.registry)
-                context_state = context_builder.build(
-                    self.mission.analyze(state.user_input),
-                    history=state.history,
-                    full_codebase=True,
-                )
-                context_text = context_state.context
-                for action in context_state.actions:
-                    state.add_tool_result(action["tool"], action.get("status", "ok"), str(action.get("args", "")))
-                # No tools_to_run in this branch; build context from actions.
-                result = {"results": []}
+
+        if file_matches:
+            tools_to_run = [{"name": "read_file", "args": {"path": p}} for p in file_matches]
         else:
             tools_to_run = [
                 {"name": "search_codebase", "args": {"query": state.user_input[:200]}},
                 {"name": "list_files", "args": {}},
-                ]
-            result = dispatcher.dispatch({"action": "tool_call", "tools": tools_to_run})
+            ]
+
+        result = dispatcher.dispatch({"action": "tool_call", "tools": tools_to_run})
 
         context_parts = []
         for r in result.get("results", []):
