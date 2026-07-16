@@ -110,6 +110,66 @@ OR:
 """
 
 
+# This gate reviews a file immediately after it is written. The final
+# task-level review remains useful for cross-file behaviour, but is too late
+# to decide whether the executor may advance to the next implementation step.
+_FILE_WRITE_VALIDATE_PROMPT = """
+You are the file-write validation gate for a coding agent.
+
+Original user request:
+{task}
+
+Current plan step:
+{step}
+
+Target file (read from disk after the write): {path}
+Complete current content of that file:
+--- FILE: {path} ---
+{source}
+--- END FILE: {path} ---
+
+Decide whether the just-written file correctly implements the part of the
+ORIGINAL user request assigned to the current plan step. Review the actual
+file content, not the tool's success message. Do not approve merely because
+the file parses or contains related words. If anything required for this step
+is absent, incorrect, or placed in the wrong file, reject it and state exactly
+what the coder must change. A rejection prevents the agent from advancing to
+the next plan step.
+
+Respond ONLY with JSON:
+{{"passed":true,"notes":"","repair_instruction":"","findings":[]}}
+OR:
+{{"passed":false,"notes":"specific missing or incorrect behavior","repair_instruction":"one exact surgical action for the coder","findings":[{{"path":"relative/path","line":12,"severity":"error","problem":"what is wrong","repair":"minimal change"}}]}}
+"""
+
+
+_PLAN_VALIDATE_PROMPT = """
+You are the plan validation gate for a coding agent.
+
+Original user request:
+{task}
+
+Plan risk: {risk}
+Planner confidence: {confidence:.2f}
+
+The following is the exact current content of plan.md:
+--- FILE: plan.md ---
+{plan_content}
+--- END FILE: plan.md ---
+
+Assess whether this plan fully and safely implements the original request.
+Check coverage, sequence, target files, dependencies, and verification. Score
+the plan from 0 to 10. Give concrete corrections that the planner can apply;
+do not score based only on formatting.
+
+Respond ONLY with JSON:
+{{"score":8.5,"notes":"brief assessment","suggested_edits":"specific corrections for the planner"}}
+"""
+
+_PLAN_REVIEW_MAX_ATTEMPTS = 3
+_HIGH_CONFIDENCE = 0.90
+
+
 class Validator:
     def __init__(self):
         self.llm = None
@@ -122,6 +182,157 @@ class Validator:
                 log("validator_llm_error", {"error": str(e)[:200]})
                 self.llm = _FallbackLLM("refiner llm unavailable")
         return self.llm
+
+    @staticmethod
+    def _latest_successful_write(state: RunState, since: int = 0) -> tuple[str, str] | None:
+        """Return the path and on-disk content for the most recent file write."""
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        for result in reversed(state.tool_results[since:]):
+            if result.tool not in {"create_file", "write_file", "edit_file", "apply_patch"} or result.status != "ok":
+                continue
+            try:
+                payload = json.loads(result.output)
+                path = payload.get("file_modified") or payload.get("path")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                path = None
+            if not path:
+                continue
+            absolute = str(path) if os.path.isabs(str(path)) else os.path.join(working_dir, str(path))
+            try:
+                with open(absolute, "r", encoding="utf-8", errors="replace") as handle:
+                    source = handle.read()
+                relative = os.path.relpath(absolute, working_dir).replace("\\", "/")
+                return relative, source
+            except OSError:
+                return str(path), ""
+        return None
+
+    def validate_current_write(self, state: RunState, since: int = 0) -> bool | None:
+        """Validate the latest write before allowing the plan to advance.
+
+        Returns None when this executor action did not write a file.
+        """
+        latest = self._latest_successful_write(state, since=since)
+        if latest is None:
+            return None
+        path, source = latest
+        if not source:
+            reason = f"Could not read written file '{path}' for semantic validation."
+            self._fail(state, reason)
+            log("validation_decision", {"layer": "per_write_source", "passed": False, "reason": reason})
+            return False
+
+        prompt = _FILE_WRITE_VALIDATE_PROMPT.format(
+            task=state.user_input,
+            step=state.current_step or state.target_plan_step or "(unspecified step)",
+            path=path,
+            source=source,
+        )
+        try:
+            raw_response = self._get_llm().invoke([HumanMessage(content=prompt)]).content
+            parsed = Dispatcher.parse_llm_json(raw_response)
+        except Exception as exc:
+            reason = f"Per-write LLM validation failed: {exc}"
+            self._fail(state, reason)
+            log("validation_decision", {"layer": "per_write_llm", "passed": False, "reason": reason[:200]})
+            return False
+
+        if not isinstance(parsed, dict):
+            reason = "Per-write LLM validation returned invalid JSON."
+            self._fail(state, reason)
+            log("validation_decision", {"layer": "per_write_llm", "passed": False, "reason": reason})
+            return False
+
+        passed = bool(parsed.get("passed", False))
+        notes = str(parsed.get("notes", "")).strip()
+        repair = str(parsed.get("repair_instruction", "")).strip()
+        findings = parsed.get("findings", [])
+        state.validation_passed = passed
+        state.validation_notes = notes or ("File write validated." if passed else "File write did not meet the request.")
+        state.validation_requires_correction = not passed
+        state.validation_classification = "success" if passed else "per_write_failure"
+        state.validation_recommendation = "continue" if passed else "repair"
+        state.validation_repair_instruction = repair if not passed else ""
+        state.validation_findings = findings if isinstance(findings, list) else []
+        log("validation_decision", {
+            "layer": "per_write_llm", "passed": passed, "path": path,
+            "notes": trim_tool_output(state.validation_notes, max_tokens=20),
+        })
+        return passed
+
+    def validate_plan_file(self, state: RunState, plan_path: str, risk: str, confidence: float) -> dict:
+        """Score plan.md and apply the pre-confirmation approval policy."""
+        try:
+            with open(plan_path, "r", encoding="utf-8", errors="replace") as handle:
+                plan_content = handle.read()
+        except OSError as exc:
+            result = {
+                "approved": False, "score": 0.0,
+                "notes": f"Could not read plan.md for validation: {exc}",
+                "suggested_edits": "Regenerate plan.md so it can be reviewed.",
+            }
+            state.plan_validation_score = result["score"]
+            state.plan_validation_notes = result["notes"]
+            return result
+
+        prompt = _PLAN_VALIDATE_PROMPT.format(
+            task=state.user_input,
+            risk=risk or "unknown",
+            confidence=float(confidence or 0.0),
+            plan_content=plan_content,
+        )
+        try:
+            raw_response = self._get_llm().invoke([HumanMessage(content=prompt)]).content
+            parsed = Dispatcher.parse_llm_json(raw_response)
+        except Exception as exc:
+            parsed = None
+            raw_response = ""
+            failure = f"Plan validator LLM failed: {exc}"
+        else:
+            failure = ""
+
+        if not isinstance(parsed, dict):
+            result = {
+                "approved": False, "score": 0.0,
+                "notes": failure or "Plan validator returned invalid JSON.",
+                "suggested_edits": "Return a complete plan that directly covers the original request.",
+            }
+        else:
+            raw_score = parsed.get("score", 0)
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                match = re.search(r"(?:10|[0-9](?:\.\d+)?)", str(raw_score))
+                score = float(match.group(0)) if match else 0.0
+            score = max(0.0, min(10.0, score))
+            notes = str(parsed.get("notes", "")).strip()
+            suggested_edits = str(
+                parsed.get("suggested_edits", parsed.get("suggestion", parsed.get("repair_instruction", "")))
+            ).strip()
+            if score >= 9:
+                approved = True
+                policy = "high_score"
+            elif score >= 7:
+                approved = (risk or "").lower() == "low" and float(confidence or 0.0) >= _HIGH_CONFIDENCE
+                policy = "medium_score_low_risk_high_confidence" if approved else "medium_score_requires_revision"
+            else:
+                approved = False
+                policy = "low_score_requires_revision"
+            result = {
+                "approved": approved, "score": score, "notes": notes,
+                "suggested_edits": suggested_edits or "Improve plan coverage and make each implementation step concrete.",
+                "policy": policy,
+            }
+
+        state.plan_validation_score = result["score"]
+        state.plan_validation_notes = result["notes"]
+        log("validation_decision", {
+            "layer": "plan_llm", "approved": result["approved"],
+            "score": result["score"], "risk": risk,
+            "confidence": round(float(confidence or 0.0), 2),
+            "notes": trim_tool_output(result["notes"], max_tokens=20),
+        })
+        return result
 
     def validate(self, state: RunState) -> bool:
         """

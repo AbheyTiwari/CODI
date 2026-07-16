@@ -664,7 +664,7 @@ class Improver:
             "requirements": state.requirements.to_dict(),
         })
 
-    def create_plan(self, state: RunState, context: str) -> dict:
+    def create_plan(self, state: RunState, context: str, validator_feedback: str = "") -> dict:
         from dispatcher import Dispatcher
 
         self._extract_requirements(state)
@@ -692,8 +692,15 @@ class Improver:
         # the metadata summary if source is short), rather than silently
         # dropping the entire second half of the collected evidence.
         from context_trimmer import trim_tool_output
+        task = state.user_input
+        if validator_feedback:
+            task += (
+                "\n\nPLAN VALIDATOR REJECTED THE PREVIOUS PLAN. Apply these "
+                "required corrections while keeping the original request intact:\n"
+                f"{validator_feedback}"
+            )
         prompt = _PLAN_PROMPT.format(
-            task=state.user_input,
+            task=task,
             requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
             context=wrap_prompt_data(trim_tool_output(context, max_tokens=1700)),

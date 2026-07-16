@@ -278,6 +278,37 @@ class CodiAgent:
         except Exception as e:
             log("plan_md_write_error", {"error": str(e)})
 
+        # A plan is itself an agent-produced artifact. Review the exact
+        # plan.md on disk before asking the user to approve execution.
+        confidence = float(getattr(analysis or state.mission, "confidence", 0.0) or 0.0)
+        review = self.validator.validate_plan_file(
+            state, plan_path, risk_info["risk"], confidence
+        )
+        if not review["approved"]:
+            state.plan_validation_attempts += 1
+            suggestion = review["suggested_edits"]
+            _agent_status(
+                f"Plan scored {review['score']:.1f}/10; regenerating with validator feedback."
+            )
+            log("agent_plan_validation_rejected", {
+                "score": review["score"], "risk": risk_info["risk"],
+                "confidence": confidence, "suggestion": suggestion[:300],
+                "attempt": state.plan_validation_attempts,
+            })
+            if state.plan_validation_attempts >= 3:
+                state.status = "failed"
+                return (
+                    "The plan validator rejected three plan drafts, so execution has not started. "
+                    f"Last score: {review['score']:.1f}/10. Needed changes: {suggestion}"
+                )
+            self.improver.create_plan(
+                state, state.knowledge.summary_for_prompt(), validator_feedback=suggestion
+            )
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                return state.plan
+            return self._confirm_plan_gate(state, analysis)
+
         state.status = "awaiting_plan_confirmation"
         _agent_status(f"Plan ready (risk: {risk_info['risk']}) — waiting for user confirmation.")
         return (
@@ -313,10 +344,19 @@ class CodiAgent:
                 state.user_input, self.registry, state
             )
             if fast_output:
-                _agent_status("Completed with fast file action.")
-                log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
-                state.status = "complete"
-                return fast_output
+                state.current_step = state.user_input
+                fast_validation = self.validator.validate_current_write(state)
+                if fast_validation is not False:
+                    _agent_status("Completed and validated fast file action.")
+                    log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
+                    state.status = "complete"
+                    return fast_output
+                # A fast action is not allowed to claim success if the file
+                # review rejects it. Continue through the normal plan/repair
+                # loop, which can fix the file rather than stopping here.
+                _agent_status("Fast file action failed validation; switching to repair plan.")
+                log("agent_fast_path_validation_failed", {"notes": state.validation_notes[:200]})
+                state.validation_repair_instruction = ""
 
             if intent == "edit" and state.context_scope != "full":
                 _agent_status("Making a targeted edit.")
@@ -511,6 +551,7 @@ class CodiAgent:
             state.current_step = step
 
             # Executor runs the step — once.
+            tool_results_before = len(state.tool_results)
             dispatch_result = self.executor.execute_step(step, state)
             reflection = self.reflector.reflect(dispatch_result, state.knowledge)
             state.reflections.append({"needs_context": reflection.needs_context, "reason": reflection.reason, "unknowns": reflection.unknowns})
@@ -529,6 +570,19 @@ class CodiAgent:
                 # Do not validate or mark an implementation step complete when
                 # the executor explicitly requested more evidence.
                 continue
+
+            # A write succeeding only proves bytes reached disk. Before this
+            # AST-sized step may advance, independently ask the validator LLM
+            # to compare the actual file content with the original request.
+            write_validation = self.validator.validate_current_write(
+                state, since=tool_results_before
+            )
+            if write_validation is False:
+                _agent_status("Written file did not satisfy the request; preparing a repair.")
+                log("agent_per_write_validation_failed", {
+                    "step": step[:120],
+                    "notes": state.validation_notes[:300],
+                })
 
             # Step-level completion is a deterministic fact: did the most
             # recent tool action for THIS step succeed? This is independent
@@ -549,7 +603,7 @@ class CodiAgent:
             # remaining iteration before reporting "Stopped before
             # completion... 1 plan step(s) not yet completed" even though
             # every tool call in the log actually succeeded.
-            if _step_succeeded(state, step):
+            if write_validation is not False and _step_succeeded(state, step):
                 completed_target = state.target_plan_step or step
                 state.mark_step_complete(completed_target)
                 log("step_marked_complete", {
@@ -560,8 +614,13 @@ class CodiAgent:
 
             # Validator now answers ONLY "is the overall task done?" —
             # not "did this step succeed" (that's already been decided above).
-            _agent_status("Validating the result.")
-            is_valid = self.validator.validate(state)
+            # Keep a failed file review intact; the task-level validator would
+            # otherwise replace its repair instruction with plan-progress text.
+            if write_validation is False:
+                is_valid = False
+            else:
+                _agent_status("Validating overall plan progress.")
+                is_valid = self.validator.validate(state)
 
             if is_valid:
                 _agent_status("Validation passed.")
@@ -666,7 +725,12 @@ class CodiAgent:
         step = state.user_input
         state.current_step = step
 
+        tool_results_before = len(state.tool_results)
         self.executor.execute_step(step, state)
+
+        if self.validator.validate_current_write(state, since=tool_results_before) is False:
+            log("agent_edit_per_write_validation_failed", {"notes": (state.validation_notes or "")[:160]})
+            return None
 
         if not _step_succeeded(state):
             log("agent_edit_step_failed", {"step": step[:120]})

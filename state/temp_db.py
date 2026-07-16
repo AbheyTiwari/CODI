@@ -117,6 +117,12 @@ class RunState:
     # ── Plan ──────────────────────────────────────────────────────────────────
     plan:        str = ""
     plan_steps:  list[str] = field(default_factory=list)
+    # Plan review runs before asking the user for confirmation.  Keeping its
+    # decision in state makes retries observable and prevents an unbounded
+    # plan-regeneration loop when the validator keeps rejecting a plan.
+    plan_validation_attempts: int = 0
+    plan_validation_score: float | None = None
+    plan_validation_notes: str = ""
 
     # ── Execution ─────────────────────────────────────────────────────────────
     iteration:       int = 0
