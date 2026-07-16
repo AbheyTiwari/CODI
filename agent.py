@@ -157,6 +157,7 @@ class CodiAgent:
                 history=inputs.get("history", ""),
             )
             state.context_scope = "full" if inputs.get("read_entire_codebase") else "targeted"
+            state.force_read = bool(inputs.get("force_read"))
             # Every fresh task starts unconfirmed. Fast-path / direct-answer /
             # read / edit tasks never reach the gate check, so this is safe
             # to force here — only the "build" path consults it.

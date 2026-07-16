@@ -209,6 +209,7 @@ class ContextBuilder:
                 # stale, or the user gave a path relative to a subdirectory)
                 # — check the filesystem directly before giving up.
                 absolute = normalized if os.path.isabs(normalized) else os.path.join(working_dir, normalized)
+                absolute = os.path.realpath(absolute)
                 if os.path.isfile(absolute):
                     resolved = normalized
 

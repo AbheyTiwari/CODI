@@ -31,7 +31,7 @@ ACTION_TRIGGERS = (
     "run", "execute", "generate", "refactor", "implement", "add", "code",
     "put", "save", "html", "css", "script", "file", "folder", "index",
     "function", "class", "api", "page", "deploy", "install", "setup",
-    "rename", "move", "copy", "read", "open", "parse", "fetch", "download",
+    "rename", "move", "copy", "open", "parse", "fetch", "download",
     "list", "search", "find", "show", "get", "check", "access", "browse",
     "navigate", "click", "screenshot", "scrape", "query", "lookup", "pull",
     "push", "commit", "clone", "diff", "status", "remember", "store",
@@ -220,8 +220,18 @@ def classify_intent(text: str) -> str:
     if broad_scope_hint:
         return "build"
 
-    if has_read_verb and not has_build_verb and not has_edit_verb:
-        return "read"
+    # FIX: read-intent is no longer inferred from keywords. The word "read"
+    # appearing in natural language (e.g. "the chatbot should be able to read
+    # answer from those files") was incorrectly locking Codi into read-only
+    # mode, preventing any writes. Read-intent is now ONLY activated by the
+    # explicit /read command prefix (handled in Planner.classify via
+    # state.force_read). When has_read_verb fires without edit/build verbs,
+    # we fall through to the build classification below instead of returning
+    # "read" — this lets the full pipeline decide whether the task actually
+    # needs file modifications.
+    #
+    # OLD: if has_read_verb and not has_build_verb and not has_edit_verb:
+    #          return "read"
 
     # NOTE: " and " is deliberately NOT a build signal on its own anymore.
     # "edit index.html and add content there" has one file and one edit
@@ -269,7 +279,23 @@ class Planner:
         return result
 
     def classify(self, state: RunState) -> str:
-        """Return one of "qa" | "read" | "edit" | "build" for state.user_input."""
+        """Return one of "qa" | "read" | "edit" | "build" for state.user_input.
+
+        The "read" intent is ONLY returned when state.force_read is True
+        (set by main.py when the user types /read). Keyword-based read
+        detection was removed from classify_intent() because the word
+        "read" in natural language too easily downgraded real edit/build
+        tasks to read-only mode.
+        """
+        if state.force_read:
+            log("planner_classify", {
+                "input": state.user_input[:160],
+                "intent": "read",
+                "input_len": len(state.user_input or ""),
+                "reason": "force_read_via_slash_command",
+            })
+            return "read"
+
         intent = classify_intent(state.user_input)
         log("planner_classify", {
             "input": state.user_input[:160],

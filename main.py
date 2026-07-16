@@ -13,7 +13,7 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-_LAUNCH_DIR = os.getcwd()
+_LAUNCH_DIR = os.path.realpath(os.getcwd())
 os.environ.setdefault("CODI_WORKING_DIR", _LAUNCH_DIR)
 
 _path_hash  = hashlib.md5(_LAUNCH_DIR.encode()).hexdigest()[:10]
@@ -343,8 +343,19 @@ def _change_working_dir(raw_path: str):
     _auto_index(target)
 
 def _set_working_dir(target: str):
-    """Central function — always call this when changing the active project dir."""
+    """Central function — always call this when changing the active project dir.
+
+    FIX: resolve via os.path.realpath() so the stored CODI_WORKING_DIR is always
+    the canonical path the filesystem reports. Without this, a user typing
+    ``cd C:\\users\\Abhey\\project`` (lowercase 'u') stores that form, but
+    _abs() in file_tools.py calls os.path.realpath() which may canonicalize to
+    ``C:\\Users\\Abhey\\project`` (uppercase 'U') — and even though the
+    _normcase_path containment check handles this, other code paths that read
+    CODI_WORKING_DIR directly (context_builder, plan.md location, log display,
+    _cleanup_session_on_exit) were operating on the non-canonical form.
+    """
     global _LAUNCH_DIR, _path_hash, _chroma_dir
+    target       = os.path.realpath(target)
     _LAUNCH_DIR  = target
     _path_hash   = hashlib.md5(target.encode()).hexdigest()[:10]
     _chroma_dir  = os.path.join(_REPO_ROOT, "chroma_db", _path_hash)
@@ -705,6 +716,21 @@ def main():
                 session_memory.add("assistant", fast_result)
                 continue
  
+            # ── /read prefix: force read-only intent ──────────────────────────
+            # When the user types "/read <prompt>", the agent is forced into
+            # read-only mode (inspect/explain code, never write). Without this
+            # prefix, the word "read" in natural language is treated like any
+            # other word and does NOT trigger read-only mode.
+            force_read = False
+            if cmd.startswith("/read ") or cmd == "/read":
+                remainder = user_input[len("/read"):].strip()
+                if not remainder:
+                    console.print(Text("  usage: /read <prompt>  — e.g. /read explain what auth.py does", style="yellow"))
+                    continue
+                user_input = remainder
+                force_read = True
+                console.print(Text("  → read-only mode (no files will be changed)", style=t["accent"]))
+
             # Only refine action-oriented longer inputs — skip for short/simple
             if len(user_input) > 60:
                 refined = refine_prompt(user_input)
@@ -730,6 +756,7 @@ def main():
                     "input": refined,
                     "history": history_str,
                     "read_entire_codebase": read_entire_codebase,
+                    "force_read": force_read,
                 })
                 output       = response.get("output") or "No output returned."
                 tool_outputs = response.get("tool_outputs", [])

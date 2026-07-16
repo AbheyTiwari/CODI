@@ -101,6 +101,10 @@ class RunState:
     # inspect and read the repository before planning; "targeted" lets the
     # discovery controller choose only task-relevant files.
     context_scope: str = "targeted"
+    # When True, the planner unconditionally classifies the task as "read"
+    # (read-only: inspect code, answer questions, never write). Set by main.py
+    # when the user explicitly types the /read prefix command.
+    force_read: bool = False
     context_response: str = ""
     context_attempts: int = 0
     reflections: list[dict[str, Any]] = field(default_factory=list)
