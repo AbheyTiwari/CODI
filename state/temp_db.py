@@ -129,6 +129,20 @@ class RunState:
     step_attempts:   dict[str, int] = field(default_factory=dict)
     # Per-step repair attempts counter to avoid repeated repair loops
     repair_attempts:  dict[str, int] = field(default_factory=dict)
+
+    # FIX (bug 1 — "keeps trying the same thing that already failed"):
+    # step_attempts only ever counted HOW MANY TIMES a step was retried, not
+    # WHICH STRATEGY was used on each attempt. That's the actual root cause
+    # of Codi repeating a failed approach: next_step()'s repeated-failure
+    # branch called improve() with nothing but the raw error string, so a
+    # small model given near-identical context twice frequently produces
+    # near-identical output twice. This maps step text -> ordered list of
+    # distinct strategy names already attempted for that step, so both the
+    # executor (deterministically) and the improver's correction prompt
+    # (as an explicit instruction) can refuse to repeat a strategy that
+    # already failed instead of hoping the LLM notices on its own.
+    step_strategies: dict[str, list[str]] = field(default_factory=dict)
+
     project_manifest: dict[str, Any] = field(default_factory=lambda: {"package": None, "files_created": {}})
     plan_confirmed:  bool = True
 
@@ -228,6 +242,21 @@ class RunState:
         if normalized:
             self.written_steps.setdefault(normalized, set()).add(step or "")
         return normalized
+
+    # FIX (bug 1): record which strategy was used for a given plan step so
+    # repeated attempts don't blindly repeat a strategy that already failed.
+    # Keyed on the ORIGINAL step text (same key used by step_attempts /
+    # completed_steps), not on the rewritten correction text — otherwise
+    # every retry would get a fresh key and this would track nothing.
+    def record_step_strategy(self, step: str, strategy: str) -> None:
+        if not step or not strategy:
+            return
+        tried = self.step_strategies.setdefault(step, [])
+        if strategy not in tried:
+            tried.append(strategy)
+
+    def tried_strategies(self, step: str) -> list[str]:
+        return list(self.step_strategies.get(step, []))
 
     def _compress_tool_history_if_needed(self, threshold: int = 10):
         """Collapse older tool results into a summary once history becomes too long."""

@@ -48,24 +48,50 @@ def file_hash(path: str) -> str:
     with open(path, "rb") as f:
         return hashlib.md5(f.read()).hexdigest()
 
-def walk_codebase(root_path: str):
-    skip_dirs = {
-        '.git', 'node_modules', '__pycache__', 'venv', 'dist', 'build',
-        '.idea', 'chroma_db', '.mypy_cache', '.pytest_cache', '.tox',
-    }
-    code_exts = {
-        '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.scss',
-        '.json', '.yaml', '.yml', '.toml', '.md', '.txt', '.sh', '.bash',
-        '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.rb', '.php',
-        '.sql', '.graphql',
-    }
-    named_files = {'Dockerfile', 'Makefile', '.env.example'}
+_SKIP_DIRS = {
+    '.git', 'node_modules', '__pycache__', 'venv', '.venv', 'dist', 'build',
+    '.idea', 'chroma_db', '.mypy_cache', '.pytest_cache', '.tox',
+}
+_CODE_EXTS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.scss',
+    '.json', '.yaml', '.yml', '.toml', '.md', '.txt', '.sh', '.bash',
+    '.c', '.cpp', '.h', '.hpp', '.java', '.go', '.rs', '.rb', '.php',
+    '.sql', '.graphql',
+}
+_NAMED_FILES = {'Dockerfile', 'Makefile', '.env.example'}
 
+# Files larger than this are skipped entirely rather than chunked. A single
+# huge file (minified vendor bundle, generated JSON fixture, lockfile) can
+# otherwise produce tens of thousands of chunks that both blow past
+# Chroma's max add_documents() batch size and add little semantic search
+# value anyway. ~2MB of text is already thousands of chunks at 800 chars each.
+_MAX_FILE_CHARS = int(os.environ.get("CODI_MAX_INDEX_FILE_CHARS", "2000000"))
+
+
+def _is_eligible(filename: str) -> bool:
+    _, ext = os.path.splitext(filename)
+    return ext.lower() in _CODE_EXTS or filename in _NAMED_FILES
+
+
+def count_eligible_files(root_path: str) -> int:
+    """
+    Cheap pre-scan (stat only, no file reads) so a progress callback can show
+    "N / total" instead of an unbounded, seemingly-hung spinner. This mirrors
+    the same skip_dirs/code_exts rules walk_codebase() uses so the count is
+    accurate, not just a rough guess.
+    """
+    total = 0
     for root, dirs, files in os.walk(root_path):
-        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith('.')]
+        total += sum(1 for f in files if _is_eligible(f))
+    return total
+
+
+def walk_codebase(root_path: str):
+    for root, dirs, files in os.walk(root_path):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith('.')]
         for f in files:
-            _, ext = os.path.splitext(f)
-            if ext.lower() not in code_exts and f not in named_files:
+            if not _is_eligible(f):
                 continue
             path = os.path.join(root, f)
             try:
@@ -76,12 +102,36 @@ def walk_codebase(root_path: str):
             except Exception:
                 continue
 
-def index_codebase(root_path: str, db_path: str = None):
+def index_codebase(root_path: str, db_path: str = None, progress_callback=None):
+    """
+    Incrementally index a codebase into ChromaDB.
+
+    progress_callback, if given, is called as progress_callback(done, total,
+    current_path, changed) after every file is considered (whether it was
+    actually re-embedded or skipped via the hash cache). This is what lets a
+    caller (e.g. main.py's Rich status spinner) show real "N/total" progress
+    instead of a spinner that looks identical whether it's on file 1 or file
+    4000 of a large first-time index.
+    """
     if db_path is None:
         db_path = os.environ.get("CODI_CHROMA_DIR", CHROMA_PERSIST_DIR)
 
-    print(f"  Indexing: {root_path}")
     os.makedirs(db_path, exist_ok=True)
+
+    # Pre-scan for a total count. This is a directory walk + splitext check
+    # only (no file reads), so it's cheap even on large trees, and it's what
+    # turns "indexing..." into "indexing... (128/4302) app/models/user.py".
+    total_files = count_eligible_files(root_path)
+    if progress_callback is None:
+        def progress_callback(done, total, path, changed):  # noqa: ARG001
+            # Default: print every ~5% of progress (or every file for small
+            # projects) instead of flooding stdout on large repos.
+            step = max(1, total // 20)
+            if done == total or done % step == 0:
+                label = os.path.basename(path) if path else ""
+                print(f"  Indexing {done}/{total} — {label}")
+
+    print(f"  Indexing: {root_path} ({total_files} eligible files)")
     ef = get_embeddings()
 
     cache_path = os.path.join(db_path, "file_hashes.json")
@@ -91,20 +141,46 @@ def index_codebase(root_path: str, db_path: str = None):
 
     new_cache = {}
     updated = 0
+    processed = 0
+    skipped_large = []
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     
     # Batch processing for faster indexing
     batch_docs = []
     batch_size = 32
 
+    def _flush():
+        nonlocal batch_docs
+        if batch_docs:
+            vectorstore.add_documents(batch_docs)
+            batch_docs = []
+
     for fpath, content in walk_codebase(root_path):
+        processed += 1
+
+        # A single huge file (a bundled/minified vendor script, a large
+        # generated JSON fixture, a lockfile) can produce tens of thousands
+        # of chunks in one create_documents() call. The old code only
+        # flushed batch_docs AFTER the whole file's docs were appended, so
+        # one such file could hand Chroma a single add_documents() batch far
+        # larger than its own internal max_batch_size (observed: a batch of
+        # 30586 against a 5461 ceiling) — the whole index run then raised
+        # and aborted with nothing flushed. Skip absolute monsters outright;
+        # they are almost never useful for semantic code search anyway.
+        if len(content) > _MAX_FILE_CHARS:
+            skipped_large.append(fpath)
+            progress_callback(processed, total_files, fpath, False)
+            continue
+
         try:
             h = file_hash(fpath)
         except Exception:
+            progress_callback(processed, total_files, fpath, False)
             continue
 
         new_cache[fpath] = h
         if cache.get(fpath) == h:
+            progress_callback(processed, total_files, fpath, False)
             continue
 
         try:
@@ -118,21 +194,33 @@ def index_codebase(root_path: str, db_path: str = None):
                 splits,
                 metadatas=[{"source": fpath}] * len(splits)
             )
-            batch_docs.extend(docs)
-            
-            # Add documents in batches for better performance
-            if len(batch_docs) >= batch_size:
-                vectorstore.add_documents(batch_docs)
-                batch_docs = []
-            
+            # Flush in fixed-size slices as we go, instead of extending
+            # batch_docs with the entire file's docs and checking the size
+            # only afterward. This guarantees add_documents() is NEVER
+            # called with more than batch_size documents, no matter how
+            # many chunks a single file produces.
+            for i in range(0, len(docs), batch_size):
+                batch_docs.extend(docs[i:i + batch_size])
+                if len(batch_docs) >= batch_size:
+                    _flush()
+
             updated += 1
 
+        progress_callback(processed, total_files, fpath, True)
+
     # Add remaining documents
-    if batch_docs:
-        vectorstore.add_documents(batch_docs)
+    _flush()
 
     json.dump(new_cache, open(cache_path, "w"))
     print(f"  Indexed {updated} changed / {len(new_cache)} total files.")
+    if skipped_large:
+        print(
+            f"  Skipped {len(skipped_large)} file(s) over "
+            f"{_MAX_FILE_CHARS // 1000}k chars (too large to usefully "
+            f"chunk for semantic search): "
+            + ", ".join(os.path.basename(p) for p in skipped_large[:5])
+            + (f" and {len(skipped_large) - 5} more" if len(skipped_large) > 5 else "")
+        )
 
 if __name__ == "__main__":
     import sys

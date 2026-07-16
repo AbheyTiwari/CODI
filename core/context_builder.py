@@ -41,20 +41,21 @@ class ContextState:
     context: str = ""
     complete: bool = False
     source_evidence: list[str] = field(default_factory=list)
-    # Files the mission explicitly named that could not be resolved against
-    # any known project path, even fuzzily. This is distinct from a generic
-    # "unknown" — it means planning must not proceed on a silent guess.
+    # Files the mission explicitly named as EXISTING that could not be
+    # resolved against any known project path, even fuzzily. This is
+    # distinct from a generic "unknown" — it means planning must not
+    # proceed on a silent guess. Populated ONLY from mission.files_needed,
+    # never from mission.files_new (see _looks_like_file_path usage below).
     missing_requested_files: list[str] = field(default_factory=list)
     needs_user_clarification: bool = False
     clarification_question: str = ""
 
-# The Mission Analyzer's files_needed list is meant to hold actual project
-# file paths, but a small model sometimes fills it with capability/dependency
-# descriptions instead — e.g. "Library or service for PDF extraction" for a
-# brand-new feature that names no existing file at all. Those are not file
-# paths and must never be run through the missing-file hard-stop below; doing
-# so previously blocked a plain "add a new feature" request by demanding the
-# user "confirm the exact file path" for something that was never a file.
+# The Mission Analyzer's files_needed list is meant to hold only files that
+# already exist; files_new holds suggested-but-unconfirmed filenames for
+# brand-new code. Older mission data (or a degraded fallback) may still
+# hand this builder a single-field shape — _looks_like_file_path is kept as
+# a defensive filter either way so a stray capability description never
+# gets treated as a real path.
 
 
 def _looks_like_file_path(candidate: str) -> bool:
@@ -154,13 +155,104 @@ class ContextBuilder:
 
     def _decide(self, state: ContextState, mission, conversation_history: str) -> dict | None:
         evidence = "\n\n".join(state.source_evidence)[-70000:]
-        prompt = f"Mission: {mission.goal}\nLikely files: {mission.files_needed}\nLikely symbols: {mission.symbols_needed}\n{state.knowledge.summary_for_prompt()}\nConversation history:\n{conversation_history[-50000:]}\nSource/history evidence:\n{evidence}\nActions already taken: {state.actions}"
+        prompt = (
+            f"Mission: {mission.goal}\n"
+            f"Likely existing files: {mission.files_needed}\n"
+            f"Suggested new files (may not exist yet): {getattr(mission, 'files_new', [])}\n"
+            f"Likely symbols: {mission.symbols_needed}\n"
+            f"{state.knowledge.summary_for_prompt()}\n"
+            f"Conversation history:\n{conversation_history[-50000:]}\n"
+            f"Source/history evidence:\n{evidence}\n"
+            f"Actions already taken: {state.actions}"
+        )
         try:
             response = self.llm.invoke([SystemMessage(content=_PROMPT), HumanMessage(content=prompt)])
             return self._parse(response.content)
         except Exception as exc:
             log("context_llm_error", {"error": str(exc)})
             return None
+
+    def apply_user_supplied_paths(self, knowledge: KnowledgeBase, candidates: list[str]) -> list[str]:
+        """
+        Deterministically resolve and inspect file paths the USER supplied
+        in a clarification answer — bypassing _decide()'s LLM discovery loop
+        entirely for these paths.
+
+        Why this exists: previously, a clarification answer like "the file
+        is in src/utils/parser.py" was appended to state.history as prose
+        and handed back to context_builder.build(), which re-ran the exact
+        same LLM-driven discovery loop that already failed to find the file.
+        A small discovery-controller model has no special reason to notice
+        one sentence buried in a growing history blob — the answer was
+        technically present but never treated as ground truth. This method
+        treats it as ground truth: resolve it against real project paths
+        (exact match, then fuzzy basename match, then a direct filesystem
+        check in case the project index is stale), inspect_file + read_file
+        it immediately, record it in knowledge, and clear any stale
+        "not present" unknown for that filename so the missing-file hard
+        stop in build() doesn't re-fire on a file that was just verified.
+
+        Returns the list of resolved (verified-to-exist) paths.
+        """
+        known_paths = {str(p).replace("\\", "/") for p in knowledge.project.get("files", [])}
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        resolved_paths: list[str] = []
+
+        for candidate in candidates:
+            if not _looks_like_file_path(candidate):
+                continue
+            normalized = candidate.strip().strip("'\"`").replace("\\", "/")
+
+            resolved = _resolve_close_path(normalized, known_paths)
+            if not resolved:
+                # Not in the pre-scanned project file list (index may be
+                # stale, or the user gave a path relative to a subdirectory)
+                # — check the filesystem directly before giving up.
+                absolute = normalized if os.path.isabs(normalized) else os.path.join(working_dir, normalized)
+                if os.path.isfile(absolute):
+                    resolved = normalized
+
+            if not resolved:
+                log("context_user_path_unresolved", {"candidate": candidate})
+                continue
+
+            result = self.dispatcher.dispatch(
+                {"action": "tool_call", "tools": [
+                    {"name": "inspect_file", "args": {"path": resolved}},
+                    {"name": "read_file", "args": {"path": resolved}},
+                ]},
+                knowledge=knowledge,
+            )
+            verified = any(
+                item.get("tool") == "read_file" and item.get("status") == "ok"
+                for item in result.get("results", [])
+            )
+            if not verified:
+                log("context_user_path_verify_failed", {"candidate": candidate, "resolved": resolved})
+                continue
+
+            # Make the path visible to build()'s own known_paths computation
+            # (which reads knowledge.project.get("files", [])) so the
+            # deterministic files_needed resolution there matches this
+            # verified path on the next pass instead of treating it as
+            # still-missing.
+            files_list = knowledge.project.setdefault("files", [])
+            if resolved not in files_list:
+                files_list.append(resolved)
+
+            # Clear any stale hard-stop unknown naming this exact file —
+            # it is no longer missing, it was just verified above.
+            base = os.path.basename(resolved).lower()
+            knowledge.unknowns = [
+                u for u in knowledge.unknowns
+                if not (u.startswith("Requested file is not present:") and base in u.lower())
+            ]
+
+            knowledge.summaries.append(f"User-supplied path verified in clarification response: {resolved}")
+            log("context_user_path_resolved", {"candidate": candidate, "resolved": resolved})
+            resolved_paths.append(resolved)
+
+        return resolved_paths
 
     def build(self, mission, history: str = "", knowledge: KnowledgeBase | None = None,
               max_iterations: int = 8, full_codebase: bool = False) -> ContextState:
@@ -187,10 +279,17 @@ class ContextBuilder:
                 state.knowledge.add_unknown(
                     f"Full-codebase read capped at {limit} of {len(eligible)} eligible files."
                 )
+
+        known_paths = {str(path).replace("\\", "/") for path in state.knowledge.project.get("files", [])}
+
+        # ── files_needed: files the mission believes ALREADY EXIST ─────────────
         # Give the planner actual source, not only AST metadata. This is a
         # high-value deterministic step for a 7B model and avoids repeated
         # discovery turns for files that were already named by the task.
-        known_paths = {str(path).replace("\\", "/") for path in state.knowledge.project.get("files", [])}
+        # If NONE of these can be resolved (even fuzzily), that's a real
+        # signal something is wrong (typo'd/renamed existing file, or the
+        # mission analyzer miscategorized a suggestion as "existing") and
+        # planning should not proceed on a silent guess.
         filelike_requested = []
         for path in mission.files_needed:
             if not (isinstance(path, str) and path):
@@ -216,12 +315,36 @@ class ContextBuilder:
                 # edit task plan against a guessed substitute file.
                 state.missing_requested_files.append(path)
                 state.knowledge.add_unknown(f"Requested file is not present: {path}")
-        # Hard stop: if the mission named specific, real-looking file path(s)
-        # (the normal case for a single-file edit task) and NONE could be
-        # resolved, even fuzzily, planning must not proceed on a silent
-        # substitute guess. Ask the user instead of quietly continuing on
-        # weak evidence. A new-feature request with no actual file paths
-        # named (only capability descriptions) never reaches this branch.
+
+        # ── files_new: suggested filenames for code that doesn't exist yet ──────
+        # These are advisory only — a brand-new feature legitimately has no
+        # existing file to point to, and "doesn't exist yet" is the correct,
+        # expected state here, not an error. NEVER fed into the missing-file
+        # hard-stop below. If a suggested name happens to already exist on
+        # disk (the mission analyzer under-estimated), surface that as real
+        # context so the plan edits it instead of blindly creating it fresh.
+        for path in getattr(mission, "files_new", []) or []:
+            if not (isinstance(path, str) and path and _looks_like_file_path(path)):
+                continue
+            normalized = path.replace("\\", "/")
+            resolved = _resolve_close_path(normalized, known_paths)
+            if resolved:
+                self._run(state, "inspect_file", {"path": resolved})
+                self._run(state, "read_file", {"path": resolved})
+                state.knowledge.add_unknown(
+                    f"Suggested new file '{path}' already exists as {resolved} — treat as an edit, not a create."
+                )
+            else:
+                state.knowledge.summaries.append(f"Planned new file (does not exist yet): {path}")
+
+        # Hard stop: if the mission named specific, real-looking EXISTING
+        # file path(s) (the normal case for a single-file edit task) and
+        # NONE could be resolved, even fuzzily, planning must not proceed on
+        # a silent substitute guess. Ask the user instead of quietly
+        # continuing on weak evidence. A new-feature request with no actual
+        # existing-file paths named (only files_new suggestions or
+        # capability descriptions) never reaches this branch — files_new
+        # entries are handled entirely above and never counted here.
         if filelike_requested and len(state.missing_requested_files) == len(filelike_requested):
             state.needs_user_clarification = True
             state.clarification_question = (
@@ -330,5 +453,10 @@ class ContextBuilder:
         state.context = source_block + "\n\n" + metadata_block if source_block else metadata_block
         if not state.complete:
             state.knowledge.add_unknown("Context confidence/evidence threshold was not met; planning is blocked.")
-        log("context_complete", {"confidence": state.confidence, "complete": state.complete, "actions": state.actions, "unknown_count": len(state.knowledge.unknowns)})
+        log("context_complete", {
+            "confidence": state.confidence,
+            "complete": state.complete,
+            "actions": state.actions,
+            "unknown_count": len(state.knowledge.unknowns),
+        })
         return state

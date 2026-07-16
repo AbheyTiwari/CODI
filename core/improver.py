@@ -174,6 +174,21 @@ _VERIFICATION_WORDS = ("verify", "validate", "test", "check", "screenshot")
 _IMPLEMENTATION_WORDS = ("add", "change", "create", "edit", "fix", "implement", "insert", "modify", "remove", "replace", "style", "update", "write")
 
 
+# FIX (bug 1): human-readable descriptions of each strategy name recorded by
+# core/executor.py, used to build an explicit "do not repeat these" block in
+# the correction prompt. Keeping this mapping here (not duplicated inline)
+# means adding a new executor strategy only requires one new entry.
+_STRATEGY_DESCRIPTIONS: dict[str, str] = {
+    "edit_first_textmatch": "exact old/new text-match replacement",
+    "edit_first_additive": "additive edit_file (append-style) targeting a specific anchor",
+    "line_range_edit": "line-number-based replace_lines/delete_lines/insert_at_line",
+    "additive_append": "appending new code to the end of the file",
+    "content_first": "regenerating the file's full content from scratch",
+    "edit_missing_file": "editing a file that does not exist on disk",
+    "standard_json": "letting the coder freely choose a tool via the generic JSON path",
+}
+
+
 def _best_file_match(step: str, known_files: list[str]) -> str | None:
     """
     Deterministically pick the most plausible target file for a step that
@@ -387,6 +402,96 @@ def _files_from_tool_results(state: RunState) -> list[str]:
     return _unique(files)
 
 
+def _known_files_for_lint(state: RunState) -> set[str]:
+    """Files the plan may assume already exist: verified project files plus
+    anything TaskRequirements already extracted from the task text."""
+    files: set[str] = set()
+    try:
+        project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+        files.update(str(f).replace("\\", "/") for f in project_files)
+    except Exception:
+        pass
+    files.update(f.replace("\\", "/") for f in (state.requirements.files or []))
+    return files
+
+
+_LINT_CREATE_WORDS = ("create", "write", "generate", "produce")
+_LINT_EDIT_WORDS = ("edit", "update", "modify", "change", "fix", "append", "insert", "remove", "replace", "style", "rename")
+
+
+def _plan_lint_violations(steps: list[str], requirements: TaskRequirements, known_files: set[str]) -> list[str]:
+    """
+    Deterministic, no-LLM pass over a candidate plan — catches the most
+    common self-contradictions before a single tool call burns iteration
+    budget:
+      (a) a step edits a file that is neither in the verified project
+          context nor created by an earlier step in this same plan
+      (b) a step's text contains a term forbidden by the locked framework
+          (the same patterns TaskRequirements.framework_lock() feeds to the
+          validator's post-execution contamination check — checked here too,
+          BEFORE execution, not only after)
+      (c) two steps target the identical (action, file) pair — a duplicate
+          create or duplicate edit of the same target, almost always a sign
+          the plan is repeating itself rather than making progress
+    """
+    violations: list[str] = []
+    available = {f.lower() for f in known_files}
+    seen_targets: set[tuple[str, str]] = set()
+    forbidden = [p.lower() for p in requirements.framework_lock() if p]
+
+    for index, step in enumerate(steps, start=1):
+        lowered = (step or "").lower()
+
+        for pattern in forbidden:
+            if pattern in lowered:
+                violations.append(
+                    f"Step {index} references forbidden term '{pattern}' "
+                    f"(task is locked to {requirements.framework})."
+                )
+
+        refs = _extract_file_refs(step)
+        creates = any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in _LINT_CREATE_WORDS)
+        edits = any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in _LINT_EDIT_WORDS)
+        action = "create" if creates else ("edit" if edits else "other")
+
+        for ref in refs:
+            normalized = ref.replace("\\", "/").lower()
+            if edits and not creates and normalized not in available:
+                violations.append(
+                    f"Step {index} edits '{ref}', but that file is not in the verified "
+                    f"project context and no earlier step in this plan creates it."
+                )
+            if action != "other":
+                key = (action, normalized)
+                if key in seen_targets:
+                    violations.append(
+                        f"Step {index} duplicates an earlier step's action+target: {action} {ref}."
+                    )
+                seen_targets.add(key)
+            if creates:
+                available.add(normalized)
+
+    return violations
+
+
+def _trim_plan_violations(steps: list[str], requirements: TaskRequirements, known_files: set[str]) -> list[str]:
+    """
+    Deterministic last resort when a re-prompted plan still violates the
+    linter: walk the steps in order and drop only the ones that introduce a
+    NEW violation given everything kept so far, rather than discarding the
+    whole plan. Always keeps at least one step so the run has something to
+    attempt instead of failing outright on a lint technicality.
+    """
+    kept: list[str] = []
+    for step in steps:
+        candidate = kept + [step]
+        if not _plan_lint_violations(candidate, requirements, known_files):
+            kept.append(step)
+        else:
+            log("plan_lint_step_dropped", {"step": step[:160]})
+    return kept or steps[:1]
+
+
 def classify_plan_risk(state: RunState) -> dict:
     """
     Deterministic risk classification for a proposed plan — no LLM call, no
@@ -570,7 +675,11 @@ class Improver:
                 state.plan = "Generate and verify unit tests one function at a time."
                 state.plan_steps = steps
                 log("plan_created", {"plan_source": "function_inventory", "steps": len(steps)})
-                return {"plan": state.plan, "steps": steps}
+                # Deterministically generated, but still worth a lint pass —
+                # e.g. a stale framework lock from a prior task in the same
+                # session could still make a "create test_x.py" step invalid.
+                self._lint_and_repair_plan(state, context="")
+                return {"plan": state.plan, "steps": state.plan_steps}
 
         # Was a naive context[:6000] head-cut. context_builder now places
         # actual source code first and the cheap AST-metadata summary last,
@@ -609,45 +718,114 @@ class Improver:
             return {"plan": state.plan, "steps": []}
 
         from context_trimmer import trim_tool_output
+        plan_text, plan_steps, plan_source = self._parse_plan_response(raw, state.requirements)
+        state.plan = plan_text
+        state.plan_steps = plan_steps
+
+        log("plan_created", {
+            "plan_source": plan_source,
+            "steps": len(state.plan_steps),
+            "plan": trim_tool_output(state.plan, max_tokens=20),
+            "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
+        })
+
+        self._lint_and_repair_plan(state, context)
+
+        return {"plan": state.plan, "steps": state.plan_steps}
+
+    @staticmethod
+    def _parse_plan_response(raw: str, requirements: TaskRequirements) -> tuple[str, list[str], str]:
+        """Shared JSON-or-line-fallback parsing used by both the initial plan
+        call and the one-shot lint re-prompt, so both paths get identical
+        step normalization instead of two hand-maintained copies."""
+        from dispatcher import Dispatcher
+
         parsed = Dispatcher.parse_llm_json(raw)
         if isinstance(parsed, dict) and "steps" in parsed:
-            state.plan = _as_text(parsed.get("plan", ""))
-            raw_steps  = parsed.get("steps", [])
+            plan_text = _as_text(parsed.get("plan", ""))
+            raw_steps = parsed.get("steps", [])
             if isinstance(raw_steps, list):
-                state.plan_steps = _enforce_test_intent(_normalize_plan_steps(
-                    [_as_text(s) for s in raw_steps if _as_text(s)], state.requirements
-                ), state.requirements)
+                steps = _enforce_test_intent(_normalize_plan_steps(
+                    [_as_text(s) for s in raw_steps if _as_text(s)], requirements
+                ), requirements)
             else:
                 s = _as_text(raw_steps)
-                state.plan_steps = _enforce_test_intent(_normalize_plan_steps([s] if s else [], state.requirements), state.requirements)
-            log("plan_created", {
-                "plan_source": "json",
-                "steps": len(state.plan_steps),
-                "plan": trim_tool_output(state.plan, max_tokens=20),
-                "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
-            })
-            return parsed
+                steps = _enforce_test_intent(_normalize_plan_steps([s] if s else [], requirements), requirements)
+            return plan_text, steps, "json"
 
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        steps = []
+        collected = []
         for line in lines:
             line = line.lstrip("```").strip()
             if line.lower().startswith(("json", "{")):
                 continue
             line = line.lstrip("0123456789.-) ").strip()
             if line:
-                steps.append(line)
-        state.plan       = raw[:200]
-        state.plan_steps = _enforce_test_intent(_normalize_plan_steps(steps[:5], state.requirements), state.requirements)
+                collected.append(line)
+        plan_text = raw[:200]
+        steps = _enforce_test_intent(_normalize_plan_steps(collected[:5], requirements), requirements)
+        return plan_text, steps, "fallback"
 
-        log("plan_created", {
-            "plan_source": "fallback",
+    def _lint_and_repair_plan(self, state: RunState, context: str) -> None:
+        """
+        Deterministic contradiction check, run after every plan parse.
+        On violation: re-prompt the planner ONCE with the specific
+        violations listed as hard constraints. If the retry still violates
+        the linter, fall back to a deterministic trim (drop only the steps
+        that introduce a new violation) rather than looping indefinitely or
+        silently executing a self-contradictory plan.
+        """
+        from context_trimmer import trim_tool_output
+
+        known_files = _known_files_for_lint(state)
+        violations = _plan_lint_violations(state.plan_steps, state.requirements, known_files)
+        if not violations:
+            return
+
+        log("plan_lint_violation", {
+            "attempt": 1,
+            "violations": violations[:10],
             "steps": len(state.plan_steps),
-            "plan": trim_tool_output(state.plan, max_tokens=20),
-            "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
-            "raw_sample": trim_tool_output(raw, max_tokens=30),
         })
-        return {"plan": state.plan, "steps": state.plan_steps}
+
+        retry_prompt = _PLAN_PROMPT.format(
+            task=(
+                f"{state.user_input}\n\n"
+                "PREVIOUS PLAN REJECTED — it violated these constraints, fix them:\n"
+                + "\n".join(f"- {v}" for v in violations)
+            ),
+            requirements=state.requirements.as_prompt_block(),
+            tools=", ".join(self.registry.list_names()),
+            context=wrap_prompt_data(trim_tool_output(context, max_tokens=1700)),
+        )
+        raw_retry = self._call(retry_prompt, system=SystemMessage(content=planner_system_prompt()))
+        state.record_llm("improver_plan_lint_retry", raw_retry)
+
+        if self._last_llm_error is None and raw_retry:
+            plan_text, plan_steps, plan_source = self._parse_plan_response(raw_retry, state.requirements)
+            retry_violations = _plan_lint_violations(plan_steps, state.requirements, known_files)
+            log("plan_lint_retry_result", {
+                "plan_source": plan_source,
+                "steps": len(plan_steps),
+                "remaining_violations": retry_violations[:10],
+            })
+            if not retry_violations:
+                state.plan = plan_text
+                state.plan_steps = plan_steps
+                return
+            # Retry still violates — keep whichever candidate has fewer
+            # violations as the base for deterministic trimming below.
+            if len(retry_violations) < len(violations):
+                state.plan = plan_text
+                state.plan_steps = plan_steps
+                violations = retry_violations
+
+        trimmed = _trim_plan_violations(state.plan_steps, state.requirements, known_files)
+        log("plan_lint_trimmed", {
+            "original_steps": len(state.plan_steps),
+            "trimmed_steps": len(trimmed),
+        })
+        state.plan_steps = trimmed
 
     # ── Phase 3: Decide next step ─────────────────────────────────────────────
 
@@ -696,7 +874,10 @@ class Improver:
                 # the iteration budget with nothing learned in between.
                 # Instead, reason about the failure via improve() and hand
                 # back a concrete correction step grounded in the actual
-                # error, then retry with that reasoning applied.
+                # error AND in which strategies have already been tried and
+                # failed for this exact step (see improve()'s
+                # tried_strategies parameter — FIX bug 1), then retry with
+                # that reasoning applied.
                 last_error = next(
                     (r for r in reversed(state.tool_results) if r.status == "error"),
                     None,
@@ -706,7 +887,8 @@ class Improver:
                 if last_error and prior_attempts > 0:
                     state.validation_notes = last_error.output
                     state.target_plan_step = selected_step
-                    correction = self.improve(state)
+                    tried = state.tried_strategies(selected_step)
+                    correction = self.improve(state, tried_strategies=tried)
                     if self._last_llm_error is not None:
                         return {"step": "", "done": False, "llm_error": self._last_llm_error}
                     state.step_attempts[selected_step] = prior_attempts + 1
@@ -719,6 +901,7 @@ class Improver:
                         "source": "repeated_step_failure_reasoned_correction",
                         "original_step": trim_tool_output(selected_step, max_tokens=20),
                         "prior_attempts": prior_attempts,
+                        "tried_strategies": tried,
                     })
                     return {"step": correction, "done": False}
 
@@ -783,7 +966,7 @@ class Improver:
 
     # ── Phase 4: Generate correction after validation failure ─────────────────
 
-    def improve(self, state: RunState) -> str:
+    def improve(self, state: RunState, tried_strategies: list[str] | None = None) -> str:
         from dispatcher import Dispatcher
         notes = state.validation_notes or "unknown failure"
         reqs  = state.requirements
@@ -838,6 +1021,32 @@ class Improver:
                 "created or edited (e.g. a companion test file), not this one.",
             ]
 
+        # FIX (bug 1): explicit, structured "do not repeat" block built from
+        # everything the executor has already tried and failed for this
+        # exact step. Previously the correction prompt only had the raw
+        # error text — nothing told the model it had already tried (and
+        # exhausted) a specific approach, so it would frequently regenerate
+        # something functionally identical to the failed attempt. This is
+        # the LLM-assisted half of the fix; the deterministic half lives in
+        # core/executor.py's _execute_edit_first, which forces a strategy
+        # switch outright for the most common failure mode (text-match edit)
+        # without waiting on the model to obey this instruction.
+        if tried_strategies:
+            described = [
+                f"  - {_STRATEGY_DESCRIPTIONS.get(name, name)}"
+                for name in tried_strategies
+            ]
+            lines += [
+                "",
+                "STRATEGIES ALREADY TRIED AND FAILED FOR THIS STEP — do NOT repeat any of these:",
+                *described,
+                "Your correction MUST use a genuinely different approach than every strategy",
+                "listed above. If text-match replacement failed, ask for a line-range edit",
+                "instead. If a line-range edit failed, re-read the file for fresh line numbers",
+                "or use apply_patch. If content-first generation failed, break the change into",
+                "a smaller, targeted edit_file operation instead of regenerating the whole file.",
+            ]
+
         lines += [
             "",
             "Last tool outputs for context:",
@@ -872,7 +1081,11 @@ class Improver:
         else:
             correction = f"FAILED: {notes}. Fix required: {reqs.as_prompt_block()}"
 
-        log("improver_correction", {"correction": correction[:200], "reasoning": reasoning[:200]})
+        log("improver_correction", {
+            "correction": correction[:200],
+            "reasoning": reasoning[:200],
+            "tried_strategies": tried_strategies or [],
+        })
         return correction
 
     # ── Phase 5: Final summary ────────────────────────────────────────────────

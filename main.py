@@ -141,10 +141,20 @@ def _auto_index(target_dir: str = None):
             console.print(Text("  ⚠  >5000 files — skipping auto-index. Run /index . manually.", style="yellow"))
             return
     t = _t()
-    with console.status(Text(f"  indexing {os.path.basename(index_dir)}/...", style="dim"),
-                        spinner="dots", spinner_style=t["accent"]):
+    label = os.path.basename(index_dir)
+    with console.status(Text(f"  indexing {label}/...", style="dim"),
+                        spinner="dots", spinner_style=t["accent"]) as status:
+        # Live progress so a large/first-time index shows real movement
+        # ("142/4302 — app/models/user.py") instead of a static spinner
+        # that looks identical whether it's stuck or just working through
+        # thousands of files with no cache yet.
+        def _on_progress(done, total, path, changed):
+            name = os.path.basename(path) if path else ""
+            pct = f"{done}/{total}" if total else str(done)
+            status.update(Text(f"  indexing {label}/... ({pct}) {name}", style="dim"))
+
         try:
-            index_codebase(index_dir, db_path=chroma)
+            index_codebase(index_dir, db_path=chroma, progress_callback=_on_progress)
         except Exception as e:
             console.print(Text(f"  ⚠  index warning: {e}", style="yellow"))
     console.print(Text(f"  ✓  indexed {os.path.basename(index_dir)}/", style=t["accent"]))
@@ -168,6 +178,17 @@ _COMPOUND_ACTION_RE = re.compile(
     r"\b(?:and|then|also)\b.+\b(?:update|edit|change|modify|fix|improve|make|create|write|build|add|refactor)\b",
     re.IGNORECASE
 )
+
+_PLAN_FEEDBACK_RE = re.compile(
+    r"\b(?:plan|planner|step|steps|invent(?:s|ed|ing)?|contradic(?:t|ts|tion)|"
+    r"evidence|confidence|existing (?:file|component)|minimal change|"
+    r"do not (?:create|invent)|should (?:use|modify))\b", re.IGNORECASE
+)
+
+
+def _looks_like_plan_feedback(value: str) -> bool:
+    """Keep critique of a pending plan in the same agent run."""
+    return bool(_PLAN_FEEDBACK_RE.search(value or ""))
 
 def _try_fast_path(user_input: str) -> str | None:
     from tools.local.file_tools import read_file, list_files
@@ -521,8 +542,12 @@ def main():
                 # Always update working dir when /index is given a path
                 if raw_path:
                     _set_working_dir(target)
-                with console.status(Text(f"  indexing {target}...", style="dim"), spinner="dots"):
-                    index_codebase(target, db_path=os.environ["CODI_CHROMA_DIR"])
+                with console.status(Text(f"  indexing {target}...", style="dim"), spinner="dots") as status:
+                    def _on_progress(done, total, path, changed):
+                        name = os.path.basename(path) if path else ""
+                        pct = f"{done}/{total}" if total else str(done)
+                        status.update(Text(f"  indexing {target}... ({pct}) {name}", style="dim"))
+                    index_codebase(target, db_path=os.environ["CODI_CHROMA_DIR"], progress_callback=_on_progress)
                 console.print(Text(f"  ✓  indexed {target}", style=t["accent"]))
 
         elif cmd == "/mode":
@@ -644,6 +669,26 @@ def main():
                         console.print(Panel(Text(str(e), style="red"),
                                             title=Text("error", style="red"),
                                             border_style="red", padding=(0, 2)))
+                    continue
+                elif _looks_like_plan_feedback(user_input):
+                    console.print(Text("  revising the pending plan from your feedback", style="dim"))
+                    renderer = LiveRenderer(pending_state.user_input)
+                    renderer.start()
+                    console.print()
+                    try:
+                        response = agent_executor.invoke({"plan_feedback": user_input}, resume_state=pending_state)
+                        output = response.get("output") or "No output returned."
+                        run_state = response.get("state")
+                        renderer.stop()
+                        console.print()
+                        _refresh_status_panel()
+                        pending_plan_state["awaiting"] = bool(run_state and run_state.status == "awaiting_plan_confirmation")
+                        pending_plan_state["state"] = run_state if pending_plan_state["awaiting"] else None
+                        console.print(Panel(Markdown(output), border_style=t["dim"], padding=(0, 2)))
+                        session_memory.add("assistant", output)
+                    except Exception as e:
+                        renderer.stop()
+                        console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
                     continue
                 else:
                     # Not a confirmation — drop the pending plan and treat this

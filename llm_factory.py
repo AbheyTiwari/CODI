@@ -4,6 +4,8 @@
 
 import copy
 import re
+import time
+import inspect
 
 import requests
 from config import (
@@ -15,9 +17,38 @@ from config import (
 )
 from config_loader import get_api_key
 from status_stream import emit_status
+from core.profiler import get_active_profiler
 
 
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+# Rough chars-per-token used ONLY for profiler estimation when a provider
+# doesn't return real usage stats (Ollama/llama.cpp don't; cloud SDKs often
+# do via response.usage_metadata but we keep one consistent estimate so
+# numbers are comparable across backends rather than mixing exact+estimated).
+_CHARS_PER_TOKEN = 3.5
+
+
+def _estimate_tokens(text: str) -> int:
+    return int(len(text or "") / _CHARS_PER_TOKEN)
+
+
+def _caller_label() -> str:
+    """Best-effort 'module.function' label for the profiler, walking past
+    this file's own frames to find the actual calling code (improver.py,
+    executor.py, validator.py, planner.py, mission_analyzer.py, etc)."""
+    try:
+        frame = inspect.currentframe()
+        frame = frame.f_back  # caller of _caller_label
+        while frame:
+            module = inspect.getmodule(frame)
+            name = module.__name__ if module else ""
+            if name and name not in ("llm_factory",):
+                return f"{name}.{frame.f_code.co_name}"
+            frame = frame.f_back
+    except Exception:
+        pass
+    return "unknown"
 
 
 class _FallbackLLM:
@@ -32,6 +63,69 @@ def _strip_thinking_blocks(text: str) -> tuple[str, bool]:
     """Remove Qwen-style raw reasoning blocks before parsing or display."""
     cleaned, count = _THINK_BLOCK_RE.subn("", text or "")
     return cleaned.strip(), count > 0
+
+
+class _ProfiledLLM:
+    """
+    Wraps any LangChain chat model so every .invoke() call is timed and
+    token-estimated into the active AgentProfiler (if one is bound for the
+    current run — see core/profiler.py's thread-local active_profiler()).
+
+    This is the single chokepoint for LLM call telemetry: it wraps whatever
+    the mode-specific constructor below returns, so local/llamacpp/air/cloud
+    are all covered identically without duplicating timing code four times.
+    """
+
+    def __init__(self, llm, role: str):
+        self._llm = llm
+        self._role = role
+
+    def invoke(self, messages, *args, **kwargs):
+        profiler = get_active_profiler()
+        caller = _caller_label() if profiler else ""
+
+        prompt_text = ""
+        try:
+            prompt_text = "\n".join(
+                getattr(m, "content", "") if not isinstance(m, str) else m
+                for m in (messages if isinstance(messages, list) else [messages])
+            )
+        except Exception:
+            prompt_text = ""
+
+        started = time.monotonic()
+        error = None
+        try:
+            response = self._llm.invoke(messages, *args, **kwargs)
+        except Exception as e:
+            error = str(e)
+            duration = time.monotonic() - started
+            if profiler:
+                profiler.record_llm_call(
+                    role=self._role, caller=caller,
+                    prompt_tokens_est=_estimate_tokens(prompt_text),
+                    completion_tokens_est=0,
+                    duration_s=duration, error=error,
+                )
+            raise
+        duration = time.monotonic() - started
+
+        if profiler:
+            completion_text = getattr(response, "content", "") or ""
+            profiler.record_llm_call(
+                role=self._role, caller=caller,
+                prompt_tokens_est=_estimate_tokens(prompt_text),
+                completion_tokens_est=_estimate_tokens(completion_text),
+                duration_s=duration,
+            )
+        return response
+
+
+def _profiled(llm, role: str):
+    """Attach profiling without disturbing any existing wrapper (e.g.
+    _ReasoningFilteredLLM for local Ollama) — profiling wraps OUTERMOST so
+    it measures true end-to-end latency including reasoning-strip overhead."""
+    return _ProfiledLLM(llm, role)
 
 
 class _ReasoningFilteredLLM:
@@ -111,28 +205,28 @@ def _resolve(role: str):
     role: "refiner" | "coder" | "validator"
     """
     if MODE == "local":
-        return _local_llm(role)
-    
+        return _profiled(_local_llm(role), role)
+
     if MODE == "llamacpp":
-        return _llamacpp_llm(role)
+        return _profiled(_llamacpp_llm(role), role)
 
     if MODE == "air":
-        return _air_llm(role)
+        return _profiled(_air_llm(role), role)
 
     if MODE == "cloud":
-        return _cloud_llm(role)
+        return _profiled(_cloud_llm(role), role)
 
     if MODE == "hybrid":
         if _ollama_is_running():
-            return _local_llm(role)
+            return _profiled(_local_llm(role), role)
         if _llamacpp_is_running():
             print(f"  [LLM] Ollama offline — falling back to llama.cpp (localhost)")
-            return _llamacpp_llm(role)
+            return _profiled(_llamacpp_llm(role), role)
         if _air_llm_is_running():
             print(f"  [LLM] Ollama + llama.cpp offline — falling back to Air LLM ({AIR_LLM_URL})")
-            return _air_llm(role)
+            return _profiled(_air_llm(role), role)
         print(f"  [LLM] All local backends offline — escalating to cloud ({CLOUD_PROVIDER})")
-        return _cloud_llm(role)
+        return _profiled(_cloud_llm(role), role)
 
     raise ValueError(f"Unknown MODE: {MODE}. Use local | hybrid | cloud | air")
 

@@ -390,7 +390,7 @@ Routing also recognizes typos (fuzzy keyword matching), broad-scope phrases (*"d
 
 Codi never regenerates a whole file for a small change unless it has to. `edit_file` supports four strategies, and the Executor picks automatically based on the step's wording:
 
-For exact code navigation, Codi keeps ChromaDB for semantic search and a local SQLite index at `.codi/code_index.sqlite3` for exact file paths, declarations, and identifier references. SQLite ships with Python; no MySQL or separate database installation is needed. Before a variable or symbol rename, the Coder is instructed to use `find_symbol` and `find_references`, then edit only a verified span. Ambiguous text replacements are rejected instead of silently changing the first match.
+For repository understanding, Codi keeps ChromaDB for semantic search and a local SQLite index at `.codi/code_index.sqlite3`. The SQLite index incrementally records files, symbols, imports, calls, inheritance, and ownership signals; unchanged files are skipped and deleted files are removed. SQLite ships with Python; no MySQL or separate database installation is needed. `retrieve_context` combines exact component/symbol lookup with a narrow dependency neighborhood, while Chroma supplies semantic matches. `resolve_component` maps phrases such as “Upload Handler” to verified symbols and paths before a planner is allowed to name a file. `trace_dependencies` follows indexed imports and calls without loading whole files. Before a variable or symbol rename, the Coder is instructed to use `find_symbol` and `find_references`, then edit only a verified span. Ambiguous text replacements are rejected instead of silently changing the first match.
 
 ### 1. Text-match replace (default for small, precise changes)
 ```json

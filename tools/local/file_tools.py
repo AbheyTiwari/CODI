@@ -1,3 +1,4 @@
+# tools/local/file_tools.py
 # File I/O tools. All callables receive a plain dict of args and return a string.
 
 import ast
@@ -16,6 +17,36 @@ from logger import log
 TYPING_DELAY = 0.1  # seconds between characters (adjust for speed)
 TYPING_ENABLED = False  # Disabled: char-by-char writes block the agent loop for seconds per file
 
+# ── Placeholder-path detection ────────────────────────────────────────────────
+# FIX (bug: silent write to literal placeholder path): the coder LLM
+# occasionally emits a generic example path instead of a real one (e.g.
+# "/path/to/file.txt") when the task didn't force it to name a concrete
+# file. This mirrors the already-documented "relative/path" /
+# "PATH_TO_INSPECT" placeholder-copying bug in core/prompts.py's
+# need_context instruction — except prior to this fix, nothing caught the
+# same failure mode for write_file/create_file/edit_file. Combined with the
+# _abs() bug below (which used to return an "ERROR: ..." STRING as if it
+# were a valid path), this previously caused CODI to silently create a real
+# file on disk literally named "ERROR: path escapes project directory" and
+# report success. Reject known placeholder shapes before they ever reach a
+# filesystem call.
+_PLACEHOLDER_PATH_PATTERNS = (
+    re.compile(r"^/?path/to/", re.IGNORECASE),
+    re.compile(r"^path_to_", re.IGNORECASE),
+    re.compile(r"^relative/path", re.IGNORECASE),
+    re.compile(r"^<.*>$"),
+    re.compile(r"^\[.*\]$"),
+    re.compile(r"^(tool_name|file_path|filename_here|example\.txt)$", re.IGNORECASE),
+)
+
+
+def _is_placeholder_path(raw_path: str) -> bool:
+    candidate = (raw_path or "").strip().strip("'\"`")
+    if not candidate:
+        return False
+    return any(pattern.search(candidate) for pattern in _PLACEHOLDER_PATH_PATTERNS)
+
+
 def inspect_file(args) -> str:
     """
     Inspect a source file and return its structure instead of the raw contents.
@@ -26,107 +57,6 @@ def inspect_file(args) -> str:
     # canonical structured inspector.
     return json.dumps(_inspect_file(args), ensure_ascii=False)
 
-    path = _path_arg(args)
-    if not path:
-        return json.dumps({
-            "success": False,
-            "error": "missing path"
-        })
-
-    if not os.path.exists(path):
-        return json.dumps({
-            "success": False,
-            "error": "file not found"
-        })
-
-    ext = os.path.splitext(path)[1].lower()
-
-    try:
-
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            source = f.read()
-
-        result = {
-            "success": True,
-            "file": path,
-            "extension": ext,
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "constants": [],
-            "entrypoint": "__main__" in source
-        }
-
-        if ext == ".py":
-
-            tree = ast.parse(source)
-
-            for node in tree.body:
-
-                if isinstance(node, ast.Import):
-
-                    for alias in node.names:
-                        result["imports"].append(alias.name)
-
-                elif isinstance(node, ast.ImportFrom):
-
-                    result["imports"].append(node.module)
-
-                elif isinstance(node, ast.Assign):
-
-                    for target in node.targets:
-
-                        if isinstance(target, ast.Name):
-
-                            if target.id.isupper():
-                                result["constants"].append(target.id)
-
-                elif isinstance(node, ast.FunctionDef):
-
-                    result["functions"].append({
-                        "name": node.name,
-                        "line": node.lineno,
-                        "args": [a.arg for a in node.args.args]
-                    })
-
-                elif isinstance(node, ast.ClassDef):
-
-                    cls = {
-                        "name": node.name,
-                        "line": node.lineno,
-                        "methods": []
-                    }
-
-                    for child in node.body:
-
-                        if isinstance(child, ast.FunctionDef):
-
-                            cls["methods"].append({
-                                "name": child.name,
-                                "line": child.lineno,
-                                "args": [a.arg for a in child.args.args]
-                            })
-
-                    result["classes"].append(cls)
-
-        else:
-
-            result["lines"] = len(source.splitlines())
-
-        log("tool_result", {
-            "tool": "inspect_file",
-            "file": path,
-            "status": "ok"
-        })
-
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-
-        return json.dumps({
-            "success": False,
-            "error": str(e)
-        })
 
 def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELAY):
     """Write content to file character by character with a typing effect.
@@ -169,27 +99,72 @@ def _working_dir() -> str:
     return os.environ.get("CODI_WORKING_DIR", os.getcwd())
 
 
+class _PathEscapeError(ValueError):
+    """Raised by _abs() when a resolved path falls outside the project dir."""
+
+
 def _abs(path: str) -> str:
+    """
+    Resolve `path` against the project working directory and enforce that
+    it stays inside it.
+
+    FIX (bug): this previously RETURNED the string "ERROR: path escapes
+    project directory" as if it were a valid resolved path. Every caller
+    (_path_arg -> write_file/create_file/edit_file/read_file/...) had no
+    check for that sentinel, so a path-escape attempt silently proceeded
+    to open()/write() a real file on disk literally named
+    "ERROR: path escapes project directory" in the project root, and
+    reported success:true. Raising here instead forces every caller to
+    explicitly handle the failure — see _path_arg() below, which is now
+    the single place that turns this into a proper "" (empty path) result
+    that write_file/create_file/edit_file already know means "refuse and
+    report ERROR", rather than silently taking a wrong action based on
+    guessing that this string looked worth writing to.
+    """
     working_dir = os.path.realpath(_working_dir())
     candidate = path if os.path.isabs(path) else os.path.join(working_dir, path)
     candidate_real = os.path.realpath(candidate)
     try:
         if os.path.commonpath([working_dir, candidate_real]) != working_dir:
-            return "ERROR: path escapes project directory"
+            raise _PathEscapeError(f"path escapes project directory: {path!r}")
     except ValueError:
-        return "ERROR: path escapes project directory"
+        # os.path.commonpath raises ValueError when paths are on different
+        # drives (Windows) — that is unambiguously also outside the project.
+        raise _PathEscapeError(f"path escapes project directory: {path!r}")
     return candidate_real
 
 
 def _path_arg(args) -> str:
+    """
+    Resolve the path argument from a tool call. Returns "" (empty string)
+    on ANY failure — missing path, placeholder path, or path-escape
+    attempt — so every downstream tool (write_file/create_file/edit_file/
+    read_file/...) hits their existing `if not path: return "ERROR ..."`
+    guard instead of silently operating on a bogus string.
+    """
     # Accept both str and dict — fast path in main.py passes a string,
     # dispatcher and agent pass a dict.
     if isinstance(args, str):
-        return _abs(args) if args else ""
-    if not isinstance(args, dict):
+        raw_path = args
+    elif isinstance(args, dict):
+        raw_path = args.get("path") or args.get("filename") or args.get("file") or ""
+    else:
         return ""
-    raw_path = args.get("path") or args.get("filename") or args.get("file") or ""
-    return _abs(str(raw_path)) if raw_path else ""
+
+    if not raw_path:
+        return ""
+
+    raw_path = str(raw_path)
+
+    if _is_placeholder_path(raw_path):
+        log("path_placeholder_rejected", {"raw_path": raw_path[:200]})
+        return ""
+
+    try:
+        return _abs(raw_path)
+    except _PathEscapeError as exc:
+        log("path_escape_rejected", {"raw_path": raw_path[:200], "error": str(exc)})
+        return ""
 
 
 def _refresh_exact_index(path: str) -> None:
@@ -205,7 +180,7 @@ def read_file(args) -> str:
     """Read a file. Relative paths resolve from the project directory."""
     path = _path_arg(args)
     if not path:
-        return "ERROR reading file: missing path"
+        return "ERROR reading file: missing, placeholder, or out-of-project path"
 
     log("tool_call", {"tool": "read_file", "path": path})
     try:
@@ -236,7 +211,7 @@ def read_file_numbered(args) -> str:
     slice of a large file instead of the whole thing."""
     path = _path_arg(args)
     if not path:
-        return "ERROR reading file: missing path"
+        return "ERROR reading file: missing, placeholder, or out-of-project path"
 
     start_line = None
     end_line = None
@@ -278,7 +253,7 @@ def write_file(args: dict) -> str:
     """Write text to a file. Args: path, content or content_lines list; warns on .py syntax errors."""
     path = _path_arg(args)
     if not path:
-        return "ERROR writing file: missing path"
+        return "ERROR writing file: missing, placeholder, or out-of-project path"
 
     content = _coerce_content(args)
     log("tool_call", {"tool": "write_file", "path": path, "length": len(content)})
@@ -319,7 +294,7 @@ def create_file(args: dict) -> str:
     """Create a new file without overwriting an existing one."""
     path = _path_arg(args)
     if not path:
-        return "ERROR creating file: missing path"
+        return "ERROR creating file: missing, placeholder, or out-of-project path"
     if os.path.exists(path):
         return (
             f"ERROR creating file: {path} already exists. "
@@ -343,7 +318,7 @@ def edit_file(args: dict) -> str:
     first to get accurate line numbers)."""
     path = _path_arg(args)
     if not path:
-        return "ERROR editing file: missing path"
+        return "ERROR editing file: missing, placeholder, or out-of-project path"
 
     log("tool_call", {"tool": "edit_file", "path": path})
 
@@ -412,7 +387,10 @@ def list_files(args) -> str:
     if dir_path in (".", "", None):
         dir_path = _working_dir()
     else:
-        dir_path = _abs(str(dir_path))
+        resolved = _path_arg({"path": str(dir_path)})
+        if not resolved:
+            return f"ERROR listing {dir_path}: missing, placeholder, or out-of-project path"
+        dir_path = resolved
 
     log("tool_call", {"tool": "list_files", "path": dir_path})
     skip = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
@@ -433,7 +411,7 @@ def create_directory(args: dict) -> str:
     """Create a directory (and any missing parents)."""
     path = _path_arg(args)
     if not path:
-        return "ERROR creating directory: missing path"
+        return "ERROR creating directory: missing, placeholder, or out-of-project path"
 
     try:
         os.makedirs(path, exist_ok=True)
@@ -726,7 +704,7 @@ def apply_patch(args: dict) -> str:
     to match (no partial writes)."""
     path = _path_arg(args)
     if not path:
-        return "ERROR applying patch: missing path"
+        return "ERROR applying patch: missing, placeholder, or out-of-project path"
     if not os.path.exists(path):
         return f"ERROR applying patch: {path} does not exist. Use create_file for new files."
 

@@ -27,7 +27,7 @@ def _cached_search(query: str, k: int = 5):
 
 
 def search_codebase(args: dict) -> str:
-    """Semantic search across the indexed project codebase. Returns top matching chunks."""
+    """Hybrid code search: semantic Chroma chunks plus exact symbols/components and graph context."""
     query = args.get("query", "")
     if not query:
         return "ERROR: no query provided"
@@ -35,9 +35,20 @@ def search_codebase(args: dict) -> str:
     log("tool_call", {"tool": "search_codebase", "query": query})
     try:
         docs = _cached_search(query, k=5)
-        if not docs:
-            return "Codebase not indexed yet. Run /index first." if not docs else "No matching code chunks found."
+        # Exact lookup is fast and still useful when embeddings are absent or
+        # stale. It also returns verified paths rather than only text chunks.
+        try:
+            from state.code_index import context_for_query
+            exact = context_for_query(query, limit=8)
+        except Exception:
+            exact = {"components": [], "owners": [], "files": []}
+        if not docs and not exact.get("components"):
+            return "Codebase not indexed yet. Run /index first."
         results = []
+        if exact.get("components"):
+            candidates = [f"{item['path']}:{item['line']} {item['kind']} {item['name']}" for item in exact["components"][:5]]
+            owners = [f"{item['path']} ({item['symbol']})" for item in exact.get("owners", [])[:3]]
+            results.append("--- Exact symbols/components ---\n" + "\n".join(candidates) + ("\nOwners: " + ", ".join(owners) if owners else ""))
         for i, (content, metadata) in enumerate(docs):
             source = metadata.get("source", "unknown")
             chunk = trim_tool_output(content, max_tokens=200)

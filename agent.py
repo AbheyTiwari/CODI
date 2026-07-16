@@ -40,12 +40,13 @@ import re
 import traceback
 import os
 from langchain_core.messages import HumanMessage, SystemMessage
+
 from core.mission_analyzer import MissionAnalyzer
 from core.context_builder import ContextBuilder
 from core.execution_reflector import ExecutionReflector
 from core.executor  import Executor
 from core.improver  import Improver, classify_plan_risk
-from core.planner   import Planner
+from core.planner   import Planner, FILE_PATH_RE
 from core.quick_actions import try_fast_file_task
 from core.validator import Validator
 from dispatcher      import Dispatcher, wrap_prompt_data
@@ -130,7 +131,19 @@ class CodiAgent:
         if resuming:
             state = resume_state
             if state.status == "awaiting_plan_confirmation":
-                state.plan_confirmed = True
+                feedback = str(inputs.get("plan_feedback", "")).strip()
+                if feedback:
+                    # Plan critique is not a replacement task. Retain the
+                    # original goal and verified project evidence, then make
+                    # the critique an explicit constraint for a revision.
+                    state.user_input = f"{state.user_input}\n\nPlan feedback: {feedback}".strip()
+                    state.history = f"{state.history}\nUser plan feedback: {feedback}".strip()
+                    state.plan = ""
+                    state.plan_steps = []
+                    state.plan_confirmed = False
+                    state.status = "replanning"
+                else:
+                    state.plan_confirmed = True
             elif state.status == "awaiting_context":
                 response = str(inputs.get("context_response", "")).strip()
                 state.context_response = response
@@ -183,6 +196,20 @@ class CodiAgent:
     # ── Core loop ─────────────────────────────────────────────────────────────
 
     def _run(self, state: RunState, resuming: bool = False) -> str:
+
+        if resuming and state.status == "replanning":
+            _agent_status("Revising the plan using the user's feedback.")
+            # No new discovery is necessary: this critiques a plan built
+            # from the current project snapshot, not a new coding task.
+            self.improver.create_plan(state, state.knowledge.summary_for_prompt())
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                return state.plan
+            state.status = "awaiting_plan_confirmation"
+            return (
+                f"Revised plan:\n\n{state.plan}\n\n"
+                "Type 'y' to run it, or provide plan feedback to revise it again."
+            )
 
         if not resuming:
             # ── Route: qa / read / edit / build ────────────────────────────────
@@ -349,7 +376,67 @@ class CodiAgent:
                 log("context_declined", {"confidence": state.context_confidence})
             else:
                 _agent_status("Rechecking project context with the user's additional details.")
-                analysis = state.mission or self.mission.analyze(state.user_input)
+                # A clarification is part of the task, not merely transcript
+                # decoration. Reusing state.mission here preserved an old
+                # model guess (such as an invented file name), and the file
+                # gate fired before discovery could ever see the correction.
+                clarification = state.context_response.strip()
+                combined_task = f"{state.user_input}\n\nUser clarification: {clarification}".strip()
+
+                # ── Deterministic path resolution FIRST ─────────────────────
+                # If the clarification names a real file, that is ground
+                # truth from the user, not another guess for a small LLM to
+                # rediscover. Resolve and inspect it directly against the
+                # filesystem/project index BEFORE any LLM call — previously
+                # this only reached the discovery loop as one more sentence
+                # appended to state.history, which the discovery-controller
+                # model (_decide() in context_builder.py) had no particular
+                # reason to notice or act on, especially once history grew.
+                # Also note: the old inline regex here required a leading
+                # slash/backslash, so a plain relative answer like
+                # "src/utils/parser.py" (no leading separator) was silently
+                # never even extracted — FILE_PATH_RE (shared with
+                # planner.py's file-mention detection) has no such
+                # restriction.
+                candidate_paths = FILE_PATH_RE.findall(clarification)
+                resolved_paths = self.context_builder.apply_user_supplied_paths(
+                    state.knowledge, candidate_paths
+                ) if candidate_paths else []
+
+                analysis = self.mission.analyze(combined_task)
+
+                # "Create new ones" / "build from scratch" explicitly
+                # changes guessed files from required existing targets into
+                # advisory new files. Do this deterministically so a small
+                # mission model cannot keep repeating its earlier mistake.
+                if re.search(r"\b(create|build|make)\s+(?:new|them|it)|\bfrom scratch\b|\bdoes not have\b", clarification, re.I):
+                    analysis.files_new = list(dict.fromkeys([*analysis.files_new, *analysis.files_needed]))
+                    analysis.files_needed = []
+
+                # Verified paths (resolved_paths) and any other candidate the
+                # user typed both count as stronger evidence than the
+                # mission model's own filename guesses — feed both in, with
+                # the verified ones first so downstream resolution matches
+                # them immediately.
+                analysis.files_needed = list(dict.fromkeys([
+                    *resolved_paths,
+                    *analysis.files_needed,
+                    *[path.strip().rstrip(".,;)") for path in candidate_paths],
+                ]))
+                state.user_input = combined_task
+                state.mission = analysis
+
+                if resolved_paths:
+                    _agent_status(f"Verified {len(resolved_paths)} user-supplied path(s) directly.")
+
+                # Preserve inspected source evidence but discard facts that
+                # were invalidated by the user's answer; otherwise the old
+                # hard-stop is shown again even after a correct clarification.
+                # apply_user_supplied_paths() already cleared unknowns
+                # naming a path it specifically verified; this clears the
+                # rest so a still-outstanding guess doesn't linger either.
+                state.knowledge.unknowns = [item for item in state.knowledge.unknowns
+                                            if not item.startswith("Requested file is not present:")]
                 context_state = self.context_builder.build(
                     analysis, history=state.history, knowledge=state.knowledge,
                     full_codebase=state.context_scope == "full",
@@ -358,6 +445,8 @@ class CodiAgent:
                 state.context_confidence = context_state.confidence
                 if not context_state.complete:
                     state.status = "awaiting_context"
+                    if getattr(context_state, "needs_user_clarification", False) and context_state.clarification_question:
+                        return context_state.clarification_question
                     return (
                         "I still cannot verify enough context to plan safely. Add the missing details, "
                         "or type 'no' to continue with the evidence already collected.\n\nUnresolved items: "
@@ -375,6 +464,13 @@ class CodiAgent:
                     "The planning step could not reach the configured LLM backend. "
                     "Check that it is running and reachable, then retry."
                 )
+            # Context-resume used to fall through directly into mutation,
+            # bypassing the normal fresh-task plan confirmation gate.
+            state.status = "awaiting_plan_confirmation"
+            return (
+                f"Plan ready after applying your clarification:\n\n{state.plan}\n\n"
+                "Type 'y' to run it, or provide another instruction to replan."
+            )
 
         state.status = "running"
 
@@ -539,16 +635,29 @@ class CodiAgent:
         """
         dispatcher = Dispatcher(self.registry)
         file_matches = list(dict.fromkeys(_FILE_MENTION_RE.findall(state.user_input)))
-
-        if file_matches:
-            tools_to_run = [{"name": "read_file", "args": {"path": p}} for p in file_matches]
+        if state.context_scope == "full" and not file_matches:
+                # Full-codebase reads must actually read the codebase, even on
+                # the "read" intent path — previously only a single search_codebase
+                # + list_files ran here, silently ignoring the user's explicit
+                # "read entire codebase" preference and starving broad review
+                # prompts ("act as a senior engineer...") of any real source.
+                context_builder = ContextBuilder(self.registry)
+                context_state = context_builder.build(
+                    self.mission.analyze(state.user_input),
+                    history=state.history,
+                    full_codebase=True,
+                )
+                context_text = context_state.context
+                for action in context_state.actions:
+                    state.add_tool_result(action["tool"], action.get("status", "ok"), str(action.get("args", "")))
+                # No tools_to_run in this branch; build context from actions.
+                result = {"results": []}
         else:
             tools_to_run = [
                 {"name": "search_codebase", "args": {"query": state.user_input[:200]}},
                 {"name": "list_files", "args": {}},
-            ]
-
-        result = dispatcher.dispatch({"action": "tool_call", "tools": tools_to_run})
+                ]
+            result = dispatcher.dispatch({"action": "tool_call", "tools": tools_to_run})
 
         context_parts = []
         for r in result.get("results", []):

@@ -7,6 +7,28 @@
 #
 # All prompts live in core/prompts.py — never inline here.
 # The Dispatcher normalizes malformed LLM output before routing.
+#
+# ── EDIT ROUTING (fixed) ───────────────────────────────────────────────────
+# Line-range editing (read_file_numbered + replace_lines/delete_lines/
+# insert_at_line) is now the DEFAULT strategy for any edit_file step, not a
+# keyword-gated special case. Exact old/new text-match replacement is now
+# the FALLBACK, reserved for narrow single-literal-value swaps (a color, a
+# number, one attribute value) where reproducing a short "old" snippet
+# verbatim is low-risk.
+#
+# Root cause this fixes: _is_additive_edit() requires additive-without-
+# replace, and _is_line_range_edit() previously required an explicit
+# "line "/"function "/"class " token in the step text. A completely
+# ordinary compound step like "update the button color and add a new
+# section" tripped a _REPLACE_KEYWORDS hit ("update"), which disqualified
+# the additive path, and had no line-range keyword, which disqualified the
+# line-range path — so it fell through to _EDIT_PROMPT, which asks the
+# coder LLM to reproduce a whole-file (or whole-section) "old" string
+# character-for-character. Quantized 7B-class models are unreliable at
+# verbatim reproduction at that scale, and that mismatch was the actual
+# mechanism behind "surgical edits mess stuff up" — not a flaw in
+# _replace_text's fallback chain, which is fine, just rarely reached for
+# the right reason.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import difflib
@@ -266,10 +288,50 @@ _REPLACE_KEYWORDS = ("change", "replace", "update", "fix", "modify", "remove", "
 # to the line-range surgical edit path instead of text-match old/new — this
 # avoids requiring the coder LLM to reproduce large/whitespace-sensitive
 # snippets verbatim, which was the main source of "text not found" failures.
+#
+# NOTE: this keyword list is now used only for TELEMETRY (the "line_range"
+# field logged in tool_routing) and as a forced-true signal — it is no
+# longer the primary gate deciding whether line-range routing happens.
+# See _is_narrow_literal_edit() below for the new default-vs-fallback logic.
 _LINE_EDIT_KEYWORDS = (
     "line ", "lines ", "block", "function", "method", "def ", "class ",
     "section between", "between line", "from line",
 )
+
+# ── Narrow literal-value edit detection ────────────────────────────────────
+# The single case where skipping the read_file_numbered round trip and
+# going straight to a short old/new text-match is genuinely low-risk: one
+# short literal value (a color, a size, a number, an attribute value) is
+# being swapped, with nothing else in the step. Anything else — a second
+# clause ("and add a new section"), added/removed structure, or a step
+# long enough to plausibly touch more than a line or two — must go through
+# line-range editing instead of asking the coder to reproduce a snippet
+# verbatim.
+_NARROW_EDIT_RE = re.compile(
+    r"""(?:change|replace|update|set)\s+
+        (?:the\s+)?[\w\- ]{1,30}\s+
+        (?:to|with|from)\s+
+        ['"\u201c]?[\w#().,%\-]{1,24}['"\u201d]?
+        (?:\s+to\s+['"\u201c]?[\w#().,%\-]{1,24}['"\u201d]?)?\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_narrow_literal_edit(step: str) -> bool:
+    """
+    True only for a single short literal swap (a color, a number, an
+    attribute value) — the one case where asking the coder to reproduce a
+    short "old" snippet verbatim is low-risk enough to skip the
+    read_file_numbered round trip. Any compound step (contains " and " or
+    a semicolon), or a step that doesn't match the narrow "change X to Y"
+    shape, must go through line-range editing instead — see the module
+    docstring for why this default was inverted.
+    """
+    lowered = step.lower()
+    if " and " in lowered or ";" in step:
+        return False
+    return bool(_NARROW_EDIT_RE.search(step.strip()))
+
 
 # Directories skipped when scanning for fuzzy-match candidates
 _SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
@@ -446,6 +508,12 @@ def _is_line_range_edit(step: str) -> bool:
     code units (functions/classes/methods) — signals that a line-range
     surgical edit (replace_lines / delete_lines / insert_at_line) is more
     reliable than asking the coder LLM to reproduce exact text verbatim.
+
+    Kept for telemetry (tool_routing logs) and as an explicit force-true
+    signal in _execute_edit_first, but is NO LONGER the primary gate for
+    whether line-range routing happens — see _is_narrow_literal_edit() and
+    the routing logic in _execute_edit_first, which now default to
+    line-range for everything except narrow single-literal-value swaps.
     """
     step_lower = step.lower()
     if not any(kw in step_lower for kw in _LINE_EDIT_KEYWORDS):
@@ -517,6 +585,9 @@ class Executor:
     def _execute_content_first(
         self, step: str, tool: str, path: str, state: RunState
     ) -> dict:
+        # FIX (bug 1): record strategy so a retry after failure knows this
+        # was already attempted.
+        state.record_step_strategy(step, "content_first")
         log("executor_content_first", {"tool": tool, "path": path, "step": step[:80]})
 
         context_str = trim_tool_output(
@@ -635,7 +706,15 @@ class Executor:
         out-of-bounds / malformed line-range failure, re-reads the file (in
         case a previous attempt already partially changed it) and retries once
         with a repair prompt before giving up.
+
+        This is now the DEFAULT edit strategy (see module docstring) — reached
+        for any edit_file step except narrow single-literal-value swaps, so
+        its own internal repair-then-fallback behavior (falling back to
+        text-match on repeated line-range failure) matters more than before.
         """
+        # FIX (bug 1): record strategy.
+        state.record_step_strategy(step, "line_range_edit")
+
         numbered_handler = self.registry.get("read_file_numbered")
 
         def _read_numbered() -> str:
@@ -688,8 +767,35 @@ class Executor:
     # ── Edit-first strategy (edit_file — replace and additive) ─────────────────
 
     def _execute_edit_first(self, step: str, path: str, state: RunState, skip_line_route: bool = False) -> dict:
-        if not skip_line_route and _is_line_range_edit(step):
-            log("executor_edit_line_route", {"path": path, "step": step[:120]})
+        # ── Routing (fixed) ───────────────────────────────────────────────
+        # Line-range editing is now the DEFAULT for edit_file steps. It is
+        # skipped only when:
+        #   (a) skip_line_route=True — meaning line-range editing was
+        #       already attempted for this exact call chain and failed
+        #       (see _execute_line_edit's fallback above), so this call IS
+        #       the fallback attempt and must not recurse back into itself; or
+        #   (b) the step is a narrow single-literal-value swap
+        #       (_is_narrow_literal_edit) — a color, a number, one attribute
+        #       value, nothing else — where a short exact old/new pair is
+        #       genuinely low-risk and the read_file_numbered round trip is
+        #       unnecessary overhead.
+        #
+        # force_line_route (a prior failed text-match attempt for this exact
+        # step) still takes priority in the other direction: if text-match
+        # already failed once, never retry text-match again for that step —
+        # go straight to line-range instead, regardless of step wording.
+        # This preserves the existing loop-prevention semantics unchanged.
+        tried = state.tried_strategies(step)
+        force_line_route = "edit_first_textmatch" in tried
+
+        if not skip_line_route and (force_line_route or not _is_narrow_literal_edit(step)):
+            log("executor_edit_line_route", {
+                "path": path, "step": step[:120],
+                "forced_by_prior_failure": force_line_route,
+                "reason": "default_strategy" if not force_line_route else "prior_textmatch_failure",
+                "narrow_literal_edit": _is_narrow_literal_edit(step),
+                "legacy_line_range_keyword_hit": _is_line_range_edit(step),
+            })
             return self._execute_line_edit(step, path, state)
 
         read_handler = self.registry.get("read_file")
@@ -713,8 +819,14 @@ class Executor:
             }
 
         if _is_additive_edit(step):
+            state.record_step_strategy(step, "edit_first_additive")
             log("executor_edit_additive_route", {"path": path, "step": step[:120]})
             return self._execute_additive_append(step, path, file_content, state)
+
+        # FIX (bug 1): record strategy BEFORE attempting, so a failure here
+        # is visible to the next retry's routing check above even if this
+        # exact call never returns cleanly.
+        state.record_step_strategy(step, "edit_first_textmatch")
 
         prompt = _EDIT_PROMPT.format(
             path=path,
@@ -767,6 +879,7 @@ class Executor:
         several iterations (as happened with a typo'd "scripts.js" against
         a directory that only had "script.js").
         """
+        state.record_step_strategy(step, "edit_missing_file")
         working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
         error = (
             f"Step references '{path}' for editing, but that file does not exist "
@@ -784,6 +897,11 @@ class Executor:
     def _execute_additive_append(
         self, step: str, path: str, file_content: str, state: RunState
     ) -> dict:
+        # FIX (bug 1): record strategy. Called both directly (additive-intent
+        # steps) and as a fallback from failed text-match/line-range edits —
+        # either way it's a distinct strategy attempt worth remembering.
+        state.record_step_strategy(step, "additive_append")
+
         prompt = _ADDITIVE_APPEND_PROMPT.format(
             path=path,
             file_content=wrap_prompt_data(file_content, path=path),
@@ -961,7 +1079,9 @@ class Executor:
                 "tool": tool,
                 "path": path[:80],
                 "additive": _is_additive_edit(step),
-                "line_range": _is_line_range_edit(step),
+                "narrow_literal_edit": _is_narrow_literal_edit(step),
+                "legacy_line_range_keyword_hit": _is_line_range_edit(step),
+                "prior_strategies": state.tried_strategies(step),
             })
             return self._execute_edit_first(step, path, state)
 
@@ -972,10 +1092,13 @@ class Executor:
                 "tool": tool,
                 "path": path[:80],
                 "repair": False,
+                "prior_strategies": state.tried_strategies(step),
             })
             return self._execute_content_first(step, tool, path, state)
 
         # ── Standard JSON path ────────────────────────────────────────────────
+        state.record_step_strategy(step, "standard_json")
+
         prompt = _STEP_PROMPT.format(
             step=step,
             requirements=state.requirements.as_prompt_block(),
