@@ -8,9 +8,11 @@ import re
 from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage, SystemMessage
+
 from dispatcher import Dispatcher
 from llm_factory import get_refiner_llm
 from logger import log
+from state.code_index import resolve_component
 from state.knowledge import KnowledgeBase
 from tools.registry import ToolRegistry, registry
 
@@ -93,6 +95,108 @@ def _looks_like_file_path(candidate: str) -> bool:
     if re.search(r"\b(for|service|library|elements?|feature)\b", candidate, re.IGNORECASE):
         return False
     return True
+
+
+def _resolve_via_capability(requested: str, known_paths: set[str], working_dir: str) -> tuple[str | None, int]:
+    """
+    Second-chance resolution for a files_needed entry that failed the
+    fuzzy-basename match in _resolve_close_path().
+
+    WHY THIS EXISTS: MissionAnalyzer guesses files_needed from the words in
+    the user's raw prompt, BEFORE the project's real file list has been
+    inspected (see agent.py — mission.analyze() runs ahead of
+    context_builder.build()). "Add a navbar" plausibly produces a guess
+    like "navbar.html" even when the project's actual file is "index.html".
+    A pure filename-similarity check (_resolve_close_path, cutoff=0.75)
+    correctly rejects that — "navbar.html" and "index.html" are not close
+    strings.
+
+    CORRECTED IMPLEMENTATION (v2): the first version of this function
+    called state.code_index.resolve_component(), which queries the SQLite
+    symbol index built by index_file()'s _facts(). That indexer's
+    _SYMBOL_RE only matches JS/Python-style declarations (class/def/
+    function/const/let/var/interface/type/enum) — it is structurally BLIND
+    to HTML markup. id="navbar" and class="navbar-link" attributes are
+    never recorded there no matter how well-populated the index is, so
+    resolve_component("navbar") on an HTML project always returned zero
+    candidates, and the "couldn't find navbar.html" hard-stop kept firing
+    even with that patch in place.
+
+    The parser that DOES see HTML ids/classes/landmarks already exists:
+    tools/local/project_inspector.py's inspect_file() — the exact function
+    the inspect_file TOOL calls, and the source of the "symbols=['navbar',
+    'navbar-link', ...]" evidence that already appears in PROJECT
+    KNOWLEDGE once a file has been inspected. This calls that same parser
+    directly (no dispatcher round trip needed — it's a pure, cheap regex
+    parse of a file already on disk) against every known project file with
+    a plausible extension, and checks whether the requested capability
+    term appears in that file's ids/classes/landmarks/functions/classes.
+
+    resolve_component() is also checked as a secondary signal — it remains
+    genuinely useful for actual code symbols (Python/JS functions/classes),
+    just not for HTML markup, so this keeps both evidence sources rather
+    than picking one at the expense of the other.
+
+    Returns (resolved_path_or_None, confidence_score). The caller decides
+    the acceptance threshold so this stays a pure, testable lookup.
+    """
+    stem = os.path.splitext(os.path.basename(requested))[0].lower()
+    if not stem or len(stem) < 3:
+        return None, 0
+
+    from tools.local.project_inspector import inspect_file as _inspect_structural
+
+    best_path, best_score = None, 0
+    for candidate in known_paths:
+        ext = os.path.splitext(candidate)[1].lower()
+        if ext not in (".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".py"):
+            continue
+        absolute = candidate if os.path.isabs(candidate) else os.path.join(working_dir, candidate)
+        try:
+            result = _inspect_structural({"path": absolute})
+        except Exception as exc:
+            log("context_capability_inspect_error", {"path": candidate, "error": str(exc)[:160]})
+            continue
+        if not isinstance(result, dict) or not result.get("success"):
+            continue
+
+        haystack_terms: set[str] = set()
+        haystack_terms.update(str(v).lower() for v in result.get("ids", []))
+        haystack_terms.update(str(v).lower() for v in result.get("landmarks", []))
+        for entry in result.get("classes", []):
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if name:
+                haystack_terms.add(str(name).lower())
+        for entry in result.get("functions", []):
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if name:
+                haystack_terms.add(str(name).lower())
+        # css_classes surfaced separately from "classes" for HTML (see
+        # project_inspector._inspect_html) under the same "classes" key
+        # already handled above, plus raw CSS class strings may include
+        # multi-word values ("navbar-link active") — split them.
+        for term in list(haystack_terms):
+            haystack_terms.update(term.replace("-", " ").replace("_", " ").split())
+
+        score = sum(1 for term in haystack_terms if term and (stem in term or term in stem))
+        if score > best_score:
+            best_score = score
+            best_path = candidate
+
+    if best_path:
+        return best_path, best_score
+
+    # Secondary check: genuine code-symbol capabilities (a Python/JS
+    # function or class named after the capability) still benefit from the
+    # SQLite index — this just stops being the ONLY source of truth.
+    candidates = resolve_component(stem, limit=3)
+    if candidates:
+        top = candidates[0]
+        path = str(top.get("path", "")).replace("\\", "/")
+        if path and path in known_paths:
+            return path, int(top.get("score", 0))
+
+    return None, 0
 
 
 def _resolve_close_path(requested: str, known_paths: set[str]) -> str | None:
@@ -261,6 +365,11 @@ class ContextBuilder:
         # Project shape is deterministic and required for every code-changing task.
         if not state.knowledge.project:
             self._run(state, "inspect_project", {"path": "."})
+            # Repository instructions are durable context: architecture,
+            # commands, conventions, and safety constraints that should be
+            # known before mission planning rather than rediscovered later.
+            for instruction_path in state.knowledge.project.get("instructions", []):
+                self._run(state, "read_file", {"path": instruction_path})
             # Chroma remains the semantic search layer; SQLite supplies exact
             # paths, declarations, and references for surgical changes.
             self._run(state, "refresh_code_index", {"path": "."})
@@ -282,6 +391,7 @@ class ContextBuilder:
                 )
 
         known_paths = {str(path).replace("\\", "/") for path in state.knowledge.project.get("files", [])}
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
 
         # ── files_needed: files the mission believes ALREADY EXIST ─────────────
         # Give the planner actual source, not only AST metadata. This is a
@@ -305,12 +415,42 @@ class ContextBuilder:
             filelike_requested.append(path)
             normalized = path.replace("\\", "/")
             resolved = _resolve_close_path(normalized, known_paths)
+            resolution_source = "fuzzy_filename" if resolved else None
+
+            if not resolved:
+                # Filename similarity failed (e.g. "nav.html" vs the real
+                # "index.html" — not a close string match). Before giving
+                # up, check whether this is actually a CAPABILITY the user
+                # named ("navbar") rather than a real path the mission
+                # analyzer copied verbatim. resolve_component() answers
+                # that from the already-built symbol/file index — this is
+                # evidence-grounded (real project data), not another guess.
+                capability_match, score = _resolve_via_capability(normalized, known_paths, working_dir)
+                if capability_match and score > 0:
+                    resolved = capability_match
+                    resolution_source = "capability_resolution"
+                    state.knowledge.summaries.append(
+                        f"'{path}' did not match any existing filename directly, "
+                        f"but resolved as a capability to existing file {resolved} "
+                        f"(component match score={score})."
+                    )
+                    log("context_capability_resolved", {
+                        "requested": path, "resolved": resolved, "score": score,
+                    })
+
             if resolved:
                 self._run(state, "inspect_file", {"path": resolved})
                 self._run(state, "read_file", {"path": resolved})
+                if resolution_source == "capability_resolution":
+                    state.knowledge.add_unknown(
+                        f"'{path}' was requested but does not exist as a literal filename; "
+                        f"treating it as the existing file {resolved} based on capability match. "
+                        f"Verify this is the intended target before large structural changes."
+                    )
             else:
-                # No exact match and no close fuzzy match — this file is
-                # genuinely not identifiable in the project. Track it
+                # No exact match, no close fuzzy match, and no capability/
+                # component match — this file is genuinely not identifiable
+                # in the project even after checking real evidence. Track it
                 # explicitly instead of silently dropping it into
                 # "unknowns" and continuing, which previously let an
                 # edit task plan against a guessed substitute file.
@@ -349,14 +489,14 @@ class ContextBuilder:
         if filelike_requested and len(state.missing_requested_files) == len(filelike_requested):
             state.needs_user_clarification = True
             state.clarification_question = (
-                "I couldn't find "
+                "I checked the project files and couldn't find "
                 + (
                     f"the file '{state.missing_requested_files[0]}'"
                     if len(state.missing_requested_files) == 1
                     else f"any of these files: {', '.join(state.missing_requested_files)}"
                 )
-                + " in the current project directory. Could you confirm the exact "
-                "file path, or let me know if it should be created as a new file?"
+                + ", or anything close enough to safely treat as the same target. "
+                "Should I create it as a new file? Reply 'yes, create it' or give me the exact existing path to use instead."
             )
             state.complete = False
             log("context_missing_requested_file", {

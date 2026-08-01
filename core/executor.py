@@ -29,19 +29,106 @@
 # mechanism behind "surgical edits mess stuff up" — not a flaw in
 # _replace_text's fallback chain, which is fine, just rarely reached for
 # the right reason.
+#
+# ── BROWSER NAVIGATION GUARD (fixed) ────────────────────────────────────────
+# Previously, browser_navigate / playwright_navigate had exactly one guard:
+# block URLs starting with "file:". That let through two failure modes seen
+# in production logs:
+#   (a) the coder passed a bare filename ("index.html") as the url, which
+#       navigation tools interpret as https://index.html/ -> ERR_NAME_NOT_RESOLVED
+#   (b) the coder guessed a dev-server URL like http://localhost:3000/ that
+#       was never actually running -> ERR_CONNECTION_REFUSED
+# Both then triggered the validator's repair loop, which had no way to
+# diagnose "browser_navigate was the wrong tool" — it just asked for a
+# different guessed URL, 3 times, then gave up.
+#
+# The fix has two parts, working together:
+#   1. tools/local/static_server_tools.py's serve_static tool starts a real
+#      http.server rooted at the project working dir and returns a
+#      CONFIRMED-working base URL — this is the only correct way to get a
+#      navigable URL for local static files (file:// breaks fetch()/module
+#      imports/relative XHR due to browser CORS rules on the file: scheme).
+#   2. This module's _validate_browser_navigation() rejects any
+#      browser_navigate/playwright_navigate call whose URL host:port does
+#      NOT match either (a) a server CODI itself started via serve_static,
+#      or (b) an http(s) URL the USER explicitly supplied in the original
+#      task text. This closes the guessing loophole entirely — the coder
+#      can no longer invent a plausible-looking URL and have it accepted.
+#
+# Screenshots (playwright_screenshot) are blocked as a verification action
+# via prompts.py's executor_system_prompt rule + improver.py's
+# _normalize_plan_steps — the validator pipeline is text-only (see
+# core/validator.py), so a screenshot result is unreadable noise to it.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import difflib
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.messages import HumanMessage, SystemMessage
+
+# ── Context-slicing for line-range edits ────────────────────────────────────
+# Applies ONLY inside _execute_line_edit (see that method's docstring for why
+# _execute_edit_first's text-match path is deliberately excluded: slicing
+# there risks the model copying a plausible-but-wrong "old" string from
+# outside the slice, which is a correctness regression, not just a token
+# saving). Line numbers returned here are always the file's real line
+# numbers — read_file_numbered's own start_line/end_line args do the
+# numbering, so nothing is renumbered or reindexed client-side. If a slice
+# misses the true target, _execute_line_edit's existing repair path already
+# re-reads the FULL file (slicing disabled on repair), so failure recovery
+# is unaffected by this change.
+_SLICE_THRESHOLD_LINES = 400   # files at/under this: no slicing, unchanged behavior
+_SLICE_CONTEXT_MARGIN = 15     # lines of padding around each keyword hit
+_SLICE_MIN_REDUCTION = 0.7     # only slice if result is <70% of full file size
+_SLICE_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for",
+    "with", "is", "are", "be", "this", "that", "it", "as", "at", "by",
+    "from", "add", "update", "change", "modify", "edit", "fix", "make",
+    "set", "new", "file", "line", "lines", "section", "code",
+}
+
+
+def _extract_step_keywords(step: str) -> list:
+    """Pull distinctive tokens (len >= 3, not stopwords) out of a step
+    description for use as line-location signals. Not a new heuristic
+    invented for this purpose — same length/stopword filtering style
+    already used elsewhere in this module for edit-type detection."""
+    tokens = re.findall(r"[A-Za-z0-9_]+", step.lower())
+    seen = []
+    for t in tokens:
+        if len(t) >= 3 and t not in _SLICE_STOPWORDS and t not in seen:
+            seen.append(t)
+    return seen
+
+
+def _cluster_line_hits(hit_lines: list, total_lines: int, margin: int = _SLICE_CONTEXT_MARGIN) -> list:
+    """Turn a sorted list of matched line numbers into merged (start, end)
+    ranges padded by `margin` lines on each side, clamped to file bounds,
+    with overlapping/adjacent ranges merged."""
+    if not hit_lines:
+        return []
+    ranges = []
+    for ln in sorted(set(hit_lines)):
+        s = max(1, ln - margin)
+        e = min(total_lines, ln + margin)
+        ranges.append([s, e])
+
+    merged = [ranges[0]]
+    for s, e in ranges[1:]:
+        if s <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
 
 from context_trimmer import trim_tool_output
 from dispatcher import Dispatcher, wrap_prompt_data
 from llm_factory import get_coder_llm
 from logger import log
 from core.prompts import executor_system_prompt
-from state.temp_db import RunState
+from state.temp_db import RunState, PlanGraph, PlanStep
 from tools.registry import ToolRegistry
 
 
@@ -448,7 +535,10 @@ def _detect_file_write_step(step: str) -> tuple[str | None, str | None]:
     """
     step_lower = step.lower()
 
-    ext_pattern = r"([A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))"
+    # Optional drive prefix keeps Windows absolute paths intact during repair
+    # routing (without it, ``D:\\project\\index.html`` became
+    # ``\\project\\index.html`` and could target the wrong root).
+    ext_pattern = r"((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:html|css|js|ts|jsx|tsx|py|md|json|txt|svg|sh))"
     match = re.search(ext_pattern, step)
     if not match:
         return None, None
@@ -563,11 +653,303 @@ def _is_large_content_step(step: str, path: str, tool: str | None = None) -> boo
     return False
 
 
+# ── Browser navigation guard (rewritten) ────────────────────────────────────
+# Replaces the old "block file: URLs only" check. See module docstring for
+# the full rationale. This function is intentionally standalone (not a
+# method) so it can be unit-tested without an Executor instance.
+
+_HTTP_URL_RE = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
+
+
+def _urls_share_origin(url_a: str, base_url: str) -> bool:
+    """True if url_a's scheme+host+port match base_url's exactly. Avoids a
+    pull-in of urllib.parse edge cases by keeping the comparison to a
+    prefix check against the base_url CODI itself reported as ready —
+    base_url always ends in '/', so this also correctly matches any path
+    appended onto it (e.g. base_url + 'index.html')."""
+    url_a = (url_a or "").strip()
+    base_url = (base_url or "").strip()
+    if not url_a or not base_url:
+        return False
+    return url_a.lower().startswith(base_url.lower())
+
+
+def _validate_browser_navigation(url: str, state: RunState) -> str | None:
+    """
+    Return an error string if this browser navigation should be BLOCKED,
+    or None if it is allowed to proceed.
+
+    Allowed cases:
+      1. The URL matches (by origin prefix) a server CODI itself started
+         via serve_static in this session (tools/local/static_server_tools.py).
+      2. The user's ORIGINAL task text explicitly contained an http(s) URL,
+         and the requested url is that same http(s) scheme (covers the
+         legitimate "check my running app at http://localhost:5173" case
+         where the user, not the model, supplied the address).
+
+    Blocked otherwise — including bare filenames (no scheme at all, which
+    upstream navigation tools silently coerce to https://<name>/), and any
+    invented/guessed http(s) URL that matches neither case above.
+    """
+    url = (url or "").strip()
+    lowered = url.lower()
+
+    if not lowered.startswith(("http://", "https://")):
+        return (
+            f"Browser navigation target '{url}' is not a valid http(s) URL. "
+            "Local files must never be passed as bare filenames to "
+            "browser_navigate — call serve_static first to get a real "
+            "working URL, then navigate to the URL it returns."
+        )
+
+    try:
+        from tools.local.static_server_tools import known_server_urls
+        running = known_server_urls()
+    except Exception:
+        running = set()
+
+    if any(_urls_share_origin(url, base) for base in running):
+        return None
+
+    user_supplied_urls = _HTTP_URL_RE.findall(state.user_input or "")
+    if any(_urls_share_origin(url, u) or _urls_share_origin(u, url) for u in user_supplied_urls):
+        return None
+
+    return (
+        f"Browser navigation to '{url}' is blocked: this URL does not match any "
+        "server CODI started (call the serve_static tool first to get a real, "
+        "confirmed-working URL for local files) and was not an http(s) URL the "
+        "user explicitly supplied. Never guess a port or hostname."
+    )
+
+
 class Executor:
     def __init__(self, registry: ToolRegistry):
         self.registry   = registry
         self.dispatcher = Dispatcher(registry)
         self.llm        = get_coder_llm()
+        # Guards merges back into the shared RunState from execute_wave's
+        # worker threads. One lock per Executor instance is enough — every
+        # worker thread for a given wave shares this same Executor, and
+        # merges are short (list/dict extends), so lock contention here is
+        # not a real bottleneck relative to the LLM calls each step makes.
+        self._state_merge_lock = threading.Lock()
+
+    # ── Wave-parallel execution (multi-agent path, DAG-driven) ─────────────
+    # execute_step() below (the pre-existing single-step entry point) is
+    # reused UNCHANGED for each atomic step — this section only adds the
+    # concurrency and state-isolation machinery around it. Nothing in
+    # execute_step or anything it calls (_execute_edit_first,
+    # _execute_line_edit, _execute_content_first, etc.) was modified for
+    # this to work.
+    #
+    # THE PROBLEM: execute_step mutates `state` directly (add_tool_result,
+    # record_llm, record_step_strategy, mark_written, ...) via plain Python
+    # list/dict/set appends — none of that is thread-safe. Running several
+    # execute_step calls concurrently against the SAME RunState object would
+    # corrupt tool_results / llm_exchanges / written_steps under concurrent
+    # writes (lost updates at best, a set/dict resize crash at worst).
+    #
+    # THE FIX: each worker thread gets its own lightweight RunState CLONE —
+    # read-only fields (requirements, knowledge, user_input, framework lock,
+    # etc.) are shared by reference since execute_step never mutates them,
+    # but every mutable collection execute_step writes to gets a fresh
+    # empty copy per clone. execute_step runs against the clone with zero
+    # awareness anything is different. After a worker's execute_step call
+    # returns, its clone's NEW entries are merged back into the real shared
+    # state under self._state_merge_lock — so all actual mutation of the
+    # shared RunState happens single-threaded, just deferred to after each
+    # step finishes rather than happening live during execution.
+    #
+    # One correctness consequence of this design, by choice: a step in wave
+    # N cannot see partial/live tool_results from another step in the SAME
+    # wave while it's running — only from waves that already fully merged.
+    # This is correct, not a compromise: two steps in the same wave are, by
+    # definition (ready_steps() only returns steps whose dependencies are
+    # already validated), NOT dependent on each other, so neither should
+    # need the other's in-flight output to do its job. If it did, it should
+    # have been a declared dependency and it would be in the next wave.
+
+    @staticmethod
+    def _clone_state_for_step(state: RunState) -> RunState:
+        """Build a per-worker RunState clone: shared read-only context by
+        reference, fresh empty mutable collections so concurrent workers
+        never touch the same list/dict/set. See class-level note above."""
+        clone = RunState(
+            user_input=state.user_input,
+            history=state.history,
+            mission=state.mission,
+            knowledge=state.knowledge,
+            context_confidence=state.context_confidence,
+            context_scope=state.context_scope,
+            force_read=state.force_read,
+            requirements=state.requirements,
+            plan=state.plan,
+            plan_steps=state.plan_steps,
+            plan_graph=state.plan_graph,
+            iteration=state.iteration,
+            max_iterations=state.max_iterations,
+            project_manifest=state.project_manifest,
+            plan_confirmed=state.plan_confirmed,
+        )
+        # files_written is read+written by execute_step's duplicate-write
+        # guards (already_written/mark_written) — a worker needs to see
+        # what's ALREADY on disk from prior (already-merged) waves to avoid
+        # re-writing it, so this one collection is seeded from the current
+        # state rather than starting empty. It's still a separate set
+        # object per clone (a copy, not the same object), so concurrent
+        # workers each mutate their own copy — no shared-object race — and
+        # the merge step below unions any new entries back in afterward.
+        clone.files_written = set(state.files_written)
+        clone.written_steps = {k: set(v) for k, v in state.written_steps.items()}
+        clone.step_strategies = {k: list(v) for k, v in state.step_strategies.items()}
+        clone.repair_history = {k: list(v) for k, v in state.repair_history.items()}
+        clone.step_attempts = dict(state.step_attempts)
+        clone.repair_attempts = dict(state.repair_attempts)
+        return clone
+
+    def _merge_state_back(self, main_state: RunState, clone: RunState) -> None:
+        """Fold a worker clone's new state back into the shared RunState.
+        Always called under self._state_merge_lock — see class docstring."""
+        with self._state_merge_lock:
+            main_state.tool_results.extend(clone.tool_results)
+            main_state.llm_exchanges.extend(clone.llm_exchanges)
+            main_state.files_written |= clone.files_written
+
+            for path, steps in clone.written_steps.items():
+                main_state.written_steps.setdefault(path, set()).update(steps)
+
+            for step_text, strategies in clone.step_strategies.items():
+                existing = main_state.step_strategies.setdefault(step_text, [])
+                for s in strategies:
+                    if s not in existing:
+                        existing.append(s)
+
+            for step_text, corrections in clone.repair_history.items():
+                existing = main_state.repair_history.setdefault(step_text, [])
+                for c in corrections:
+                    if c not in existing:
+                        existing.append(c)
+                if len(existing) > 4:
+                    del existing[: len(existing) - 4]
+
+            for step_text, count in clone.step_attempts.items():
+                main_state.step_attempts[step_text] = main_state.step_attempts.get(step_text, 0) + count
+
+            for step_text, count in clone.repair_attempts.items():
+                main_state.repair_attempts[step_text] = main_state.repair_attempts.get(step_text, 0) + count
+
+            # _compress_tool_history_if_needed is per-clone during the
+            # worker's own run; the merged main_state can independently
+            # exceed the threshold once several clones' results land in it,
+            # so run the same compression pass on the merged result too.
+            main_state._compress_tool_history_if_needed()
+
+    def _execute_single_wave_step(self, plan_step: PlanStep, main_state: RunState) -> None:
+        """
+        Run one PlanStep's execute_step() call against an isolated state
+        clone, then merge results back and record the outcome onto the
+        PlanStep itself. Executed inside a worker thread by execute_wave.
+
+        Only sets plan_step.status to "failed" for EXECUTION-level failures
+        (LLM backend error, unparseable coder output, dispatcher error) —
+        never to "validated". Moving a step to "validated" is the
+        validator's job (see core/validator.py's dependency-contract gate,
+        piece 5), not the executor's — this method's job ends at "did the
+        step run and produce a result," not "was the result correct."
+        A step that finishes here without a hard execution error is left in
+        "running" status for the validator to pick up and resolve into
+        either "validated" or "failed".
+        """
+        plan_step.attempts += 1
+        clone = self._clone_state_for_step(main_state)
+
+        try:
+            result = self.execute_step(plan_step.text, clone)
+        except Exception as e:
+            # A truly unexpected exception (not the LLM-error/dispatch-error
+            # paths execute_step already handles internally and returns as
+            # a normal {"status": "error", ...} dict for) — treat as a hard
+            # execution failure so it doesn't hang the wave forever.
+            log("executor_wave_step_exception", {
+                "step_id": plan_step.id, "step": plan_step.text[:120], "error": str(e),
+            })
+            self._merge_state_back(main_state, clone)
+            plan_step.result = {"status": "error", "results": [], "error": str(e)}
+            plan_step.status = "failed"
+            return
+
+        self._merge_state_back(main_state, clone)
+        plan_step.result = result
+
+        if result.get("status") == "error":
+            log("executor_wave_step_failed", {
+                "step_id": plan_step.id,
+                "step": plan_step.text[:120],
+                "attempt": plan_step.attempts,
+                "error": (result.get("error") or "")[:200],
+            })
+            plan_step.status = "failed"
+        else:
+            log("executor_wave_step_ran", {
+                "step_id": plan_step.id,
+                "step": plan_step.text[:120],
+                "attempt": plan_step.attempts,
+            })
+            # Left as "running" deliberately — see docstring. The validator
+            # (piece 5) resolves this to "validated" or "failed".
+
+    def execute_wave(self, graph: PlanGraph, state: RunState, max_workers: int = 4) -> dict:
+        """
+        Dispatch every currently-ready step in `graph` concurrently, one
+        thread per step, up to `max_workers` at a time. Blocks until every
+        step dispatched in THIS call has finished (successfully or not) —
+        callers (agent.py) are expected to call this in a loop: dispatch a
+        wave, let the validator resolve each "running" step to "validated"/
+        "failed", call graph.ready_steps() again for the next wave, repeat
+        until graph.is_complete().
+
+        Returns a summary dict rather than raising on partial failure —
+        partial failure within a wave is an expected, handleable outcome
+        (other independent steps in the same wave may have succeeded fine),
+        not an exceptional one.
+        """
+        ready = graph.ready_steps()
+        if not ready:
+            return {"dispatched": 0, "results": {}}
+
+        for step in ready:
+            step.status = "running"
+
+        results: dict[str, dict] = {}
+        # min() guards against spinning up more threads than steps in a
+        # small wave — no functional difference, just avoids idle threads.
+        workers = max(1, min(max_workers, len(ready)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_step = {
+                pool.submit(self._execute_single_wave_step, step, state): step
+                for step in ready
+            }
+            for future in as_completed(future_to_step):
+                step = future_to_step[future]
+                try:
+                    future.result()  # re-raises if _execute_single_wave_step itself raised
+                except Exception as e:
+                    # Should be unreachable — _execute_single_wave_step catches
+                    # its own exceptions — but never let a wave hang or crash
+                    # the whole run over one worker's uncaught error.
+                    log("executor_wave_future_exception", {"step_id": step.id, "error": str(e)})
+                    step.status = "failed"
+                    step.result = {"status": "error", "results": [], "error": str(e)}
+                results[step.id] = step.result or {}
+
+        log("executor_wave_complete", {
+            "dispatched": len(ready),
+            "step_ids": [s.id for s in ready],
+            "outcomes": {s.id: s.status for s in ready},
+        })
+
+        return {"dispatched": len(ready), "results": results}
 
     def _sys(self) -> SystemMessage:
         return SystemMessage(content=executor_system_prompt(
@@ -707,6 +1089,80 @@ class Executor:
 
     # ── Line-range edit strategy (surgical, uses read_file_numbered) ──────────
 
+    def _read_numbered_sliced(self, numbered_handler, step: str, path: str):
+        """
+        Attempt a keyword-windowed read of a large file instead of dumping
+        the whole thing into the coder prompt.
+
+        Returns None (meaning: caller should do a normal full read) whenever
+        slicing doesn't clearly help or safely apply — small file, no
+        keyword hits, or insufficient size reduction — rather than ever
+        returning a slice that might be wrong AND partial. Only returns
+        actual sliced content when it's confident it's worth it.
+        """
+        try:
+            full = numbered_handler({"path": path})
+        except Exception as e:
+            log("executor_line_edit_slice_probe_error", {"path": path, "error": str(e)})
+            return None
+
+        if not full or full.startswith("ERROR"):
+            return None
+
+        # First line looks like: "[path — N lines total, showing S-E]"
+        m = re.search(r"—\s*(\d+)\s+lines total", full)
+        total_lines = int(m.group(1)) if m else full.count("\n") + 1
+
+        if total_lines <= _SLICE_THRESHOLD_LINES:
+            return full  # small file — full read is already cheap, keep as-is
+
+        keywords = _extract_step_keywords(step)
+        if not keywords:
+            return full  # nothing distinctive to search for — can't slice safely
+
+        hit_lines = []
+        for raw_line in full.split("\n"):
+            # numbered lines look like "  123\tsome code here"
+            head, sep, content = raw_line.partition("\t")
+            if not sep:
+                continue
+            try:
+                lineno = int(head.strip())
+            except ValueError:
+                continue
+            content_lower = content.lower()
+            if any(kw in content_lower for kw in keywords):
+                hit_lines.append(lineno)
+
+        if not hit_lines:
+            return full  # no matches — full file is the only safe option
+
+        ranges = _cluster_line_hits(hit_lines, total_lines)
+        sliced_line_count = sum(e - s + 1 for s, e in ranges)
+
+        if sliced_line_count >= total_lines * _SLICE_MIN_REDUCTION:
+            return full  # not enough of a win to justify multiple round trips
+
+        parts = []
+        for s, e in ranges:
+            try:
+                chunk = numbered_handler({"path": path, "start_line": s, "end_line": e})
+            except Exception as ex:
+                log("executor_line_edit_slice_chunk_error", {"path": path, "error": str(ex)})
+                return full  # any chunk failure — bail out to the safe full read
+            if not chunk or chunk.startswith("ERROR"):
+                return full
+            parts.append(chunk)
+
+        log("executor_line_edit_sliced", {
+            "path": path,
+            "total_lines": total_lines,
+            "ranges": ranges,
+            "sliced_lines": sliced_line_count,
+        })
+        header = f"[{path} — {total_lines} lines total, showing {len(ranges)} relevant range(s) below]"
+        return header + "\n" + "\n...\n".join(parts)
+
     def _execute_line_edit(self, step: str, path: str, state: RunState) -> dict:
         """
         Surgically edit a file by line number instead of exact-text matching.
@@ -728,14 +1184,24 @@ class Executor:
 
         numbered_handler = self.registry.get("read_file_numbered")
 
-        def _read_numbered() -> str:
+        def _read_numbered(slice_ok: bool = False) -> str:
             try:
-                return numbered_handler({"path": path}) if numbered_handler else ""
+                if not numbered_handler:
+                    return ""
+                if slice_ok:
+                    sliced = self._read_numbered_sliced(numbered_handler, step, path)
+                    if sliced is not None:
+                        return sliced
+                return numbered_handler({"path": path})
             except Exception as e:
                 log("executor_line_edit_read_error", {"path": path, "error": str(e)})
                 return ""
 
-        numbered = _read_numbered()
+        # Only the FIRST read is eligible for slicing. If this attempt fails
+        # and triggers the repair path below, that re-read explicitly asks
+        # for slice_ok=False (full file) — see repair block further down —
+        # so a bad slice never compounds into a second bad slice.
+        numbered = _read_numbered(slice_ok=True)
         if not numbered or numbered.startswith("ERROR"):
             error = f"line edit requested but could not read numbered content of {path}: {numbered}"
             log("executor_line_edit_no_content", {"path": path})
@@ -757,7 +1223,7 @@ class Executor:
 
         if self._edit_failed_line_range(result):
             failure_reason = self._last_edit_error(result) or "line range was invalid or out of bounds"
-            fresh_numbered = _read_numbered()
+            fresh_numbered = _read_numbered(slice_ok=False)  # full file — see note above
             repair_prompt = _LINE_EDIT_REPAIR_PROMPT.format(
                 failure_reason=failure_reason,
                 path=path,
@@ -1077,6 +1543,20 @@ class Executor:
         # ── Edit routing — always for detected edit_file / edit_file_missing ───
         tool, path = _detect_file_write_step(step)
 
+        # Validator repair instructions often describe what is missing but
+        # omit the filename. Reuse the original plan step's verified target
+        # rather than giving an underspecified repair to the generic JSON
+        # executor, where local models commonly return a noop.
+        if not tool and _step_requires_mutation(step) and state.target_plan_step:
+            original_tool, original_path = _detect_file_write_step(state.target_plan_step)
+            if original_tool and original_path:
+                tool, path = original_tool, original_path
+                log("executor_repair_target_inherited", {
+                    "repair_step": step[:160],
+                    "target_plan_step": state.target_plan_step[:160],
+                    "path": path,
+                })
+
         if tool == "edit_file_missing" and path:
             log("tool_routing", {
                 "strategy": "edit_missing_file",
@@ -1207,6 +1687,19 @@ class Executor:
             tool_name = t.get("name")
             args = t.get("args") or {}
             target_path = str(args.get("path", ""))
+            if tool_name in _WRITE_TOOLS and not target_path:
+                error = (
+                    f"Coder selected {tool_name} without its required 'path'. "
+                    "Re-read the verified project context and retry the same step with "
+                    "an explicit existing target file path."
+                )
+                state.add_tool_result(tool_name, "error", error)
+                log("executor_write_missing_path", {"tool": tool_name, "step": step[:160]})
+                return {
+                    "status": "error",
+                    "results": [{"tool": tool_name, "status": "error", "output": error}],
+                    "error": error,
+                }
             if tool_name in _WRITE_TOOLS and target_path:
                 working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
                 absolute_target = target_path if os.path.isabs(target_path) else os.path.join(working_dir, target_path)
@@ -1270,18 +1763,37 @@ class Executor:
                     return {"status": "error", "results": [{"tool": tool_name, "status": "error", "output": error}], "error": error}
             if isinstance(t, dict) and t.get("name") in {"browser_navigate", "playwright_navigate"}:
                 url = str((t.get("args") or {}).get("url", ""))
-                if url.lower().startswith("file:"):
-                    error = (
-                        "Browser navigation to a local file URL is blocked. Read and edit the local "
-                        "file directly, or use a user-supplied running http:// URL for browser validation."
-                    )
-                    state.add_tool_result("browser_navigate", "error", error)
-                    log("executor_blocked_file_browser_url", {"url": url[:160], "step": step[:160]})
+                block_reason = _validate_browser_navigation(url, state)
+                if block_reason:
+                    state.add_tool_result("browser_navigate", "error", block_reason)
+                    log("executor_blocked_browser_navigation", {"url": url[:160], "step": step[:160], "reason": block_reason[:200]})
                     return {
                         "status": "error",
-                        "results": [{"tool": "browser_navigate", "status": "error", "output": error}],
-                        "error": error,
+                        "results": [{"tool": "browser_navigate", "status": "error", "output": block_reason}],
+                        "error": block_reason,
                     }
+            if isinstance(t, dict) and t.get("name") in {"playwright_screenshot"}:
+                # Screenshots are unreadable to the (text-only) validation
+                # pipeline — see core/validator.py, every check there sends
+                # a text prompt to an LLM. Accepting a screenshot call here
+                # would burn a tool call and produce a result nothing can
+                # verify against, then still fall back to a source-based
+                # check anyway. Block it outright and redirect the coder to
+                # the mechanism that actually works: reading the written
+                # source and confirming its structure/content.
+                error = (
+                    "Screenshot-based verification is not supported — the validation "
+                    "pipeline only reads text/source, it cannot process images. "
+                    "Verify this step by reading the written file's source content "
+                    "instead (read_file / inspect_file), not by taking a screenshot."
+                )
+                state.add_tool_result("playwright_screenshot", "error", error)
+                log("executor_blocked_screenshot", {"step": step[:160]})
+                return {
+                    "status": "error",
+                    "results": [{"tool": "playwright_screenshot", "status": "error", "output": error}],
+                    "error": error,
+                }
             if not isinstance(t, dict) or t.get("name") != "edit_file":
                 continue
             args = t.get("args") or {}
@@ -1331,6 +1843,18 @@ class Executor:
         if dispatch_result.get("signal") in ("noop", "done", "need_context"):
             signal = dispatch_result.get("signal", "noop")
             if signal == "noop" and _step_requires_mutation(step):
+                # A plan-approved create/write step already names the exact
+                # operation and target. A small model replying with noop here
+                # is a control-output failure, not a request for the user to
+                # supply more context. Retry through the content-first path,
+                # which asks only for the file contents and then performs the
+                # deterministic write operation.
+                fallback_tool, fallback_path = _detect_file_write_step(step)
+                if fallback_tool in _WRITE_TOOLS and fallback_path:
+                    log("executor_noop_fallback_content_first", {
+                        "step": step[:160], "tool": fallback_tool, "path": fallback_path,
+                    })
+                    return self._execute_content_first(step, fallback_tool, fallback_path, state)
                 error = (
                     "Invalid noop for an implementation step. The coder must inspect the target "
                     "and perform one verified create_file, write_file, or edit_file operation."

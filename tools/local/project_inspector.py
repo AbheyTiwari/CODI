@@ -7,7 +7,15 @@ import re
 from pathlib import Path
 
 _LANGUAGES = {".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript", ".json": "json", ".md": "markdown", ".html": "html", ".css": "css"}
-_IGNORED = {".git", "node_modules", "__pycache__", ".venv", "venv", "chroma_db", "dist", "build"}
+# CODI's checkpoints and indexes are run artifacts, not project source.  If
+# discovery includes them, the context controller spends turns inspecting its
+# own backups and records those detours as unresolved unknowns, which in turn
+# incorrectly lowers planning confidence.
+_IGNORED = {
+    ".git", ".codi", "node_modules", "__pycache__", ".venv", "venv",
+    "chroma_db", "dist", "build", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".next", "coverage",
+}
 
 # ── Non-Python structural extraction ────────────────────────────────────────
 # inspect_file() previously returned ONLY a line count for every non-.py
@@ -212,4 +220,5 @@ def inspect_project(args=None):
     languages = sorted({_LANGUAGES[path.suffix.lower()] for path in files if path.suffix.lower() in _LANGUAGES})
     frameworks = (["python"] if {"pyproject.toml", "requirements.txt", "setup.cfg"} & names else []) + (["node"] if "package.json" in names else [])
     relative = lambda path: str(path.relative_to(root))
-    return {"success": True, "root": str(root), "languages": languages, "frameworks": frameworks, "entrypoints": [relative(path) for path in files if path.name in {"main.py", "app.py", "index.js", "index.ts", "manage.py"}], "manifests": [relative(path) for path in files if path.name in {"pyproject.toml", "requirements.txt", "package.json", "setup.cfg", "pytest.ini"}], "tests": [relative(path) for path in files if "test" in path.name.lower()][:100], "readme": "README.md" if "readme.md" in names else None, "files": [relative(path) for path in files], "file_count": len(files)}
+    instruction_names = {"agents.md", "claude.md", "gemini.md", "copilot-instructions.md"}
+    return {"success": True, "root": str(root), "languages": languages, "frameworks": frameworks, "entrypoints": [relative(path) for path in files if path.name in {"main.py", "app.py", "index.js", "index.ts", "manage.py"}], "manifests": [relative(path) for path in files if path.name in {"pyproject.toml", "requirements.txt", "package.json", "setup.cfg", "pytest.ini"}], "tests": [relative(path) for path in files if "test" in path.name.lower()][:100], "readme": "README.md" if "readme.md" in names else None, "instructions": [relative(path) for path in files if path.name.lower() in instruction_names], "files": [relative(path) for path in files], "file_count": len(files)}

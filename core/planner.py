@@ -65,6 +65,14 @@ EDIT_VERBS = (
     "edit", "fix", "update", "change", "modify", "rename", "refactor",
     "remove", "delete", "replace", "append", "prepend", "insert", "patch",
     "debug", "troubleshoot", "diagnose",
+    # "redo"/"redesign"/etc. are ordinary phrasing for an edit request
+    # ("redo the navbar", "redesign the header") but substring-matching
+    # against ACTION_TRIGGERS/EDIT_VERBS/BUILD_VERBS found none of them,
+    # so route_reason() fell through to the short_no_action default and
+    # classify_intent() answered as plain chat instead of routing to real
+    # execution — see agent.py's _qa_answer_is_unexecuted_change backstop,
+    # which reuses this exact tuple and was blind to the same gap.
+    "redo", "redesign", "revamp", "rework", "restyle", "overhaul",
 )
 
 BUILD_VERBS = (
@@ -307,9 +315,14 @@ class Planner:
     def direct_answer(self, state: RunState) -> str:
         """For simple Q&A that doesn't need tools. Returns plain text answer."""
         try:
+            history = (state.history or "No earlier conversation.")[-12000:]
             resp = self.llm.invoke([
                 SystemMessage(content=self._system_prompt()),
-                HumanMessage(content=state.user_input),
+                HumanMessage(content=(
+                    "Conversation so far (use it to resolve references such as "
+                    "'that', 'it', and 'what you changed'; do not invent actions):\n"
+                    f"{history}\n\nCurrent user message: {state.user_input}"
+                )),
             ])
             answer = resp.content.strip()
             log("planner_direct", {"output": answer[:100]})

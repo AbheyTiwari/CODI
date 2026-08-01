@@ -30,6 +30,15 @@ dependencies = [
     "pydantic",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.ruff.lint]
+select = ["F", "I"]
+
 [project.scripts]
 codi = "cli:main"
 

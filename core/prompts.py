@@ -53,6 +53,8 @@ You are a highly focused sandbox software engineer. Your only responsibility is 
 
 13. **Resolve Capabilities Before Files**: When a step names a responsibility such as "Upload Handler", call resolve_component or retrieve_context first. Only edit a returned path or a path explicitly supplied by the user; never invent filenames.
 
+14. **Browser Verification Requires a Real Server — Never Guess a URL**: To inspect or locate content in a local file (e.g. index.html), use read_file or inspect_file — never a browser tool; local HTML has no server, so any bare filename or guessed port (like http://localhost:3000/) will always fail. If a step genuinely requires visually verifying a page in a browser, call serve_static FIRST (args: none needed, or {{"path":"index.html"}} to point at a specific file) — it starts a real local server and returns a confirmed-working URL in its "url" field. Then call browser_navigate/playwright_navigate using EXACTLY that returned URL, never a different port or hostname you invent yourself. Never call playwright_screenshot as a verification step — the validation pipeline is text-only and cannot read images; screenshots will be rejected. Verify visual/structural changes by reading the file's source instead.
+
 ## Required Tool JSON
 For exactly one tool call — "reason" is REQUIRED:
 {{"action":"tool_call","reason":"short justification for this exact tool and why not another","tools":[{{"name":"TOOL_NAME","args":{{}}}}]}}
@@ -166,6 +168,9 @@ _TOOL_SIGNATURES: dict[str, str] = {
     "find_symbol":      '{"name":"identifier","path":"optional relative path"} â€” exact declarations and scopes; call before changing a named symbol',
     "find_references":  '{"name":"identifier","path":"optional relative path","limit":200} â€” exact identifier occurrences; call before a rename or cross-file change',
 
+    # ── Static server (for browser verification of local static files) ────────
+    "serve_static":      '{"path":"string (optional — file relative to project root, e.g. \'index.html\')"} — starts (or reuses) a real local HTTP server rooted at the project directory and returns a CONFIRMED-working url. ALWAYS call this before browser_navigate/playwright_navigate against any local file — never guess a port or use a bare filename as a URL.',
+
     # ── MCP filesystem ────────────────────────────────────────────────────────
     "resolve_component": '{"capability":"responsibility phrase","limit":8} -- maps a capability to verified symbols/files',
     "retrieve_context": '{"query":"task or capability","limit":12} -- exact candidates plus import/call graph context',
@@ -193,8 +198,8 @@ _TOOL_SIGNATURES: dict[str, str] = {
     "push_files":        '{"owner":"string","repo":"string","branch":"string","files":[{"path":"string","content":"string"}],"message":"string"}',
 
     # ── MCP Playwright ────────────────────────────────────────────────────────
-    "playwright_navigate":    '{"url":"string"}',
-    "playwright_screenshot":  '{"name":"string","fullPage":false}',
+    "playwright_navigate":    '{"url":"string"} — MUST be a URL returned by serve_static, or an http(s) URL the user explicitly supplied. Never a bare filename or guessed port.',
+    "playwright_screenshot":  '{"name":"string","fullPage":false} — BLOCKED as a verification step; the validation pipeline is text-only and cannot process images. Do not call this to verify a change.',
     "playwright_click":       '{"selector":"string"}',
     "playwright_fill":        '{"selector":"string","value":"string"}',
     "playwright_evaluate":    '{"script":"javascript string"}',

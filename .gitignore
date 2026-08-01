@@ -13,6 +13,7 @@ pyvenv.cfg
 
 # Local config and secrets
 .env
+.codi/
 .agent_history
 codi.log
 codi.egg-info/

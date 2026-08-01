@@ -42,8 +42,11 @@ class SessionMemory:
             with self._lock:
                 if len(self._history) < 8:
                     return
-                old_messages = self._history[:8]
-                self._history = self._history[8:]
+                # Keep messages until the summary is successfully produced.
+                # The old implementation removed them before the LLM call, so
+                # a transient backend error silently erased conversational
+                # context that later turns depended on.
+                old_messages = list(self._history[:8])
 
             text_to_summarize = "\n".join(
                 f"{r.capitalize()}: {m}" for r, m in old_messages
@@ -64,7 +67,9 @@ class SessionMemory:
             ])
 
             with self._lock:
-                self._summary = resp.content
+                if self._history[:len(old_messages)] == old_messages:
+                    self._history = self._history[len(old_messages):]
+                    self._summary = resp.content
 
         except Exception:
             pass  # if compression fails, oldest messages are already dropped — that's fine

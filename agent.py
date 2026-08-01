@@ -56,7 +56,7 @@ from core.context_builder import ContextBuilder
 from core.execution_reflector import ExecutionReflector
 from core.executor  import Executor
 from core.improver  import Improver, classify_plan_risk
-from core.planner   import Planner
+from core.planner   import Planner, EDIT_VERBS, BUILD_VERBS
 from core.quick_actions import try_fast_file_task
 from core.validator import Validator
 from dispatcher      import Dispatcher, wrap_prompt_data
@@ -77,6 +77,73 @@ _IMPLEMENTATION_VERBS = (
 # problem, instead of silently looping to max_iterations or — worse —
 # treating the resulting empty step as "task complete".
 _MAX_LLM_BACKEND_ERRORS = 3
+_MISSING_FILE_UNKNOWN_RE = re.compile(r"^Requested file is not present:\s*(.+)$", re.IGNORECASE)
+_CREATE_CONFIRMATION_RE = re.compile(
+    r"^(?:y|yes|yeah|yep|ok|okay|sure|go ahead|cr(?:e?a)te(?:\s+(?:it|them|the files))?|build(?:\s+(?:it|them|the files))?)\b",
+    re.IGNORECASE,
+)
+
+
+def _confirmed_missing_file_creation(response: str, unknowns: list[str]) -> list[str]:
+    """Return missing targets explicitly approved for creation by the user."""
+    if not _CREATE_CONFIRMATION_RE.search((response or "").strip()):
+        return []
+    return [
+        match.group(1).strip()
+        for item in unknowns
+        if (match := _MISSING_FILE_UNKNOWN_RE.match(str(item)))
+    ]
+
+# ── QA-path misclassification backstop ──────────────────────────────────────
+# classify_intent() (core/planner.py) uses keyword/phrase matching to decide
+# "qa" (plain chat, no tools) vs "edit"/"build" (real execution). Keyword
+# matching is inherently incomplete — some change request will always slip
+# through as "qa" eventually. When that happens, Planner.direct_answer()
+# happily produces a prose answer with code fences and "Steps to Implement:
+# 1. Create or update index.html..." — content that LOOKS like an
+# implementation but was never executed by any tool. Nothing downstream
+# previously checked this; the inert answer was returned to the user as if
+# the task were done.
+#
+# This is a deterministic backstop, not a replacement for fixing
+# classify_intent() itself: if the "qa" answer content looks like an
+# unexecuted implementation (code fences plus file-extension mentions or
+# instructive "do this" phrasing) AND the ORIGINAL request used edit/build
+# language, we treat that as a misclassification and fall through into the
+# real execution pipeline instead of returning the prose. Genuine
+# explanatory questions ("explain flexbox", "show me an example navbar")
+# are untouched — they don't use edit/build verbs in the request, so the
+# second condition never fires and code-in-answers keeps working normally.
+_CODE_FENCE_RE = re.compile(r"```")
+_FILE_EXT_MENTION_RE = re.compile(
+    r"\.(?:html|css|js|ts|jsx|tsx|py|json)\b", re.IGNORECASE
+)
+_INSTRUCTIVE_IMPLEMENTATION_PHRASE_RE = re.compile(
+    r"\b(create or update|steps to implement|save (?:this|it) as|"
+    r"add this to|place this in|copy this into|paste this into)\b",
+    re.IGNORECASE,
+)
+_EDIT_BUILD_VERBS_FOR_QA_GUARD = tuple(set(EDIT_VERBS) | set(BUILD_VERBS))
+
+
+def _qa_answer_is_unexecuted_change(user_input: str, answer: str) -> bool:
+    """True when a 'qa'-routed answer looks like a described-but-not-applied
+    code change for a request that used real edit/build language."""
+    if not answer:
+        return False
+    has_code_fence = bool(_CODE_FENCE_RE.search(answer))
+    if not has_code_fence:
+        return False
+    looks_like_implementation = bool(
+        _FILE_EXT_MENTION_RE.search(answer) or _INSTRUCTIVE_IMPLEMENTATION_PHRASE_RE.search(answer)
+    )
+    if not looks_like_implementation:
+        return False
+    lowered_input = (user_input or "").lower()
+    return any(
+        re.search(rf"\b{re.escape(verb)}\b", lowered_input)
+        for verb in _EDIT_BUILD_VERBS_FOR_QA_GUARD
+    )
 
 
 def _clean_step_text(step: str) -> str:
@@ -157,7 +224,10 @@ class CodiAgent:
         if resuming:
             state = resume_state
             if state.status == "awaiting_plan_confirmation":
-                state.plan_confirmed = True
+                # A follow-up question about a plan must never be interpreted
+                # as approval. The UI supplies this explicit flag only for a
+                # y/yes confirmation.
+                state.plan_confirmed = bool(inputs.get("confirm_plan", False))
             elif state.status == "awaiting_context":
                 response = str(inputs.get("context_response", "")).strip()
                 state.context_response = response
@@ -166,6 +236,12 @@ class CodiAgent:
                 # A declined request means proceed with the verified evidence
                 # already gathered. Any other response is treated as added
                 # context and discovery gets another pass before planning.
+                state.plan_confirmed = False
+            elif state.status == "awaiting_plan_revision":
+                feedback = str(inputs.get("plan_feedback", "")).strip()
+                if feedback and feedback.lower() not in {"retry", "try again"}:
+                    state.plan_validation_feedback = feedback
+                state.plan_validation_attempts = 0
                 state.plan_confirmed = False
         else:
             state = RunState(
@@ -231,6 +307,15 @@ class CodiAgent:
         )
         plan_context = state.knowledge.plan_context()
         risk_info = classify_plan_risk(state)
+        mission_confidence = float(getattr(analysis or state.mission, "confidence", 0.0) or 0.0)
+        evidence_confidence = float(state.context_confidence or 0.0)
+        # Both independent signals must support a high-confidence label. For a
+        # broad, framework-unspecified storefront request, architecture is an
+        # explicit user decision rather than something CODI can truthfully
+        # infer to certainty from a directory listing.
+        confidence = min(mission_confidence, evidence_confidence)
+        if re.search(r"\be-?commerce|online store|web store\b", state.user_input, re.IGNORECASE) and not state.requirements.framework:
+            confidence = min(confidence, 0.75)
 
         lines = [
             f"# Plan: {state.plan}", "",
@@ -260,18 +345,40 @@ class CodiAgent:
 
         lines.extend(["", "## Risks"])
         lines.append(f"- Level: {risk_info['risk']}")
-        if analysis is not None:
-            lines.append(f"- Confidence: {analysis.confidence:.2f}")
+        lines.append(f"- Confidence: {confidence:.2f} (mission and inspected-evidence agreement)")
         lines.extend(f"- {value}" for value in plan_context["risks"])
 
         lines.extend(["", "## Execution Strategy"])
         for i, s in enumerate(state.plan_steps, 1):
             lines.append(f"{i}. {s}")
         lines.extend([
-            "", "## Validation Strategy",
-            "- Run the project test command or targeted tests.",
-            "- Classify any failure, gather missing context where needed, and repair before retrying.",
+            "", "## Design and implementation rationale",
+            state.plan or "(The planner did not provide a design summary.)",
+            "", "## Planned file operations",
         ])
+        for step in state.plan_steps:
+            targets = _FILE_MENTION_RE.findall(step)
+            operation = "create" if re.search(r"\b(create|write|generate)\b", step, re.IGNORECASE) else "modify"
+            if targets:
+                lines.extend(f"- {operation}: {target} — {step}" for target in targets)
+            else:
+                lines.append(f"- planned operation: {step}")
+        planned_files = {
+            target.replace("\\", "/").lower()
+            for step in state.plan_steps
+            for target in _FILE_MENTION_RE.findall(step)
+        }
+        lines.extend(["", "## Validation Strategy"])
+        if {"index.html", "styles.css", "script.js"}.issubset(planned_files):
+            lines.extend([
+                "- Serve and fetch index.html over local HTTP; require a successful response.",
+                "- Check every linked local CSS, JavaScript, and image asset exists.",
+                "- Parse local JSON data and syntax-check linked JavaScript when Node.js is available.",
+                "- Check in-page navigation anchors; inspect responsive layout and runtime console/navigation interactions with a browser adapter when configured.",
+            ])
+        else:
+            lines.append("- Run the project test command or targeted tests.")
+        lines.append("- Classify any failure, gather missing context where needed, and repair before retrying.")
         try:
             with open(plan_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
@@ -280,11 +387,23 @@ class CodiAgent:
 
         # A plan is itself an agent-produced artifact. Review the exact
         # plan.md on disk before asking the user to approve execution.
-        confidence = float(getattr(analysis or state.mission, "confidence", 0.0) or 0.0)
         review = self.validator.validate_plan_file(
             state, plan_path, risk_info["risk"], confidence
         )
         if not review["approved"]:
+            if review.get("requires_user_review"):
+                state.status = "awaiting_plan_confirmation"
+                _agent_status("Plan needs your review before execution.")
+                log("agent_plan_requires_user_review", {
+                    "score": review["score"], "risk": risk_info["risk"],
+                    "confidence": confidence, "policy": review.get("policy"),
+                })
+                return (
+                    f"Plan written to {plan_path}, but CODI is not confident enough to auto-approve it "
+                    f"(score: {review['score']:.1f}/10; confidence: {confidence:.2f}).\n\n"
+                    f"Review concern: {review['suggested_edits']}\n\n"
+                    "Review the plan and type 'y' only if you accept this uncertainty, or tell me what to change."
+                )
             state.plan_validation_attempts += 1
             suggestion = review["suggested_edits"]
             _agent_status(
@@ -296,14 +415,13 @@ class CodiAgent:
                 "attempt": state.plan_validation_attempts,
             })
             if state.plan_validation_attempts >= 3:
-                state.status = "failed"
+                state.status = "awaiting_plan_revision"
                 return (
                     "The plan validator rejected three plan drafts, so execution has not started. "
-                    f"Last score: {review['score']:.1f}/10. Needed changes: {suggestion}"
+                    f"Last score: {review['score']:.1f}/10. Needed changes: {suggestion}\n\n"
+                    "Type 'retry' to regenerate from this feedback, or describe how you want the plan changed."
                 )
-            self.improver.create_plan(
-                state, state.knowledge.summary_for_prompt(), validator_feedback=suggestion
-            )
+            self.improver.create_plan(state, state.knowledge.summary_for_prompt(), validator_feedback=suggestion)
             if state.plan.startswith("[PLANNING FAILED]"):
                 state.status = "failed"
                 return state.plan
@@ -327,8 +445,23 @@ class CodiAgent:
             if intent == "qa":
                 _agent_status("Answering directly; no tools needed.")
                 log("agent_direct", {"input": state.user_input[:80]})
-                state.status = "complete"
-                return self.planner.direct_answer(state)
+                answer = self.planner.direct_answer(state)
+                if _qa_answer_is_unexecuted_change(state.user_input, answer):
+                    # The classifier called this "qa" but the model's own
+                    # answer just described a code change in prose instead
+                    # of applying it. Do not return the inert answer as if
+                    # the task were done — re-route into real execution.
+                    _agent_status(
+                        "Answer described a code change instead of applying it — switching to execution."
+                    )
+                    log("agent_qa_misclassification_corrected", {
+                        "input": state.user_input[:160],
+                        "discarded_answer_sample": answer[:200],
+                    })
+                    intent = "build"
+                else:
+                    state.status = "complete"
+                    return answer
 
             if intent == "read":
                 _agent_status("Reading code to answer — no files will be changed.")
@@ -443,15 +576,84 @@ class CodiAgent:
             if gate_message is not None:
                 return gate_message
 
+        elif state.status == "awaiting_plan_revision":
+            analysis = state.mission or self.mission.analyze(state.user_input)
+            feedback = state.plan_validation_feedback or state.plan_validation_notes
+            _agent_status("Regenerating the rejected plan with validator feedback.")
+            self.improver.create_plan(
+                state, state.knowledge.summary_for_prompt(), validator_feedback=feedback
+            )
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                return state.plan
+            gate_message = self._confirm_plan_gate(state, analysis)
+            if gate_message is not None:
+                return gate_message
+
         elif state.status == "awaiting_context":
             declined = state.context_response.lower() in {"n", "no", "proceed", "continue"}
+            approved_creates = _confirmed_missing_file_creation(
+                state.context_response, state.knowledge.unknowns
+            )
             if declined:
                 _agent_status("Proceeding with the available verified context at the user's request.")
                 log("context_declined", {"confidence": state.context_confidence})
                 analysis = state.mission
             else:
                 _agent_status("Rechecking project context with the user's additional details.")
-                analysis = state.mission or self.mission.analyze(state.user_input)
+                # A clarification can replace an earlier, incorrect assumption
+                # about which files exist. Re-analyse it as part of the task,
+                # then treat any user-named, verified paths as authoritative.
+                clarification_task = (
+                    f"{state.user_input}\n\nUser clarification: {state.context_response}"
+                )
+                # A response to CODI's own "should I create it?" question is
+                # authorization, not extra project context. Re-analysing
+                # "yes" used to put the same absent files back in
+                # files_needed and trap empty projects in this branch.
+                analysis = state.mission if approved_creates else self.mission.analyze(clarification_task)
+                state.mission = analysis
+                if not hasattr(self, "context_builder"):
+                    self.context_builder = ContextBuilder(self.registry)
+                if approved_creates:
+                    approved_set = {path.replace("\\", "/") for path in approved_creates}
+                    analysis.files_needed = [
+                        path for path in analysis.files_needed
+                        if path.replace("\\", "/") not in approved_set
+                    ]
+                    analysis.files_new = list(dict.fromkeys([
+                        *(analysis.files_new or []), *approved_creates
+                    ]))
+                    state.knowledge.unknowns = [
+                        item for item in state.knowledge.unknowns
+                        if not _MISSING_FILE_UNKNOWN_RE.match(str(item))
+                    ]
+                    analysis.unknowns = [
+                        item for item in analysis.unknowns
+                        if "requested file" not in str(item).lower()
+                    ]
+                    log("context_missing_files_creation_approved", {"files": approved_creates})
+                supplied_paths = list(dict.fromkeys(_FILE_MENTION_RE.findall(state.context_response)))
+                resolved_paths = self.context_builder.apply_user_supplied_paths(
+                    state.knowledge, supplied_paths
+                )
+                if resolved_paths:
+                    # The user corrected the target. Do not preserve stale
+                    # hallucinated component paths as hard requirements.
+                    state.knowledge.unknowns = [
+                        item for item in state.knowledge.unknowns
+                        if not item.startswith("Requested file is not present:")
+                    ]
+                    analysis.files_needed = resolved_paths
+                    analysis.files_new = []
+                    analysis.unknowns = [
+                        item for item in analysis.unknowns
+                        if "requested file" not in str(item).lower()
+                    ]
+                    log("context_clarification_paths_applied", {
+                        "paths": resolved_paths,
+                        "response": state.context_response[:200],
+                    })
                 context_state = self.context_builder.build(
                     analysis, history=state.history, knowledge=state.knowledge,
                     full_codebase=state.context_scope == "full",
@@ -633,6 +835,32 @@ class CodiAgent:
                 state.repair_attempts[repair_key] = state.repair_attempts.get(repair_key, 0) + 1
                 if state.repair_attempts[repair_key] >= 3:
                     state.status = "awaiting_context"
+                    target_matches = _FILE_MENTION_RE.findall(
+                        state.target_plan_step or state.current_step or ""
+                    )
+                    target_hint = target_matches[0] if target_matches else "the intended target file"
+                    notes_lower = (state.validation_notes or "").lower()
+                    if "noop" in notes_lower:
+                        question = (
+                            f"Should I create or update {target_hint} exactly as the approved plan says? "
+                            "If not, tell me which existing file should own this behavior."
+                        )
+                    elif "does not exist" in notes_lower:
+                        question = (
+                            f"I could not find {target_hint}. Should I create it, or what exact existing file should I use instead?"
+                        )
+                    else:
+                        question = (
+                            f"For {target_hint}, what behavior or dependency should CODI use that is not currently in the project?"
+                        )
+                    state.clarification_prompt = (
+                        "I paused after three unsuccessful repair attempts. "
+                        f"The last failure was: {state.validation_notes}\n\n"
+                        f"Specific question: {question}\n\n"
+                        "Reply with the answer and I will resume from the failing step."
+                    )
+                    log("agent_clarification_required", {"attempts": 3, "notes": state.validation_notes[:200]})
+                    return state.clarification_prompt
                     state.clarification_prompt = (
                         "I could not safely complete this after three repair attempts. "
                         f"The last failure was: {state.validation_notes}\n\n"

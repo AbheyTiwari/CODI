@@ -23,6 +23,169 @@ class ToolResult:
     output: str
 
 
+# ── Dependency graph for parallel atomic-step execution ─────────────────────
+# This is ADDITIVE to plan_steps (flat list), not a replacement. Simple/edit-
+# mode tasks and anything that doesn't populate plan_graph continue through
+# the existing sequential Improver.next_step() loop untouched. plan_graph is
+# only consulted by the new wave-execution path (agent.py checks
+# `if state.plan_graph and state.plan_graph.steps:` before taking that
+# branch — see agent.py for the fallback wiring).
+#
+# depends_on holds OTHER STEP IDS, not file paths — two steps touching the
+# same file aren't automatically dependent (e.g. two independent additive
+# writes to different sections), and two steps on different files CAN be
+# dependent (step B calls a function step A defines in another module).
+# Building depends_on is a two-stage process (see core/improver.py):
+#   1. LLM proposes depends_on per step at plan time (semantic intent —
+#      "this step needs that one to exist first" isn't always visible from
+#      source alone, e.g. ordering that matters for product/business logic).
+#   2. A static-analysis pass (AST-based where the target file is Python;
+#      regex-based name-reference fallback otherwise) adds any edges the
+#      LLM missed by checking whether a step's step text or its target
+#      file's existing content references a `provides` name from another
+#      step. It only ADDS edges, never removes ones the LLM proposed —
+#      a false-positive extra dependency costs a little parallelism; a
+#      missed one costs correctness, so the bias is deliberate.
+@dataclass
+class PlanStep:
+    """
+    One atomic unit of work in a dependency-graph plan — normally scoped to
+    "implement one function," "add one class," "wire one route," not a
+    whole file. Executed by its own Executor call; validated independently
+    before steps that depend on it are allowed to start.
+
+    id           — stable short identifier ("step_1", "step_2", ...), assigned
+                   at plan-graph construction time. Used as the depends_on
+                   reference — never the step text, which can be rewritten
+                   during repair and would break edge lookups.
+    text         — the actual instruction handed to the Executor, same shape
+                   as an entry in plan_steps.
+    target_file  — the file this step is expected to write/modify. Used both
+                   for the AST dependency-inference pass and for the
+                   dependency-contract validator ("does this file still
+                   contain what an upstream step's `provides` promised?").
+    depends_on   — list of OTHER PlanStep.id values that must reach status
+                   "validated" before this step is eligible to run.
+    provides     — symbol names (function/class/route names, etc.) this step
+                   is expected to introduce. Populated by the LLM at plan
+                   time and cross-checked post-execution. Used by downstream
+                   steps' dependency-contract validation, not by this step
+                   itself.
+    status       — "pending" | "running" | "validated" | "failed".
+                   "validated" (not just "done") is the gate other steps'
+                   depends_on checks look for — a step that ran but failed
+                   validation must not unblock anything downstream.
+    attempts     — how many times this step has been dispatched. Kept here
+                   (in addition to RunState.step_attempts, which is keyed by
+                   raw step text and used by the sequential path) so the
+                   wave scheduler can cap per-step retries without relying
+                   on text-matching into a dict built for a different loop.
+    result       — last execution result dict (same shape Executor.execute
+                   already returns), kept for validator/debugging access.
+    validation_notes — human-readable reason for the last validation
+                   pass/fail, surfaced in repair prompts and logs.
+    """
+    id: str
+    text: str
+    target_file: str | None = None
+    depends_on: list[str] = field(default_factory=list)
+    provides: list[str] = field(default_factory=list)
+    status: str = "pending"   # pending | running | validated | failed
+    attempts: int = 0
+    result: dict[str, Any] | None = None
+    validation_notes: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "target_file": self.target_file,
+            "depends_on": list(self.depends_on),
+            "provides": list(self.provides),
+            "status": self.status,
+            "attempts": self.attempts,
+            "validation_notes": self.validation_notes,
+        }
+
+
+@dataclass
+class PlanGraph:
+    """
+    The full dependency graph for a run. Steps are stored keyed by id for
+    O(1) depends_on lookups (the wave scheduler resolves a lot of these
+    per iteration, so a list-scan here would get expensive on larger plans).
+    """
+    steps: dict[str, PlanStep] = field(default_factory=dict)
+    max_step_attempts: int = 3
+
+    def add(self, step: PlanStep) -> None:
+        self.steps[step.id] = step
+
+    def get(self, step_id: str) -> PlanStep | None:
+        return self.steps.get(step_id)
+
+    def ready_steps(self) -> list[PlanStep]:
+        """
+        Steps eligible to run RIGHT NOW: still pending, every dependency is
+        validated, and the step hasn't exhausted its retry budget. This is
+        exactly one "wave" for the concurrent scheduler — call this, dispatch
+        everything it returns in parallel, validate each result, then call
+        it again for the next wave. A step whose dependency FAILED (not just
+        "not yet validated") is permanently excluded — see blocked_steps().
+        """
+        ready = []
+        for step in self.steps.values():
+            if step.status != "pending":
+                continue
+            if step.attempts >= self.max_step_attempts:
+                continue
+            deps = [self.steps.get(dep_id) for dep_id in step.depends_on]
+            if any(dep is None for dep in deps):
+                continue  # dangling dependency reference — treat as not-ready, not crash
+            if all(dep.status == "validated" for dep in deps):
+                ready.append(step)
+        return ready
+
+    def blocked_steps(self) -> list[PlanStep]:
+        """Pending steps that can never become ready because a dependency
+        permanently failed (exhausted its own retry budget)."""
+        blocked = []
+        for step in self.steps.values():
+            if step.status != "pending":
+                continue
+            deps = [self.steps.get(dep_id) for dep_id in step.depends_on]
+            if any(dep is not None and dep.status == "failed" for dep in deps):
+                blocked.append(step)
+        return blocked
+
+    def is_complete(self) -> bool:
+        """True once every step is either validated or has permanently
+        failed/is permanently blocked — i.e. there's no more work the
+        scheduler could possibly do, success or not."""
+        for step in self.steps.values():
+            if step.status in ("validated", "failed"):
+                continue
+            if step in self.blocked_steps():
+                continue
+            return False
+        return True
+
+    def all_validated(self) -> bool:
+        return bool(self.steps) and all(s.status == "validated" for s in self.steps.values())
+
+    def summary_counts(self) -> dict:
+        counts = {"pending": 0, "running": 0, "validated": 0, "failed": 0}
+        for step in self.steps.values():
+            counts[step.status] = counts.get(step.status, 0) + 1
+        return counts
+
+    def to_dict(self) -> dict:
+        return {
+            "steps": {sid: s.to_dict() for sid, s in self.steps.items()},
+            "summary": self.summary_counts(),
+        }
+
+
 @dataclass
 class TaskRequirements:
     """
@@ -117,12 +280,21 @@ class RunState:
     # ── Plan ──────────────────────────────────────────────────────────────────
     plan:        str = ""
     plan_steps:  list[str] = field(default_factory=list)
+    # DAG plan for the wave-parallel multi-agent execution path (see PlanGraph
+    # above). ADDITIVE — None/empty for every task that goes through the
+    # existing sequential Improver.next_step() loop. Only populated when
+    # Improver.create_plan() decides a task is atomic-decomposable (see
+    # core/improver.py). agent.py checks `if state.plan_graph and
+    # state.plan_graph.steps:` before taking the wave-execution branch;
+    # anything else falls through to the untouched sequential path.
+    plan_graph: PlanGraph | None = None
     # Plan review runs before asking the user for confirmation.  Keeping its
     # decision in state makes retries observable and prevents an unbounded
     # plan-regeneration loop when the validator keeps rejecting a plan.
     plan_validation_attempts: int = 0
     plan_validation_score: float | None = None
     plan_validation_notes: str = ""
+    plan_validation_feedback: str = ""
 
     # ── Execution ─────────────────────────────────────────────────────────────
     iteration:       int = 0
@@ -153,6 +325,21 @@ class RunState:
     # already failed instead of hoping the LLM notices on its own.
     step_strategies: dict[str, list[str]] = field(default_factory=dict)
 
+    # NEW (gap #2 — "sharper repair prompts"): step_strategies only ever
+    # gets populated by core/executor.py's edit-strategy names
+    # (edit_first_textmatch, line_range_edit, ...). A test-failure repair
+    # loop (validator._test_execution_check -> improve()'s "Test failures"
+    # block) never wrote to that dict, so every retry of a failing test saw
+    # the exact same prompt shape with zero memory of what the PREVIOUS
+    # correction attempt already told the coder to do. This is a parallel,
+    # lightweight tracker: step text -> ordered list of the actual
+    # correction strings previously sent to the coder for that step,
+    # regardless of failure category (test failure, repeated tool error,
+    # anything else routed through Improver.improve()). Capped short
+    # (see record_repair_attempt) since this only needs to answer "have we
+    # already tried this," not serve as a full audit log.
+    repair_history: dict[str, list[str]] = field(default_factory=dict)
+
     project_manifest: dict[str, Any] = field(default_factory=lambda: {"package": None, "files_created": {}})
     plan_confirmed:  bool = True
 
@@ -176,7 +363,7 @@ class RunState:
 
     # ── Final output ──────────────────────────────────────────────────────────
     final_output: str = ""
-    status:       str = "start"   # start | running | complete | failed
+    status:       str = "start"   # start | running | awaiting_plan_revision | complete | failed
 
     # ── Raw LLM JSON exchanges (for debugging) ────────────────────────────────
     llm_exchanges: list[dict] = field(default_factory=list)
@@ -267,6 +454,22 @@ class RunState:
 
     def tried_strategies(self, step: str) -> list[str]:
         return list(self.step_strategies.get(step, []))
+
+    # NEW (gap #2): record the actual correction text sent to the coder for
+    # a given step, regardless of failure category. Capped at the 4 most
+    # recent entries per step — this only needs to tell the next repair
+    # prompt "here's what was already tried," not retain unbounded history.
+    def record_repair_attempt(self, step: str, correction: str) -> None:
+        if not step or not correction:
+            return
+        history = self.repair_history.setdefault(step, [])
+        if correction not in history:
+            history.append(correction)
+            if len(history) > 4:
+                del history[0]
+
+    def prior_repair_attempts(self, step: str) -> list[str]:
+        return list(self.repair_history.get(step, []))
 
     def _compress_tool_history_if_needed(self, threshold: int = 10):
         """Collapse older tool results into a summary once history becomes too long."""

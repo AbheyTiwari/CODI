@@ -57,7 +57,8 @@ def main():
     load_dotenv(os.path.join(_REPO_ROOT, ".env"))
 
     # 5. Auto-index the working directory (incremental — only changed files re-index)
-    _auto_index(cwd, chroma_dir)
+    # main.py performs one quiet background index after its prompt is ready.
+    # Doing it here too duplicated work and could corrupt the input display.
 
     # 6. Launch the CLI
     from main import main as _main

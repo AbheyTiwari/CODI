@@ -126,7 +126,7 @@ def startup_sequence():
     console.print()
 
 # ── Auto-index ────────────────────────────────────────────────────────────────
-def _auto_index(target_dir: str = None):
+def _auto_index(target_dir: str = None, quiet: bool = False):
     """Index target_dir (defaults to current CODI_WORKING_DIR)."""
     index_dir = target_dir or os.environ.get("CODI_WORKING_DIR", _LAUNCH_DIR)
     chroma    = os.environ.get("CODI_CHROMA_DIR", _chroma_dir)
@@ -142,6 +142,15 @@ def _auto_index(target_dir: str = None):
             return
     t = _t()
     label = os.path.basename(index_dir)
+    if quiet:
+        # Rich Live output from a background thread fights prompt_toolkit's
+        # redraw buffer, making typed input appear to disappear. Auto-index
+        # silently; an explicit /index still displays normal progress.
+        try:
+            index_codebase(index_dir, db_path=chroma, quiet=True)
+        except Exception as e:
+            log("background_index_error", {"path": index_dir, "error": str(e)})
+        return
     with console.status(Text(f"  indexing {label}/...", style="dim"),
                         spinner="dots", spinner_style=t["accent"]) as status:
         # Live progress so a large/first-time index shows real movement
@@ -161,7 +170,7 @@ def _auto_index(target_dir: str = None):
     console.print()
 
 def _auto_index_background(target_dir: str = None):
-    thread = threading.Thread(target=_auto_index, args=(target_dir,), daemon=True)
+    thread = threading.Thread(target=_auto_index, args=(target_dir, True), daemon=True)
     thread.start()
     return thread
 
@@ -189,6 +198,18 @@ _PLAN_FEEDBACK_RE = re.compile(
 def _looks_like_plan_feedback(value: str) -> bool:
     """Keep critique of a pending plan in the same agent run."""
     return bool(_PLAN_FEEDBACK_RE.search(value or ""))
+
+
+_PENDING_CONVERSATION_RE = re.compile(
+    r"^(?:why|what|how|can you explain|could you explain|is (?:that|this)|"
+    r"are we|do you|did you|thanks|thank you)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_pending_conversation(value: str) -> bool:
+    """Keep clearly conversational turns from discarding an awaiting plan."""
+    return bool(_PENDING_CONVERSATION_RE.match((value or "").strip()))
 
 def _try_fast_path(user_input: str) -> str | None:
     from tools.local.file_tools import read_file, list_files
@@ -666,6 +687,7 @@ def main():
                         console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
                     continue
                 if user_input.strip().lower() in ("y", "yes"):
+                    session_memory.add("user", user_input)
                     confirmed_state = pending_plan_state["state"]
                     pending_plan_state["awaiting"] = False
                     pending_plan_state["state"] = None
@@ -676,7 +698,7 @@ def main():
                     console.print()
  
                     try:
-                        response = agent_executor.invoke({}, resume_state=confirmed_state)
+                        response = agent_executor.invoke({"confirm_plan": True}, resume_state=confirmed_state)
                         output       = response.get("output") or "No output returned."
                         tool_outputs = response.get("tool_outputs", [])
  
@@ -691,12 +713,17 @@ def main():
                                             title=Text("error", style="red"),
                                             border_style="red", padding=(0, 2)))
                     continue
-                elif _looks_like_plan_feedback(user_input):
+                elif (
+                    user_input.strip().lower() in {"retry", "try again"}
+                    or _looks_like_plan_feedback(user_input)
+                ) and not _is_pending_conversation(user_input):
+                    session_memory.add("user", user_input)
                     console.print(Text("  revising the pending plan from your feedback", style="dim"))
                     renderer = LiveRenderer(pending_state.user_input)
                     renderer.start()
                     console.print()
                     try:
+                        pending_state.status = "awaiting_plan_revision"
                         response = agent_executor.invoke({"plan_feedback": user_input}, resume_state=pending_state)
                         output = response.get("output") or "No output returned."
                         run_state = response.get("state")
@@ -706,6 +733,36 @@ def main():
                         pending_plan_state["awaiting"] = bool(run_state and run_state.status == "awaiting_plan_confirmation")
                         pending_plan_state["state"] = run_state if pending_plan_state["awaiting"] else None
                         console.print(Panel(Markdown(output), border_style=t["dim"], padding=(0, 2)))
+                        session_memory.add("assistant", output)
+                    except Exception as e:
+                        renderer.stop()
+                        console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
+                    continue
+                elif _is_pending_conversation(user_input):
+                    # Answer a question about active work without losing the
+                    # pending plan. A later y/yes still resumes that exact
+                    # plan, while a concrete plan comment takes the branch
+                    # above.
+                    session_memory.add("user", user_input)
+                    renderer = LiveRenderer(user_input)
+                    renderer.start()
+                    try:
+                        pending_context = (
+                            "\n\nACTIVE PENDING PLAN (not executed yet):\n"
+                            f"Goal: {pending_state.plan}\n"
+                            + "\n".join(
+                                f"{index}. {step}" for index, step in enumerate(pending_state.plan_steps, start=1)
+                            )
+                        )
+                        response = agent_executor.invoke({
+                            "input": user_input,
+                            "history": get_trimmed_history() + pending_context,
+                        })
+                        output = response.get("output") or "No output returned."
+                        renderer.stop()
+                        console.print()
+                        _refresh_status_panel()
+                        render_response(output, response.get("tool_outputs", []))
                         session_memory.add("assistant", output)
                     except Exception as e:
                         renderer.stop()

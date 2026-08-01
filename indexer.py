@@ -102,7 +102,7 @@ def walk_codebase(root_path: str):
             except Exception:
                 continue
 
-def index_codebase(root_path: str, db_path: str = None, progress_callback=None):
+def index_codebase(root_path: str, db_path: str = None, progress_callback=None, quiet: bool = False):
     """
     Incrementally index a codebase into ChromaDB.
 
@@ -124,6 +124,8 @@ def index_codebase(root_path: str, db_path: str = None, progress_callback=None):
     total_files = count_eligible_files(root_path)
     if progress_callback is None:
         def progress_callback(done, total, path, changed):  # noqa: ARG001
+            if quiet:
+                return
             # Default: print every ~5% of progress (or every file for small
             # projects) instead of flooding stdout on large repos.
             step = max(1, total // 20)
@@ -131,7 +133,16 @@ def index_codebase(root_path: str, db_path: str = None, progress_callback=None):
                 label = os.path.basename(path) if path else ""
                 print(f"  Indexing {done}/{total} — {label}")
 
-    print(f"  Indexing: {root_path} ({total_files} eligible files)")
+    if not quiet:
+        print(f"  Indexing: {root_path} ({total_files} eligible files)")
+
+    # An empty directory has nothing to embed. Avoid loading/downloading the
+    # Hugging Face model solely to announce zero files.
+    if total_files == 0:
+        if not quiet:
+            print("  Indexed 0 changed / 0 total files.")
+        return
+
     ef = get_embeddings()
 
     cache_path = os.path.join(db_path, "file_hashes.json")
@@ -212,15 +223,17 @@ def index_codebase(root_path: str, db_path: str = None, progress_callback=None):
     _flush()
 
     json.dump(new_cache, open(cache_path, "w"))
-    print(f"  Indexed {updated} changed / {len(new_cache)} total files.")
+    if not quiet:
+        print(f"  Indexed {updated} changed / {len(new_cache)} total files.")
     if skipped_large:
-        print(
-            f"  Skipped {len(skipped_large)} file(s) over "
-            f"{_MAX_FILE_CHARS // 1000}k chars (too large to usefully "
-            f"chunk for semantic search): "
-            + ", ".join(os.path.basename(p) for p in skipped_large[:5])
-            + (f" and {len(skipped_large) - 5} more" if len(skipped_large) > 5 else "")
-        )
+        if not quiet:
+            print(
+                f"  Skipped {len(skipped_large)} file(s) over "
+                f"{_MAX_FILE_CHARS // 1000}k chars (too large to usefully "
+                f"chunk for semantic search): "
+                + ", ".join(os.path.basename(p) for p in skipped_large[:5])
+                + (f" and {len(skipped_large) - 5} more" if len(skipped_large) > 5 else "")
+            )
 
 if __name__ == "__main__":
     import sys

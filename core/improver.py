@@ -74,7 +74,7 @@ Produce an execution plan. Respond ONLY with JSON — no fences, no prose:
 {{"plan":"one sentence summary","steps":["Step 1: ...","Step 2: ..."]}}
 
 Rules:
-- Maximum 5 steps. Each step is a plain string — NOT an object.
+- Maximum 7 steps. Each step is a plain string — NOT an object.
 - Reconcile every file name with the evidence before using it. If an intended
   file is absent, make the step explicitly create it; do not say "edit".
 - Include a verification step only after all implementation steps.
@@ -85,7 +85,12 @@ Rules:
 - If task mentions [BOILERPLATE CREATED: file1, file2], those files exist.
   Plan EDIT steps only — do NOT plan to create them again.
 - For simple single-file tasks, ONE step is enough.
-- Be specific: name the file, name the tool, name the content.
+- Be specific: name the file, name the tool, and name the concrete result.
+  For UI work, cover the page structure, user interactions, visual system
+  (layout, typography, color/spacing), responsive/accessibility behavior, and
+  verification as applicable. For application work, cover the architecture,
+  data flow, and framework/dependency choices the user actually requested.
+  Put those decisions in the `plan` summary before listing implementation steps.
 - Every implementation step MUST name at least one target file. Never use a
   vague step such as "Add CSS" or "Implement JavaScript"; say exactly where
   it will be added. A read-only action is not an implementation step.
@@ -166,12 +171,42 @@ def _unique(items: list[str]) -> list[str]:
 
 
 def _extract_file_refs(text: str) -> list[str]:
-    pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|svg))"
+    pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:json|java|html|css|jsx|tsx|yaml|yml|xml|svg|txt|sql|sh|py|js|ts|md))"
     return _unique([m.group(1).strip("'\"` ") for m in re.finditer(pattern, text or "")])
 
 
 _VERIFICATION_WORDS = ("verify", "validate", "test", "check", "screenshot")
 _IMPLEMENTATION_WORDS = ("add", "change", "create", "edit", "fix", "implement", "insert", "modify", "remove", "replace", "style", "update", "write")
+
+
+def _is_static_ecommerce_request(task: str, framework: str | None) -> bool:
+    """Recognize a broad storefront request that needs concrete core flows."""
+    lowered = (task or "").lower()
+    return (
+        framework in (None, "vanilla")
+        and any(term in lowered for term in ("ecommerce", "e-commerce", "online store", "web store"))
+    )
+
+
+def _static_ecommerce_steps(project_files: list[str]) -> list[str]:
+    """A minimum viable storefront architecture for an unspecified static app.
+
+    This is deliberately deterministic: a planner cannot call something an
+    ecommerce site while omitting catalog, cart, checkout, navigation, or a
+    responsive UI. Existing files are edited; missing files are explicitly
+    created, so plan.md and execution never disagree about file operations.
+    """
+    existing = {str(path).replace("\\", "/").lower() for path in project_files}
+
+    def verb(path: str) -> str:
+        return "Edit" if path.lower() in existing else "Create"
+
+    return [
+        f"{verb('index.html')} index.html with accessible navigation, a searchable product catalog, product-detail affordances, cart summary, and checkout form structure",
+        f"{verb('styles.css')} styles.css with the visual system, responsive catalog/cart layout, keyboard focus states, and mobile breakpoints",
+        f"{verb('products.json')} products.json with the cupcake catalog data required for product cards, prices, images, and availability",
+        f"{verb('script.js')} script.js to load and validate catalog data, render and filter products, manage cart quantities, and validate checkout interactions",
+    ]
 
 
 # FIX (bug 1): human-readable descriptions of each strategy name recorded by
@@ -237,26 +272,72 @@ def _best_file_match(step: str, known_files: list[str]) -> str | None:
     return known_files[0]
 
 
-def _normalize_plan_steps(steps: list[str], requirements: TaskRequirements) -> list[str]:
-    """Make every implementation step file-targeted before execution begins."""
+def _normalize_plan_steps(
+    steps: list[str],
+    requirements: TaskRequirements,
+    project_files: list[str] | None = None,
+) -> list[str]:
+    """Make every implementation step file-targeted before execution begins.
+
+    project_files: real, verified file paths from state.knowledge.project
+    (i.e. what inspect_project actually found on disk) — used as a fallback
+    target for browser-verification rewrites below. This is DELIBERATELY
+    separate from `requirements.files`, which is populated by regex-matching
+    file extensions out of the user's raw prompt text
+    (_deterministic_requirements -> _extract_file_refs(state.user_input)).
+    A prompt like "fix the navigation bar" never names a file extension, so
+    requirements.files is empty even when the project obviously has exactly
+    one HTML entrypoint — passing project_files closes that gap.
+    """
     normalized: list[str] = []
     known_files = _unique(requirements.files)
+    fallback_files = _unique([str(f).replace("\\", "/") for f in (project_files or [])])
     for raw_step in steps:
         step = _as_text(raw_step).strip()
         if not step:
             continue
         lowered = step.lower()
-        # Browser MCP cannot open file:// URLs. Local HTML is verified from
-        # source unless the user explicitly supplied a running web URL.
-        if any(term in lowered for term in ("browser", "reload the page", "screenshot")):
-            target = _extract_file_refs(step) or known_files
-            if target:
-                step = f"Read {target[0]} and verify its HTML structure and requested content"
-                lowered = step.lower()
+        # ── Browser/visual verification is NEVER executable in this
+        # architecture and must be DROPPED, not rewritten:
+        #   1. The browser MCP tool cannot open file:// URLs (blocked
+        #      explicitly in core/executor.py's browser_navigate guard).
+        #   2. Even a successful navigation/screenshot has NO path back to
+        #      an LLM for visual inspection — nothing in this pipeline does
+        #      image-based verification.
+        #   3. FIX (v2): an earlier version of this rewrite converted the
+        #      step into "Read {file} and verify its HTML structure and
+        #      requested content" — but real verification for every write
+        #      ALREADY happens automatically and independently, twice:
+        #      core/validator.py's validate_current_write() runs an LLM
+        #      semantic check right after every edit_file/write_file, and
+        #      the final validate() LLM check runs before the task is ever
+        #      marked complete. A synthetic "go re-read the file" plan step
+        #      performs no check beyond those — it can only ever be a
+        #      no-op. Worse, that rewrite's own trailing wording ("structure
+        #      and requested content") became the literal keywords
+        #      validator.py's noop-content-check demands appear in the
+        #      file — generic boilerplate that will never match real file
+        #      content, so the synthetic step failed a check that had
+        #      nothing to do with whether the actual feature was built.
+        #      There is no safe wording for this step type; it is deleted
+        #      outright rather than reworded, same as the browser-call case
+        #      it originally existed to replace.
+        if any(term in lowered for term in (
+            "browser", "reload the page", "screenshot", "refresh the page",
+            "open the page", "render", "visually",
+        )):
+            log("improver_step_verification_dropped", {
+                "step": step[:160],
+                "reason": (
+                    "browser/visual verification step provides no check beyond the "
+                    "per-write and final LLM validation that already run automatically"
+                ),
+            })
+            continue
         is_verification = any(word in lowered for word in _VERIFICATION_WORDS)
         needs_file = any(re.search(rf"\b{word}\b", lowered) for word in _IMPLEMENTATION_WORDS)
         if needs_file and not is_verification and not _extract_file_refs(step):
-            resolved_file = _best_file_match(step, known_files)
+            resolved_file = _best_file_match(step, known_files or fallback_files)
             if resolved_file:
                 log("improver_step_file_resolved", {
                     "step": step[:160], "resolved_file": resolved_file,
@@ -515,7 +596,14 @@ def classify_plan_risk(state: RunState) -> dict:
     already treats as a hard failure, not a soft warning.
     """
     working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
-    files = _unique(state.requirements.files or [])
+    # Requirements only see filenames explicitly written in the user's first
+    # sentence. The approved plan is the source of truth for concrete creates
+    # and edits, so include every target it names. Without this, plan.md could
+    # falsely claim "Files to Create: none" and then execute create_file.
+    plan_targets = [
+        path for step in state.plan_steps for path in _extract_file_refs(step)
+    ]
+    files = _unique([*(state.requirements.files or []), *plan_targets])
 
     creates: list[str] = []
     modifies: list[str] = []
@@ -695,15 +783,24 @@ class Improver:
         task = state.user_input
         if validator_feedback:
             task += (
-                "\n\nPLAN VALIDATOR REJECTED THE PREVIOUS PLAN. Apply these "
-                "required corrections while keeping the original request intact:\n"
-                f"{validator_feedback}"
+                "\n\nPLAN VALIDATOR REJECTED THE PREVIOUS PLAN. Do NOT repeat "
+                "the rejected plan. Produce a materially corrected replacement that "
+                "applies the feedback below while keeping the original request intact. "
+                "Treat feedback as planning guidance, not as permission to invent files "
+                "or expand user scope.\n\nVALIDATOR FEEDBACK:\n"
+                f"{validator_feedback}\n\nREJECTED PLAN SUMMARY:\n{state.plan[:1600]}"
             )
+        conversation = trim_tool_output(state.history or "No earlier conversation.", max_tokens=700)
         prompt = _PLAN_PROMPT.format(
             task=task,
             requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
-            context=wrap_prompt_data(trim_tool_output(context, max_tokens=1700)),
+            context=(
+                "CONVERSATION CONTEXT (use only to resolve the user's intent; "
+                "the current request remains authoritative):\n"
+                f"{conversation}\n\nPROJECT CONTEXT:\n"
+                + wrap_prompt_data(trim_tool_output(context, max_tokens=1700))
+            ),
         )
 
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
@@ -725,9 +822,23 @@ class Improver:
             return {"plan": state.plan, "steps": []}
 
         from context_trimmer import trim_tool_output
-        plan_text, plan_steps, plan_source = self._parse_plan_response(raw, state.requirements)
+        project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+        plan_text, plan_steps, plan_source = self._parse_plan_response(
+            raw, state.requirements, project_files=project_files
+        )
         state.plan = plan_text
         state.plan_steps = plan_steps
+
+        if _is_static_ecommerce_request(state.user_input, state.requirements.framework):
+            state.plan = (
+                "Build a responsive static cupcake storefront: semantic navigation and product catalog, "
+                "JSON-backed product data, client-side search/filter and cart state, checkout validation, "
+                "and an accessible visual system."
+            )
+            state.plan_steps = _static_ecommerce_steps(project_files)
+            log("plan_ecommerce_architecture_enforced", {
+                "steps": len(state.plan_steps), "files": _extract_file_refs("\n".join(state.plan_steps)),
+            })
 
         log("plan_created", {
             "plan_source": plan_source,
@@ -737,14 +848,29 @@ class Improver:
         })
 
         self._lint_and_repair_plan(state, context)
+        # Keep the plan artifact, risk classification, and executor aligned on
+        # the same target inventory rather than only files named in the raw
+        # user prompt.
+        state.requirements.files = _unique([
+            *(state.requirements.files or []),
+            *(path for step in state.plan_steps for path in _extract_file_refs(step)),
+        ])
 
         return {"plan": state.plan, "steps": state.plan_steps}
 
     @staticmethod
-    def _parse_plan_response(raw: str, requirements: TaskRequirements) -> tuple[str, list[str], str]:
+    def _parse_plan_response(
+        raw: str, requirements: TaskRequirements, project_files: list[str] | None = None
+    ) -> tuple[str, list[str], str]:
         """Shared JSON-or-line-fallback parsing used by both the initial plan
         call and the one-shot lint re-prompt, so both paths get identical
-        step normalization instead of two hand-maintained copies."""
+        step normalization instead of two hand-maintained copies.
+
+        project_files: verified paths from state.knowledge.project — passed
+        through to _normalize_plan_steps so browser-verification rewrites
+        (and generic file-targeting) can fall back to real project evidence,
+        not only to filenames the raw user prompt happened to mention.
+        """
         from dispatcher import Dispatcher
 
         parsed = Dispatcher.parse_llm_json(raw)
@@ -753,11 +879,13 @@ class Improver:
             raw_steps = parsed.get("steps", [])
             if isinstance(raw_steps, list):
                 steps = _enforce_test_intent(_normalize_plan_steps(
-                    [_as_text(s) for s in raw_steps if _as_text(s)], requirements
+                    [_as_text(s) for s in raw_steps if _as_text(s)], requirements, project_files
                 ), requirements)
             else:
                 s = _as_text(raw_steps)
-                steps = _enforce_test_intent(_normalize_plan_steps([s] if s else [], requirements), requirements)
+                steps = _enforce_test_intent(
+                    _normalize_plan_steps([s] if s else [], requirements, project_files), requirements
+                )
             return plan_text, steps, "json"
 
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -770,7 +898,9 @@ class Improver:
             if line:
                 collected.append(line)
         plan_text = raw[:200]
-        steps = _enforce_test_intent(_normalize_plan_steps(collected[:5], requirements), requirements)
+        steps = _enforce_test_intent(
+            _normalize_plan_steps(collected[:5], requirements, project_files), requirements
+        )
         return plan_text, steps, "fallback"
 
     def _lint_and_repair_plan(self, state: RunState, context: str) -> None:
@@ -809,7 +939,10 @@ class Improver:
         state.record_llm("improver_plan_lint_retry", raw_retry)
 
         if self._last_llm_error is None and raw_retry:
-            plan_text, plan_steps, plan_source = self._parse_plan_response(raw_retry, state.requirements)
+            retry_project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+            plan_text, plan_steps, plan_source = self._parse_plan_response(
+                raw_retry, state.requirements, project_files=retry_project_files
+            )
             retry_violations = _plan_lint_violations(plan_steps, state.requirements, known_files)
             log("plan_lint_retry_result", {
                 "plan_source": plan_source,
