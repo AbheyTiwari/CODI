@@ -19,12 +19,32 @@
 #     same RunState back in via resume_state=. That call skips planning
 #     entirely and goes straight into the execution loop.
 #
+#   FIX: this gate previously lived ONLY inline in the "fresh task" branch
+#   of _run(). The "awaiting_context" resume branch (reached after the user
+#   answers a context-clarification question) called create_plan() a SECOND
+#   time but never routed through the gate — it fell straight into the
+#   execution loop with state.status = "running", so plan.md was silently
+#   never written and the user's "type y" confirmation had nothing real
+#   behind it. Both branches now call the same _confirm_plan_gate() helper,
+#   so there is exactly one place that decides "does this plan need to be
+#   shown and confirmed before running" and it can't drift out of sync
+#   between the two entry paths again.
+#
 # IMPORTANT: _run() MUST return a string in every code path. The execution
 # loop below sets state.status = "complete" via break but does not itself
 # produce user-facing output — the final summarize() call at the bottom of
 # _run() is what turns "the loop finished" into an actual answer. Without
 # it, invoke() returns output=None and the caller prints "No output
 # returned." even after files were written successfully.
+#
+# LLM-BACKEND-DOWN HANDLING:
+#   Improver.next_step() / .improve() now return an "llm_error" key when the
+#   underlying LLM call itself failed (connection error, timeout, backend
+#   unreachable) rather than the model genuinely returning nothing. Treating
+#   that as "step empty -> task complete" (the previous behavior) silently
+#   reported success on runs where the backend never responded at all. The
+#   loop below now retries up to _MAX_LLM_BACKEND_ERRORS times, then fails
+#   the run explicitly with a message naming the actual problem.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import re
@@ -35,8 +55,8 @@ from core.mission_analyzer import MissionAnalyzer
 from core.context_builder import ContextBuilder
 from core.execution_reflector import ExecutionReflector
 from core.executor  import Executor
-from core.improver  import Improver
-from core.planner   import Planner
+from core.improver  import Improver, classify_plan_risk
+from core.planner   import Planner, EDIT_VERBS, BUILD_VERBS
 from core.quick_actions import try_fast_file_task
 from core.validator import Validator
 from dispatcher      import Dispatcher, wrap_prompt_data
@@ -52,9 +72,94 @@ _IMPLEMENTATION_VERBS = (
     "modify", "remove", "replace", "style", "update", "write",
 )
 
+# How many consecutive LLM-backend failures (connection errors, timeouts)
+# the execution loop tolerates before giving up and reporting the real
+# problem, instead of silently looping to max_iterations or — worse —
+# treating the resulting empty step as "task complete".
+_MAX_LLM_BACKEND_ERRORS = 3
+_MISSING_FILE_UNKNOWN_RE = re.compile(r"^Requested file is not present:\s*(.+)$", re.IGNORECASE)
+_CREATE_CONFIRMATION_RE = re.compile(
+    r"^(?:y|yes|yeah|yep|ok|okay|sure|go ahead|cr(?:e?a)te(?:\s+(?:it|them|the files))?|build(?:\s+(?:it|them|the files))?)\b",
+    re.IGNORECASE,
+)
+
+
+def _confirmed_missing_file_creation(response: str, unknowns: list[str]) -> list[str]:
+    """Return missing targets explicitly approved for creation by the user."""
+    if not _CREATE_CONFIRMATION_RE.search((response or "").strip()):
+        return []
+    return [
+        match.group(1).strip()
+        for item in unknowns
+        if (match := _MISSING_FILE_UNKNOWN_RE.match(str(item)))
+    ]
+
+# ── QA-path misclassification backstop ──────────────────────────────────────
+# classify_intent() (core/planner.py) uses keyword/phrase matching to decide
+# "qa" (plain chat, no tools) vs "edit"/"build" (real execution). Keyword
+# matching is inherently incomplete — some change request will always slip
+# through as "qa" eventually. When that happens, Planner.direct_answer()
+# happily produces a prose answer with code fences and "Steps to Implement:
+# 1. Create or update index.html..." — content that LOOKS like an
+# implementation but was never executed by any tool. Nothing downstream
+# previously checked this; the inert answer was returned to the user as if
+# the task were done.
+#
+# This is a deterministic backstop, not a replacement for fixing
+# classify_intent() itself: if the "qa" answer content looks like an
+# unexecuted implementation (code fences plus file-extension mentions or
+# instructive "do this" phrasing) AND the ORIGINAL request used edit/build
+# language, we treat that as a misclassification and fall through into the
+# real execution pipeline instead of returning the prose. Genuine
+# explanatory questions ("explain flexbox", "show me an example navbar")
+# are untouched — they don't use edit/build verbs in the request, so the
+# second condition never fires and code-in-answers keeps working normally.
+_CODE_FENCE_RE = re.compile(r"```")
+_FILE_EXT_MENTION_RE = re.compile(
+    r"\.(?:html|css|js|ts|jsx|tsx|py|json)\b", re.IGNORECASE
+)
+_INSTRUCTIVE_IMPLEMENTATION_PHRASE_RE = re.compile(
+    r"\b(create or update|steps to implement|save (?:this|it) as|"
+    r"add this to|place this in|copy this into|paste this into)\b",
+    re.IGNORECASE,
+)
+_EDIT_BUILD_VERBS_FOR_QA_GUARD = tuple(set(EDIT_VERBS) | set(BUILD_VERBS))
+
+
+def _qa_answer_is_unexecuted_change(user_input: str, answer: str) -> bool:
+    """True when a 'qa'-routed answer looks like a described-but-not-applied
+    code change for a request that used real edit/build language."""
+    if not answer:
+        return False
+    has_code_fence = bool(_CODE_FENCE_RE.search(answer))
+    if not has_code_fence:
+        return False
+    looks_like_implementation = bool(
+        _FILE_EXT_MENTION_RE.search(answer) or _INSTRUCTIVE_IMPLEMENTATION_PHRASE_RE.search(answer)
+    )
+    if not looks_like_implementation:
+        return False
+    lowered_input = (user_input or "").lower()
+    return any(
+        re.search(rf"\b{re.escape(verb)}\b", lowered_input)
+        for verb in _EDIT_BUILD_VERBS_FOR_QA_GUARD
+    )
+
+
+def _clean_step_text(step: str) -> str:
+    """Strip filenames and path references from the step text to prevent
+    false-positive verb matches (e.g., 'change.md' matching 'change', or
+    'style.css' matching 'style')."""
+    # Remove things like change.md, styles.css
+    cleaned = re.sub(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,5}\b", " ", step or "")
+    # Strip punctuation
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return cleaned
+
 
 def _step_requires_mutation(step: str) -> bool:
-    return any(re.search(rf"\b{verb}\b", (step or "").lower()) for verb in _IMPLEMENTATION_VERBS)
+    cleaned = _clean_step_text(step)
+    return any(re.search(rf"\b{verb}\b", cleaned.lower()) for verb in _IMPLEMENTATION_VERBS)
 
 
 def _step_succeeded(state: RunState, step: str = "") -> bool:
@@ -69,13 +174,17 @@ def _step_succeeded(state: RunState, step: str = "") -> bool:
     if not state.tool_results:
         return False
     last = state.tool_results[-1]
-    if _step_requires_mutation(step):
-        return last.status == "ok" and last.tool in {"create_file", "write_file", "edit_file"}
-    if last.status == "ok":
-        return True
-    # dispatcher noop/duplicate-write signals also count as step success —
-    # they mean "nothing left to do here," not "this failed"
+
+    # Dispatcher noop/duplicate-write signals also count as step success —
+    # they mean "nothing left to do here," not "this failed". Check this first,
+    # before _step_requires_mutation exits early.
     if last.tool == "dispatcher" and last.output in ("noop", "done"):
+        return True
+
+    if _step_requires_mutation(step):
+        return last.status == "ok" and last.tool in {"create_file", "write_file", "edit_file", "apply_patch"}
+    
+    if last.status == "ok":
         return True
     return False
 
@@ -115,7 +224,10 @@ class CodiAgent:
         if resuming:
             state = resume_state
             if state.status == "awaiting_plan_confirmation":
-                state.plan_confirmed = True
+                # A follow-up question about a plan must never be interpreted
+                # as approval. The UI supplies this explicit flag only for a
+                # y/yes confirmation.
+                state.plan_confirmed = bool(inputs.get("confirm_plan", False))
             elif state.status == "awaiting_context":
                 response = str(inputs.get("context_response", "")).strip()
                 state.context_response = response
@@ -125,12 +237,19 @@ class CodiAgent:
                 # already gathered. Any other response is treated as added
                 # context and discovery gets another pass before planning.
                 state.plan_confirmed = False
+            elif state.status == "awaiting_plan_revision":
+                feedback = str(inputs.get("plan_feedback", "")).strip()
+                if feedback and feedback.lower() not in {"retry", "try again"}:
+                    state.plan_validation_feedback = feedback
+                state.plan_validation_attempts = 0
+                state.plan_confirmed = False
         else:
             state = RunState(
                 user_input=inputs.get("input", ""),
                 history=inputs.get("history", ""),
             )
             state.context_scope = "full" if inputs.get("read_entire_codebase") else "targeted"
+            state.force_read = bool(inputs.get("force_read"))
             # Every fresh task starts unconfirmed. Fast-path / direct-answer /
             # read / edit tasks never reach the gate check, so this is safe
             # to force here — only the "build" path consults it.
@@ -161,9 +280,159 @@ class CodiAgent:
 
         return {
             "output":       output,
-            "tool_outputs": state.recent_tool_outputs(n=10),
+            "tool_outputs": [{"tool": r.tool, "status": r.status, "output": r.output} for r in state.tool_results[-10:]],
             "state":        state,
         }
+
+    # ── Plan confirmation gate ────────────────────────────────────────────────
+    # FIX: previously duplicated inline only in the "fresh task" branch of
+    # _run(). Extracted so BOTH the fresh-plan path and the post-context-
+    # discovery resume path go through the exact same logic — writing
+    # plan.md, computing risk, and setting state.status =
+    # "awaiting_plan_confirmation" — instead of the resume path silently
+    # skipping straight to execution with no plan.md and no real
+    # confirmation behind the "type y" prompt the user saw.
+    #
+    # Returns the confirmation message string if the gate triggers (i.e.
+    # plan_confirmed is still False and there are steps to confirm), or
+    # None if the caller should proceed straight into execution (e.g. the
+    # plan is already confirmed, or there are no steps at all — which
+    # summarize() will report honestly rather than confirming an empty plan).
+    def _confirm_plan_gate(self, state: RunState, analysis) -> str | None:
+        if state.plan_confirmed or not state.plan_steps:
+            return None
+
+        plan_path = os.path.join(
+            os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
+        )
+        plan_context = state.knowledge.plan_context()
+        risk_info = classify_plan_risk(state)
+        mission_confidence = float(getattr(analysis or state.mission, "confidence", 0.0) or 0.0)
+        evidence_confidence = float(state.context_confidence or 0.0)
+        # Both independent signals must support a high-confidence label. For a
+        # broad, framework-unspecified storefront request, architecture is an
+        # explicit user decision rather than something CODI can truthfully
+        # infer to certainty from a directory listing.
+        confidence = min(mission_confidence, evidence_confidence)
+        if re.search(r"\be-?commerce|online store|web store\b", state.user_input, re.IGNORECASE) and not state.requirements.framework:
+            confidence = min(confidence, 0.75)
+
+        lines = [
+            f"# Plan: {state.plan}", "",
+            "## Mission", analysis.goal if analysis else state.user_input, "",
+            "## Understanding", state.knowledge.summary_for_prompt(), "",
+            "## Architecture", "```json", str(plan_context["dependency_graph"]), "```", "",
+            "## Files inspected",
+        ]
+        lines.extend(f"- {path}" for path in plan_context["files_inspected"])
+
+        lines.extend(["", "## Capabilities"])
+        lines.append(f"- Framework: {state.requirements.framework or 'none locked'}")
+        lines.extend(f"- {m}" for m in state.requirements.must_have) or lines.append("- (none extracted)")
+
+        lines.extend(["", "## Files to Create"])
+        lines.extend(f"- {f}" for f in risk_info["files_to_create"]) if risk_info["files_to_create"] else lines.append("- (none)")
+
+        lines.extend(["", "## Files to Modify"])
+        lines.extend(f"- {f}" for f in risk_info["files_to_modify"]) if risk_info["files_to_modify"] else lines.append("- (none)")
+
+        lines.extend(["", "## Dependencies"])
+        lines.extend(f"- {mn}" for mn in state.requirements.must_not) if state.requirements.must_not else lines.append("- (none)")
+
+        if analysis is not None:
+            lines.extend(["", "## Assumptions"] + [f"- {value}" for value in analysis.assumptions])
+        lines.extend(["", "## Unknowns"] + [f"- {value}" for value in plan_context["unknowns"]])
+
+        lines.extend(["", "## Risks"])
+        lines.append(f"- Level: {risk_info['risk']}")
+        lines.append(f"- Confidence: {confidence:.2f} (mission and inspected-evidence agreement)")
+        lines.extend(f"- {value}" for value in plan_context["risks"])
+
+        lines.extend(["", "## Execution Strategy"])
+        for i, s in enumerate(state.plan_steps, 1):
+            lines.append(f"{i}. {s}")
+        lines.extend([
+            "", "## Design and implementation rationale",
+            state.plan or "(The planner did not provide a design summary.)",
+            "", "## Planned file operations",
+        ])
+        for step in state.plan_steps:
+            targets = _FILE_MENTION_RE.findall(step)
+            operation = "create" if re.search(r"\b(create|write|generate)\b", step, re.IGNORECASE) else "modify"
+            if targets:
+                lines.extend(f"- {operation}: {target} — {step}" for target in targets)
+            else:
+                lines.append(f"- planned operation: {step}")
+        planned_files = {
+            target.replace("\\", "/").lower()
+            for step in state.plan_steps
+            for target in _FILE_MENTION_RE.findall(step)
+        }
+        lines.extend(["", "## Validation Strategy"])
+        if {"index.html", "styles.css", "script.js"}.issubset(planned_files):
+            lines.extend([
+                "- Serve and fetch index.html over local HTTP; require a successful response.",
+                "- Check every linked local CSS, JavaScript, and image asset exists.",
+                "- Parse local JSON data and syntax-check linked JavaScript when Node.js is available.",
+                "- Check in-page navigation anchors; inspect responsive layout and runtime console/navigation interactions with a browser adapter when configured.",
+            ])
+        else:
+            lines.append("- Run the project test command or targeted tests.")
+        lines.append("- Classify any failure, gather missing context where needed, and repair before retrying.")
+        try:
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            log("plan_md_write_error", {"error": str(e)})
+
+        # A plan is itself an agent-produced artifact. Review the exact
+        # plan.md on disk before asking the user to approve execution.
+        review = self.validator.validate_plan_file(
+            state, plan_path, risk_info["risk"], confidence
+        )
+        if not review["approved"]:
+            if review.get("requires_user_review"):
+                state.status = "awaiting_plan_confirmation"
+                _agent_status("Plan needs your review before execution.")
+                log("agent_plan_requires_user_review", {
+                    "score": review["score"], "risk": risk_info["risk"],
+                    "confidence": confidence, "policy": review.get("policy"),
+                })
+                return (
+                    f"Plan written to {plan_path}, but CODI is not confident enough to auto-approve it "
+                    f"(score: {review['score']:.1f}/10; confidence: {confidence:.2f}).\n\n"
+                    f"Review concern: {review['suggested_edits']}\n\n"
+                    "Review the plan and type 'y' only if you accept this uncertainty, or tell me what to change."
+                )
+            state.plan_validation_attempts += 1
+            suggestion = review["suggested_edits"]
+            _agent_status(
+                f"Plan scored {review['score']:.1f}/10; regenerating with validator feedback."
+            )
+            log("agent_plan_validation_rejected", {
+                "score": review["score"], "risk": risk_info["risk"],
+                "confidence": confidence, "suggestion": suggestion[:300],
+                "attempt": state.plan_validation_attempts,
+            })
+            if state.plan_validation_attempts >= 3:
+                state.status = "awaiting_plan_revision"
+                return (
+                    "The plan validator rejected three plan drafts, so execution has not started. "
+                    f"Last score: {review['score']:.1f}/10. Needed changes: {suggestion}\n\n"
+                    "Type 'retry' to regenerate from this feedback, or describe how you want the plan changed."
+                )
+            self.improver.create_plan(state, state.knowledge.summary_for_prompt(), validator_feedback=suggestion)
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                return state.plan
+            return self._confirm_plan_gate(state, analysis)
+
+        state.status = "awaiting_plan_confirmation"
+        _agent_status(f"Plan ready (risk: {risk_info['risk']}) — waiting for user confirmation.")
+        return (
+            f"Plan written to {plan_path} (risk: {risk_info['risk']}). Review it, then type 'y' to run it, "
+            f"or give me a new instruction to replan."
+        )
 
     # ── Core loop ─────────────────────────────────────────────────────────────
 
@@ -176,8 +445,23 @@ class CodiAgent:
             if intent == "qa":
                 _agent_status("Answering directly; no tools needed.")
                 log("agent_direct", {"input": state.user_input[:80]})
-                state.status = "complete"
-                return self.planner.direct_answer(state)
+                answer = self.planner.direct_answer(state)
+                if _qa_answer_is_unexecuted_change(state.user_input, answer):
+                    # The classifier called this "qa" but the model's own
+                    # answer just described a code change in prose instead
+                    # of applying it. Do not return the inert answer as if
+                    # the task were done — re-route into real execution.
+                    _agent_status(
+                        "Answer described a code change instead of applying it — switching to execution."
+                    )
+                    log("agent_qa_misclassification_corrected", {
+                        "input": state.user_input[:160],
+                        "discarded_answer_sample": answer[:200],
+                    })
+                    intent = "build"
+                else:
+                    state.status = "complete"
+                    return answer
 
             if intent == "read":
                 _agent_status("Reading code to answer — no files will be changed.")
@@ -193,10 +477,19 @@ class CodiAgent:
                 state.user_input, self.registry, state
             )
             if fast_output:
-                _agent_status("Completed with fast file action.")
-                log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
-                state.status = "complete"
-                return fast_output
+                state.current_step = state.user_input
+                fast_validation = self.validator.validate_current_write(state)
+                if fast_validation is not False:
+                    _agent_status("Completed and validated fast file action.")
+                    log("agent_fast_path", {"input": state.user_input[:80], "output": fast_output[:120]})
+                    state.status = "complete"
+                    return fast_output
+                # A fast action is not allowed to claim success if the file
+                # review rejects it. Continue through the normal plan/repair
+                # loop, which can fix the file rather than stopping here.
+                _agent_status("Fast file action failed validation; switching to repair plan.")
+                log("agent_fast_path_validation_failed", {"notes": state.validation_notes[:200]})
+                state.validation_repair_instruction = ""
 
             if intent == "edit" and state.context_scope != "full":
                 _agent_status("Making a targeted edit.")
@@ -256,46 +549,111 @@ class CodiAgent:
             # ── Phase 2: Create plan ────────────────────────────────────────────
             _agent_status("Creating an execution plan.")
             self.improver.create_plan(state, context)
+
+            # FIX: if the planning LLM call itself failed (connection error /
+            # timeout — see core/improver.py create_plan()), the plan text is
+            # tagged with "[PLANNING FAILED]" and plan_steps is empty. This
+            # must surface as a clear failure to the user, not silently
+            # proceed to write an empty plan.md and ask for confirmation on
+            # nothing.
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                _agent_status("Planning failed — LLM backend unreachable.")
+                log("agent_planning_backend_failure", {"plan": state.plan[:200]})
+                return (
+                    f"{state.plan}\n\n"
+                    "The planning step could not reach the configured LLM backend. "
+                    "Check that it is running and reachable (see config.py MODE / "
+                    "LLAMACPP_URL / OLLAMA_BASE_URL), then retry."
+                )
+
             if state.plan_steps:
                 _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
             log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan})
 
             # ── Plan confirmation gate ───────────────────────────────────────────
-            if not state.plan_confirmed:
-                plan_path = os.path.join(
-                    os.environ.get("CODI_WORKING_DIR", os.getcwd()), "plan.md"
-                )
-                plan_context = state.knowledge.plan_context()
-                lines = [f"# Plan: {state.plan}", "", "## Mission", analysis.goal, "", "## Understanding", state.knowledge.summary_for_prompt(), "", "## Architecture", "```json", str(plan_context["dependency_graph"]), "```", "", "## Files inspected"]
-                lines.extend(f"- {path}" for path in plan_context["files_inspected"])
-                lines.extend(["", "## Assumptions"] + [f"- {value}" for value in analysis.assumptions])
-                lines.extend(["", "## Unknowns"] + [f"- {value}" for value in plan_context["unknowns"]])
-                lines.extend(["", "## Risks"] + [f"- {value}" for value in plan_context["risks"]])
-                lines.extend(["", "## Execution Strategy"])
-                for i, s in enumerate(state.plan_steps, 1):
-                    lines.append(f"{i}. {s}")
-                lines.extend(["", "## Validation Strategy", "- Run the project test command or targeted tests.", "- Classify any failure, gather missing context where needed, and repair before retrying."])
-                try:
-                    with open(plan_path, "w", encoding="utf-8") as f:
-                        f.write("\n".join(lines) + "\n")
-                except Exception as e:
-                    log("plan_md_write_error", {"error": str(e)})
+            gate_message = self._confirm_plan_gate(state, analysis)
+            if gate_message is not None:
+                return gate_message
 
-                state.status = "awaiting_plan_confirmation"
-                _agent_status("Plan ready — waiting for user confirmation.")
-                return (
-                    f"Plan written to {plan_path}. Review it, then type 'y' to run it, "
-                    f"or give me a new instruction to replan."
-                )
+        elif state.status == "awaiting_plan_revision":
+            analysis = state.mission or self.mission.analyze(state.user_input)
+            feedback = state.plan_validation_feedback or state.plan_validation_notes
+            _agent_status("Regenerating the rejected plan with validator feedback.")
+            self.improver.create_plan(
+                state, state.knowledge.summary_for_prompt(), validator_feedback=feedback
+            )
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                return state.plan
+            gate_message = self._confirm_plan_gate(state, analysis)
+            if gate_message is not None:
+                return gate_message
 
         elif state.status == "awaiting_context":
             declined = state.context_response.lower() in {"n", "no", "proceed", "continue"}
+            approved_creates = _confirmed_missing_file_creation(
+                state.context_response, state.knowledge.unknowns
+            )
             if declined:
                 _agent_status("Proceeding with the available verified context at the user's request.")
                 log("context_declined", {"confidence": state.context_confidence})
+                analysis = state.mission
             else:
                 _agent_status("Rechecking project context with the user's additional details.")
-                analysis = state.mission or self.mission.analyze(state.user_input)
+                # A clarification can replace an earlier, incorrect assumption
+                # about which files exist. Re-analyse it as part of the task,
+                # then treat any user-named, verified paths as authoritative.
+                clarification_task = (
+                    f"{state.user_input}\n\nUser clarification: {state.context_response}"
+                )
+                # A response to CODI's own "should I create it?" question is
+                # authorization, not extra project context. Re-analysing
+                # "yes" used to put the same absent files back in
+                # files_needed and trap empty projects in this branch.
+                analysis = state.mission if approved_creates else self.mission.analyze(clarification_task)
+                state.mission = analysis
+                if not hasattr(self, "context_builder"):
+                    self.context_builder = ContextBuilder(self.registry)
+                if approved_creates:
+                    approved_set = {path.replace("\\", "/") for path in approved_creates}
+                    analysis.files_needed = [
+                        path for path in analysis.files_needed
+                        if path.replace("\\", "/") not in approved_set
+                    ]
+                    analysis.files_new = list(dict.fromkeys([
+                        *(analysis.files_new or []), *approved_creates
+                    ]))
+                    state.knowledge.unknowns = [
+                        item for item in state.knowledge.unknowns
+                        if not _MISSING_FILE_UNKNOWN_RE.match(str(item))
+                    ]
+                    analysis.unknowns = [
+                        item for item in analysis.unknowns
+                        if "requested file" not in str(item).lower()
+                    ]
+                    log("context_missing_files_creation_approved", {"files": approved_creates})
+                supplied_paths = list(dict.fromkeys(_FILE_MENTION_RE.findall(state.context_response)))
+                resolved_paths = self.context_builder.apply_user_supplied_paths(
+                    state.knowledge, supplied_paths
+                )
+                if resolved_paths:
+                    # The user corrected the target. Do not preserve stale
+                    # hallucinated component paths as hard requirements.
+                    state.knowledge.unknowns = [
+                        item for item in state.knowledge.unknowns
+                        if not item.startswith("Requested file is not present:")
+                    ]
+                    analysis.files_needed = resolved_paths
+                    analysis.files_new = []
+                    analysis.unknowns = [
+                        item for item in analysis.unknowns
+                        if "requested file" not in str(item).lower()
+                    ]
+                    log("context_clarification_paths_applied", {
+                        "paths": resolved_paths,
+                        "response": state.context_response[:200],
+                    })
                 context_state = self.context_builder.build(
                     analysis, history=state.history, knowledge=state.knowledge,
                     full_codebase=state.context_scope == "full",
@@ -312,6 +670,28 @@ class CodiAgent:
             context = state.knowledge.summary_for_prompt()
             _agent_status("Creating an execution plan.")
             self.improver.create_plan(state, context)
+            if state.plan.startswith("[PLANNING FAILED]"):
+                state.status = "failed"
+                _agent_status("Planning failed — LLM backend unreachable.")
+                log("agent_planning_backend_failure", {"plan": state.plan[:200]})
+                return (
+                    f"{state.plan}\n\n"
+                    "The planning step could not reach the configured LLM backend. "
+                    "Check that it is running and reachable, then retry."
+                )
+
+            if state.plan_steps:
+                _agent_status(f"Plan ready with {len(state.plan_steps)} step(s).")
+            log("agent_plan_ready", {"steps": len(state.plan_steps), "plan": state.plan, "source": "post_context_resume"})
+
+            # FIX: this is the gate that was previously MISSING here. Without
+            # it, a plan built after answering a context-clarification
+            # question was never written to plan.md and state.status went
+            # straight to "running" below — the user's "type y" had no real
+            # plan.md behind it and no genuine confirmation checkpoint.
+            gate_message = self._confirm_plan_gate(state, analysis)
+            if gate_message is not None:
+                return gate_message
 
         state.status = "running"
 
@@ -334,6 +714,30 @@ class CodiAgent:
             next_decision = self.improver.next_step(state)
             if not isinstance(next_decision, dict):
                 next_decision = {"step": str(next_decision), "done": False}
+
+            llm_error = next_decision.get("llm_error")
+            if llm_error:
+                # FIX: an empty step here means the LLM backend call itself
+                # failed — NOT that the planner decided the task is done.
+                # Previously this fell straight into `if done or not step:`
+                # below and silently reported "task complete" after a single
+                # failed connection attempt. Retry a bounded number of times,
+                # then fail explicitly with the real reason.
+                state.llm_backend_errors += 1
+                _agent_status(
+                    f"LLM backend error ({state.llm_backend_errors}/{_MAX_LLM_BACKEND_ERRORS}): {llm_error[:120]}"
+                )
+                log("agent_llm_backend_error", {
+                    "iteration": state.iteration,
+                    "count": state.llm_backend_errors,
+                    "error": llm_error[:300],
+                })
+                if state.llm_backend_errors >= _MAX_LLM_BACKEND_ERRORS:
+                    state.status = "failed"
+                    state.validation_notes = f"LLM backend unreachable after {state.llm_backend_errors} attempts: {llm_error}"
+                    break
+                continue  # retry — do not count this as a completed/failed step
+
             step = str(next_decision.get("step", "") or "")
             done = bool(next_decision.get("done", False))
 
@@ -349,6 +753,7 @@ class CodiAgent:
             state.current_step = step
 
             # Executor runs the step — once.
+            tool_results_before = len(state.tool_results)
             dispatch_result = self.executor.execute_step(step, state)
             reflection = self.reflector.reflect(dispatch_result, state.knowledge)
             state.reflections.append({"needs_context": reflection.needs_context, "reason": reflection.reason, "unknowns": reflection.unknowns})
@@ -368,18 +773,56 @@ class CodiAgent:
                 # the executor explicitly requested more evidence.
                 continue
 
+            # A write succeeding only proves bytes reached disk. Before this
+            # AST-sized step may advance, independently ask the validator LLM
+            # to compare the actual file content with the original request.
+            write_validation = self.validator.validate_current_write(
+                state, since=tool_results_before
+            )
+            if write_validation is False:
+                _agent_status("Written file did not satisfy the request; preparing a repair.")
+                log("agent_per_write_validation_failed", {
+                    "step": step[:120],
+                    "notes": state.validation_notes[:300],
+                })
+
             # Step-level completion is a deterministic fact: did the most
             # recent tool action for THIS step succeed? This is independent
             # of whether the overall task is finished — do not let the
             # semantic validator gate this.
-            if _step_succeeded(state, step):
-                state.mark_step_complete(step)
-                log("step_marked_complete", {"step": step[:120], "completed_count": len(state.completed_steps)})
+            #
+            # IMPORTANT: mark completion against state.target_plan_step, the
+            # ORIGINAL plan_steps entry this attempt was satisfying — NOT
+            # against `step`, the text actually sent to the executor. After
+            # a validation failure, core/improver.py's next_step() rewrites
+            # `step` into a repair/correction instruction ("edit_file the
+            # 'refusing to overwrite' issue in index.html", etc). If that
+            # rewritten text were what got appended to completed_steps, a
+            # SUCCESSFUL retry would still never match anything in
+            # state.plan_steps (an exact-string list) — the step remains
+            # permanently "not completed", the plan-progress validation
+            # guard keeps failing it, and the run silently burns every
+            # remaining iteration before reporting "Stopped before
+            # completion... 1 plan step(s) not yet completed" even though
+            # every tool call in the log actually succeeded.
+            if write_validation is not False and _step_succeeded(state, step):
+                completed_target = state.target_plan_step or step
+                state.mark_step_complete(completed_target)
+                log("step_marked_complete", {
+                    "step": completed_target[:120],
+                    "executed_as": step[:120] if step != completed_target else None,
+                    "completed_count": len(state.completed_steps),
+                })
 
             # Validator now answers ONLY "is the overall task done?" —
             # not "did this step succeed" (that's already been decided above).
-            _agent_status("Validating the result.")
-            is_valid = self.validator.validate(state)
+            # Keep a failed file review intact; the task-level validator would
+            # otherwise replace its repair instruction with plan-progress text.
+            if write_validation is False:
+                is_valid = False
+            else:
+                _agent_status("Validating overall plan progress.")
+                is_valid = self.validator.validate(state)
 
             if is_valid:
                 _agent_status("Validation passed.")
@@ -392,6 +835,32 @@ class CodiAgent:
                 state.repair_attempts[repair_key] = state.repair_attempts.get(repair_key, 0) + 1
                 if state.repair_attempts[repair_key] >= 3:
                     state.status = "awaiting_context"
+                    target_matches = _FILE_MENTION_RE.findall(
+                        state.target_plan_step or state.current_step or ""
+                    )
+                    target_hint = target_matches[0] if target_matches else "the intended target file"
+                    notes_lower = (state.validation_notes or "").lower()
+                    if "noop" in notes_lower:
+                        question = (
+                            f"Should I create or update {target_hint} exactly as the approved plan says? "
+                            "If not, tell me which existing file should own this behavior."
+                        )
+                    elif "does not exist" in notes_lower:
+                        question = (
+                            f"I could not find {target_hint}. Should I create it, or what exact existing file should I use instead?"
+                        )
+                    else:
+                        question = (
+                            f"For {target_hint}, what behavior or dependency should CODI use that is not currently in the project?"
+                        )
+                    state.clarification_prompt = (
+                        "I paused after three unsuccessful repair attempts. "
+                        f"The last failure was: {state.validation_notes}\n\n"
+                        f"Specific question: {question}\n\n"
+                        "Reply with the answer and I will resume from the failing step."
+                    )
+                    log("agent_clarification_required", {"attempts": 3, "notes": state.validation_notes[:200]})
+                    return state.clarification_prompt
                     state.clarification_prompt = (
                         "I could not safely complete this after three repair attempts. "
                         f"The last failure was: {state.validation_notes}\n\n"
@@ -484,7 +953,12 @@ class CodiAgent:
         step = state.user_input
         state.current_step = step
 
+        tool_results_before = len(state.tool_results)
         self.executor.execute_step(step, state)
+
+        if self.validator.validate_current_write(state, since=tool_results_before) is False:
+            log("agent_edit_per_write_validation_failed", {"notes": (state.validation_notes or "")[:160]})
+            return None
 
         if not _step_succeeded(state):
             log("agent_edit_step_failed", {"step": step[:120]})

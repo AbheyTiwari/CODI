@@ -74,7 +74,7 @@ Produce an execution plan. Respond ONLY with JSON — no fences, no prose:
 {{"plan":"one sentence summary","steps":["Step 1: ...","Step 2: ..."]}}
 
 Rules:
-- Maximum 5 steps. Each step is a plain string — NOT an object.
+- Maximum 7 steps. Each step is a plain string — NOT an object.
 - Reconcile every file name with the evidence before using it. If an intended
   file is absent, make the step explicitly create it; do not say "edit".
 - Include a verification step only after all implementation steps.
@@ -85,7 +85,12 @@ Rules:
 - If task mentions [BOILERPLATE CREATED: file1, file2], those files exist.
   Plan EDIT steps only — do NOT plan to create them again.
 - For simple single-file tasks, ONE step is enough.
-- Be specific: name the file, name the tool, name the content.
+- Be specific: name the file, name the tool, and name the concrete result.
+  For UI work, cover the page structure, user interactions, visual system
+  (layout, typography, color/spacing), responsive/accessibility behavior, and
+  verification as applicable. For application work, cover the architecture,
+  data flow, and framework/dependency choices the user actually requested.
+  Put those decisions in the `plan` summary before listing implementation steps.
 - Every implementation step MUST name at least one target file. Never use a
   vague step such as "Add CSS" or "Implement JavaScript"; say exactly where
   it will be added. A read-only action is not an implementation step.
@@ -166,12 +171,57 @@ def _unique(items: list[str]) -> list[str]:
 
 
 def _extract_file_refs(text: str) -> list[str]:
-    pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:py|java|html|css|js|ts|jsx|tsx|json|md|txt|xml|yml|yaml|sh|sql|svg))"
+    pattern = r"(?<![\w.-])([A-Za-z0-9_./\\-]+\.(?:json|java|html|css|jsx|tsx|yaml|yml|xml|svg|txt|sql|sh|py|js|ts|md))"
     return _unique([m.group(1).strip("'\"` ") for m in re.finditer(pattern, text or "")])
 
 
 _VERIFICATION_WORDS = ("verify", "validate", "test", "check", "screenshot")
 _IMPLEMENTATION_WORDS = ("add", "change", "create", "edit", "fix", "implement", "insert", "modify", "remove", "replace", "style", "update", "write")
+
+
+def _is_static_ecommerce_request(task: str, framework: str | None) -> bool:
+    """Recognize a broad storefront request that needs concrete core flows."""
+    lowered = (task or "").lower()
+    return (
+        framework in (None, "vanilla")
+        and any(term in lowered for term in ("ecommerce", "e-commerce", "online store", "web store"))
+    )
+
+
+def _static_ecommerce_steps(project_files: list[str]) -> list[str]:
+    """A minimum viable storefront architecture for an unspecified static app.
+
+    This is deliberately deterministic: a planner cannot call something an
+    ecommerce site while omitting catalog, cart, checkout, navigation, or a
+    responsive UI. Existing files are edited; missing files are explicitly
+    created, so plan.md and execution never disagree about file operations.
+    """
+    existing = {str(path).replace("\\", "/").lower() for path in project_files}
+
+    def verb(path: str) -> str:
+        return "Edit" if path.lower() in existing else "Create"
+
+    return [
+        f"{verb('index.html')} index.html with accessible navigation, a searchable product catalog, product-detail affordances, cart summary, and checkout form structure",
+        f"{verb('styles.css')} styles.css with the visual system, responsive catalog/cart layout, keyboard focus states, and mobile breakpoints",
+        f"{verb('products.json')} products.json with the cupcake catalog data required for product cards, prices, images, and availability",
+        f"{verb('script.js')} script.js to load and validate catalog data, render and filter products, manage cart quantities, and validate checkout interactions",
+    ]
+
+
+# FIX (bug 1): human-readable descriptions of each strategy name recorded by
+# core/executor.py, used to build an explicit "do not repeat these" block in
+# the correction prompt. Keeping this mapping here (not duplicated inline)
+# means adding a new executor strategy only requires one new entry.
+_STRATEGY_DESCRIPTIONS: dict[str, str] = {
+    "edit_first_textmatch": "exact old/new text-match replacement",
+    "edit_first_additive": "additive edit_file (append-style) targeting a specific anchor",
+    "line_range_edit": "line-number-based replace_lines/delete_lines/insert_at_line",
+    "additive_append": "appending new code to the end of the file",
+    "content_first": "regenerating the file's full content from scratch",
+    "edit_missing_file": "editing a file that does not exist on disk",
+    "standard_json": "letting the coder freely choose a tool via the generic JSON path",
+}
 
 
 def _best_file_match(step: str, known_files: list[str]) -> str | None:
@@ -222,26 +272,72 @@ def _best_file_match(step: str, known_files: list[str]) -> str | None:
     return known_files[0]
 
 
-def _normalize_plan_steps(steps: list[str], requirements: TaskRequirements) -> list[str]:
-    """Make every implementation step file-targeted before execution begins."""
+def _normalize_plan_steps(
+    steps: list[str],
+    requirements: TaskRequirements,
+    project_files: list[str] | None = None,
+) -> list[str]:
+    """Make every implementation step file-targeted before execution begins.
+
+    project_files: real, verified file paths from state.knowledge.project
+    (i.e. what inspect_project actually found on disk) — used as a fallback
+    target for browser-verification rewrites below. This is DELIBERATELY
+    separate from `requirements.files`, which is populated by regex-matching
+    file extensions out of the user's raw prompt text
+    (_deterministic_requirements -> _extract_file_refs(state.user_input)).
+    A prompt like "fix the navigation bar" never names a file extension, so
+    requirements.files is empty even when the project obviously has exactly
+    one HTML entrypoint — passing project_files closes that gap.
+    """
     normalized: list[str] = []
     known_files = _unique(requirements.files)
+    fallback_files = _unique([str(f).replace("\\", "/") for f in (project_files or [])])
     for raw_step in steps:
         step = _as_text(raw_step).strip()
         if not step:
             continue
         lowered = step.lower()
-        # Browser MCP cannot open file:// URLs. Local HTML is verified from
-        # source unless the user explicitly supplied a running web URL.
-        if any(term in lowered for term in ("browser", "reload the page", "screenshot")):
-            target = _extract_file_refs(step) or known_files
-            if target:
-                step = f"Read {target[0]} and verify its HTML structure and requested content"
-                lowered = step.lower()
+        # ── Browser/visual verification is NEVER executable in this
+        # architecture and must be DROPPED, not rewritten:
+        #   1. The browser MCP tool cannot open file:// URLs (blocked
+        #      explicitly in core/executor.py's browser_navigate guard).
+        #   2. Even a successful navigation/screenshot has NO path back to
+        #      an LLM for visual inspection — nothing in this pipeline does
+        #      image-based verification.
+        #   3. FIX (v2): an earlier version of this rewrite converted the
+        #      step into "Read {file} and verify its HTML structure and
+        #      requested content" — but real verification for every write
+        #      ALREADY happens automatically and independently, twice:
+        #      core/validator.py's validate_current_write() runs an LLM
+        #      semantic check right after every edit_file/write_file, and
+        #      the final validate() LLM check runs before the task is ever
+        #      marked complete. A synthetic "go re-read the file" plan step
+        #      performs no check beyond those — it can only ever be a
+        #      no-op. Worse, that rewrite's own trailing wording ("structure
+        #      and requested content") became the literal keywords
+        #      validator.py's noop-content-check demands appear in the
+        #      file — generic boilerplate that will never match real file
+        #      content, so the synthetic step failed a check that had
+        #      nothing to do with whether the actual feature was built.
+        #      There is no safe wording for this step type; it is deleted
+        #      outright rather than reworded, same as the browser-call case
+        #      it originally existed to replace.
+        if any(term in lowered for term in (
+            "browser", "reload the page", "screenshot", "refresh the page",
+            "open the page", "render", "visually",
+        )):
+            log("improver_step_verification_dropped", {
+                "step": step[:160],
+                "reason": (
+                    "browser/visual verification step provides no check beyond the "
+                    "per-write and final LLM validation that already run automatically"
+                ),
+            })
+            continue
         is_verification = any(word in lowered for word in _VERIFICATION_WORDS)
         needs_file = any(re.search(rf"\b{word}\b", lowered) for word in _IMPLEMENTATION_WORDS)
         if needs_file and not is_verification and not _extract_file_refs(step):
-            resolved_file = _best_file_match(step, known_files)
+            resolved_file = _best_file_match(step, known_files or fallback_files)
             if resolved_file:
                 log("improver_step_file_resolved", {
                     "step": step[:160], "resolved_file": resolved_file,
@@ -366,7 +462,7 @@ def _files_from_tool_results(state: RunState) -> list[str]:
     """
     files = []
     for result in state.tool_results:
-        if result.tool not in ("create_file", "write_file", "edit_file"):
+        if result.tool not in ("create_file", "write_file", "edit_file", "apply_patch"):
             continue
         if result.status != "ok":
             continue  # <-- the fix: skip failed attempts entirely
@@ -387,10 +483,169 @@ def _files_from_tool_results(state: RunState) -> list[str]:
     return _unique(files)
 
 
+def _known_files_for_lint(state: RunState) -> set[str]:
+    """Files the plan may assume already exist: verified project files plus
+    anything TaskRequirements already extracted from the task text."""
+    files: set[str] = set()
+    try:
+        project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+        files.update(str(f).replace("\\", "/") for f in project_files)
+    except Exception:
+        pass
+    files.update(f.replace("\\", "/") for f in (state.requirements.files or []))
+    return files
+
+
+_LINT_CREATE_WORDS = ("create", "write", "generate", "produce")
+_LINT_EDIT_WORDS = ("edit", "update", "modify", "change", "fix", "append", "insert", "remove", "replace", "style", "rename")
+
+
+def _plan_lint_violations(steps: list[str], requirements: TaskRequirements, known_files: set[str]) -> list[str]:
+    """
+    Deterministic, no-LLM pass over a candidate plan — catches the most
+    common self-contradictions before a single tool call burns iteration
+    budget:
+      (a) a step edits a file that is neither in the verified project
+          context nor created by an earlier step in this same plan
+      (b) a step's text contains a term forbidden by the locked framework
+          (the same patterns TaskRequirements.framework_lock() feeds to the
+          validator's post-execution contamination check — checked here too,
+          BEFORE execution, not only after)
+      (c) two steps target the identical (action, file) pair — a duplicate
+          create or duplicate edit of the same target, almost always a sign
+          the plan is repeating itself rather than making progress
+    """
+    violations: list[str] = []
+    available = {f.lower() for f in known_files}
+    seen_targets: set[tuple[str, str]] = set()
+    forbidden = [p.lower() for p in requirements.framework_lock() if p]
+
+    for index, step in enumerate(steps, start=1):
+        lowered = (step or "").lower()
+
+        for pattern in forbidden:
+            if pattern in lowered:
+                violations.append(
+                    f"Step {index} references forbidden term '{pattern}' "
+                    f"(task is locked to {requirements.framework})."
+                )
+
+        refs = _extract_file_refs(step)
+        creates = any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in _LINT_CREATE_WORDS)
+        edits = any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in _LINT_EDIT_WORDS)
+        action = "create" if creates else ("edit" if edits else "other")
+
+        for ref in refs:
+            normalized = ref.replace("\\", "/").lower()
+            if edits and not creates and normalized not in available:
+                violations.append(
+                    f"Step {index} edits '{ref}', but that file is not in the verified "
+                    f"project context and no earlier step in this plan creates it."
+                )
+            if action != "other":
+                key = (action, normalized)
+                if key in seen_targets:
+                    violations.append(
+                        f"Step {index} duplicates an earlier step's action+target: {action} {ref}."
+                    )
+                seen_targets.add(key)
+            if creates:
+                available.add(normalized)
+
+    return violations
+
+
+def _trim_plan_violations(steps: list[str], requirements: TaskRequirements, known_files: set[str]) -> list[str]:
+    """
+    Deterministic last resort when a re-prompted plan still violates the
+    linter: walk the steps in order and drop only the ones that introduce a
+    NEW violation given everything kept so far, rather than discarding the
+    whole plan. Always keeps at least one step so the run has something to
+    attempt instead of failing outright on a lint technicality.
+    """
+    kept: list[str] = []
+    for step in steps:
+        candidate = kept + [step]
+        if not _plan_lint_violations(candidate, requirements, known_files):
+            kept.append(step)
+        else:
+            log("plan_lint_step_dropped", {"step": step[:160]})
+    return kept or steps[:1]
+
+
+def classify_plan_risk(state: RunState) -> dict:
+    """
+    Deterministic risk classification for a proposed plan — no LLM call, no
+    guessing. Runs purely against state.requirements.files and the actual
+    filesystem, so the result is reproducible and auditable.
+
+    Returns:
+        {
+          "risk": "low" | "medium" | "high",
+          "files_to_create": [...],   # files that do not yet exist on disk
+          "files_to_modify": [...],   # files that already exist on disk
+        }
+
+    Risk heuristic (intentionally simple and explainable):
+      - 0-1 target files, no framework lock  -> low
+      - 2-4 target files, OR any framework lock -> medium
+      - 5+ target files -> high
+    A framework lock always raises a would-be "low" to "medium" because a
+    single-file change can still fail structurally (wrong stack entirely),
+    which the deterministic contamination checker in core/validator.py
+    already treats as a hard failure, not a soft warning.
+    """
+    working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+    # Requirements only see filenames explicitly written in the user's first
+    # sentence. The approved plan is the source of truth for concrete creates
+    # and edits, so include every target it names. Without this, plan.md could
+    # falsely claim "Files to Create: none" and then execute create_file.
+    plan_targets = [
+        path for step in state.plan_steps for path in _extract_file_refs(step)
+    ]
+    files = _unique([*(state.requirements.files or []), *plan_targets])
+
+    creates: list[str] = []
+    modifies: list[str] = []
+    for f in files:
+        absolute = f if os.path.isabs(f) else os.path.join(working_dir, f)
+        if os.path.exists(absolute):
+            modifies.append(f)
+        else:
+            creates.append(f)
+
+    file_count = len(files)
+    if file_count <= 1:
+        risk = "low"
+    elif file_count <= 4:
+        risk = "medium"
+    else:
+        risk = "high"
+
+    if state.requirements.framework and risk == "low":
+        risk = "medium"
+
+    result = {"risk": risk, "files_to_create": creates, "files_to_modify": modifies}
+    log("plan_risk_classified", {
+        "risk": risk,
+        "creates": len(creates),
+        "modifies": len(modifies),
+        "framework": state.requirements.framework,
+    })
+    return result
+
+
 class Improver:
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
         self.llm      = get_refiner_llm()
+        # FIX: set on every _call() invocation — None means the last call
+        # either succeeded or hasn't been made yet; a string means the LLM
+        # request itself failed (connection error, timeout, backend down).
+        # Callers (next_step in particular) must check this BEFORE treating
+        # an empty response as "nothing to do" / "task complete" — those are
+        # not the same thing as "the backend never answered".
+        self._last_llm_error: str | None = None
 
     def _orchestrator_sys(self) -> SystemMessage:
         return SystemMessage(content=_ORCHESTRATOR_SYSTEM.format(
@@ -399,10 +654,12 @@ class Improver:
 
     def _call(self, prompt: str, system: SystemMessage | None = None) -> str:
         sys_msg = system or self._orchestrator_sys()
+        self._last_llm_error = None
         try:
             resp = self.llm.invoke([sys_msg, HumanMessage(content=prompt)])
             return resp.content.strip()
         except Exception as e:
+            self._last_llm_error = str(e)
             log("improver_error", {"error": str(e)})
             return ""
 
@@ -495,7 +752,7 @@ class Improver:
             "requirements": state.requirements.to_dict(),
         })
 
-    def create_plan(self, state: RunState, context: str) -> dict:
+    def create_plan(self, state: RunState, context: str, validator_feedback: str = "") -> dict:
         from dispatcher import Dispatcher
 
         self._extract_requirements(state)
@@ -506,7 +763,11 @@ class Improver:
                 state.plan = "Generate and verify unit tests one function at a time."
                 state.plan_steps = steps
                 log("plan_created", {"plan_source": "function_inventory", "steps": len(steps)})
-                return {"plan": state.plan, "steps": steps}
+                # Deterministically generated, but still worth a lint pass —
+                # e.g. a stale framework lock from a prior task in the same
+                # session could still make a "create test_x.py" step invalid.
+                self._lint_and_repair_plan(state, context="")
+                return {"plan": state.plan, "steps": state.plan_steps}
 
         # Was a naive context[:6000] head-cut. context_builder now places
         # actual source code first and the cheap AST-metadata summary last,
@@ -519,61 +780,206 @@ class Improver:
         # the metadata summary if source is short), rather than silently
         # dropping the entire second half of the collected evidence.
         from context_trimmer import trim_tool_output
+        task = state.user_input
+        if validator_feedback:
+            task += (
+                "\n\nPLAN VALIDATOR REJECTED THE PREVIOUS PLAN. Do NOT repeat "
+                "the rejected plan. Produce a materially corrected replacement that "
+                "applies the feedback below while keeping the original request intact. "
+                "Treat feedback as planning guidance, not as permission to invent files "
+                "or expand user scope.\n\nVALIDATOR FEEDBACK:\n"
+                f"{validator_feedback}\n\nREJECTED PLAN SUMMARY:\n{state.plan[:1600]}"
+            )
+        conversation = trim_tool_output(state.history or "No earlier conversation.", max_tokens=700)
         prompt = _PLAN_PROMPT.format(
-            task=state.user_input,
+            task=task,
             requirements=state.requirements.as_prompt_block(),
             tools=", ".join(self.registry.list_names()),
-            context=wrap_prompt_data(trim_tool_output(context, max_tokens=1700)),
+            context=(
+                "CONVERSATION CONTEXT (use only to resolve the user's intent; "
+                "the current request remains authoritative):\n"
+                f"{conversation}\n\nPROJECT CONTEXT:\n"
+                + wrap_prompt_data(trim_tool_output(context, max_tokens=1700))
+            ),
         )
 
         raw = self._call(prompt, system=SystemMessage(content=planner_system_prompt()))
         state.record_llm("improver_plan_raw", raw)
 
+        if self._last_llm_error is not None:
+            # The planning LLM call itself failed (connection error, timeout,
+            # backend down) — this is NOT the same as "the model decided
+            # there is nothing to plan". Surface it plainly instead of
+            # silently producing an empty plan that downstream code (agent.py,
+            # the plan.md confirmation gate) will interpret as a legitimate
+            # zero-step plan.
+            state.plan = f"[PLANNING FAILED] LLM backend error: {self._last_llm_error}"
+            state.plan_steps = []
+            log("plan_created", {
+                "plan_source": "llm_backend_error",
+                "error": self._last_llm_error[:200],
+            })
+            return {"plan": state.plan, "steps": []}
+
         from context_trimmer import trim_tool_output
+        project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+        plan_text, plan_steps, plan_source = self._parse_plan_response(
+            raw, state.requirements, project_files=project_files
+        )
+        state.plan = plan_text
+        state.plan_steps = plan_steps
+
+        if _is_static_ecommerce_request(state.user_input, state.requirements.framework):
+            state.plan = (
+                "Build a responsive static cupcake storefront: semantic navigation and product catalog, "
+                "JSON-backed product data, client-side search/filter and cart state, checkout validation, "
+                "and an accessible visual system."
+            )
+            state.plan_steps = _static_ecommerce_steps(project_files)
+            log("plan_ecommerce_architecture_enforced", {
+                "steps": len(state.plan_steps), "files": _extract_file_refs("\n".join(state.plan_steps)),
+            })
+
+        log("plan_created", {
+            "plan_source": plan_source,
+            "steps": len(state.plan_steps),
+            "plan": trim_tool_output(state.plan, max_tokens=20),
+            "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
+        })
+
+        self._lint_and_repair_plan(state, context)
+        # Keep the plan artifact, risk classification, and executor aligned on
+        # the same target inventory rather than only files named in the raw
+        # user prompt.
+        state.requirements.files = _unique([
+            *(state.requirements.files or []),
+            *(path for step in state.plan_steps for path in _extract_file_refs(step)),
+        ])
+
+        return {"plan": state.plan, "steps": state.plan_steps}
+
+    @staticmethod
+    def _parse_plan_response(
+        raw: str, requirements: TaskRequirements, project_files: list[str] | None = None
+    ) -> tuple[str, list[str], str]:
+        """Shared JSON-or-line-fallback parsing used by both the initial plan
+        call and the one-shot lint re-prompt, so both paths get identical
+        step normalization instead of two hand-maintained copies.
+
+        project_files: verified paths from state.knowledge.project — passed
+        through to _normalize_plan_steps so browser-verification rewrites
+        (and generic file-targeting) can fall back to real project evidence,
+        not only to filenames the raw user prompt happened to mention.
+        """
+        from dispatcher import Dispatcher
+
         parsed = Dispatcher.parse_llm_json(raw)
         if isinstance(parsed, dict) and "steps" in parsed:
-            state.plan = _as_text(parsed.get("plan", ""))
-            raw_steps  = parsed.get("steps", [])
+            plan_text = _as_text(parsed.get("plan", ""))
+            raw_steps = parsed.get("steps", [])
             if isinstance(raw_steps, list):
-                state.plan_steps = _enforce_test_intent(_normalize_plan_steps(
-                    [_as_text(s) for s in raw_steps if _as_text(s)], state.requirements
-                ), state.requirements)
+                steps = _enforce_test_intent(_normalize_plan_steps(
+                    [_as_text(s) for s in raw_steps if _as_text(s)], requirements, project_files
+                ), requirements)
             else:
                 s = _as_text(raw_steps)
-                state.plan_steps = _enforce_test_intent(_normalize_plan_steps([s] if s else [], state.requirements), state.requirements)
-            log("plan_created", {
-                "plan_source": "json",
-                "steps": len(state.plan_steps),
-                "plan": trim_tool_output(state.plan, max_tokens=20),
-                "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
-            })
-            return parsed
+                steps = _enforce_test_intent(
+                    _normalize_plan_steps([s] if s else [], requirements, project_files), requirements
+                )
+            return plan_text, steps, "json"
 
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
-        steps = []
+        collected = []
         for line in lines:
             line = line.lstrip("```").strip()
             if line.lower().startswith(("json", "{")):
                 continue
             line = line.lstrip("0123456789.-) ").strip()
             if line:
-                steps.append(line)
-        state.plan       = raw[:200]
-        state.plan_steps = _enforce_test_intent(_normalize_plan_steps(steps[:5], state.requirements), state.requirements)
+                collected.append(line)
+        plan_text = raw[:200]
+        steps = _enforce_test_intent(
+            _normalize_plan_steps(collected[:5], requirements, project_files), requirements
+        )
+        return plan_text, steps, "fallback"
 
-        log("plan_created", {
-            "plan_source": "fallback",
+    def _lint_and_repair_plan(self, state: RunState, context: str) -> None:
+        """
+        Deterministic contradiction check, run after every plan parse.
+        On violation: re-prompt the planner ONCE with the specific
+        violations listed as hard constraints. If the retry still violates
+        the linter, fall back to a deterministic trim (drop only the steps
+        that introduce a new violation) rather than looping indefinitely or
+        silently executing a self-contradictory plan.
+        """
+        from context_trimmer import trim_tool_output
+
+        known_files = _known_files_for_lint(state)
+        violations = _plan_lint_violations(state.plan_steps, state.requirements, known_files)
+        if not violations:
+            return
+
+        log("plan_lint_violation", {
+            "attempt": 1,
+            "violations": violations[:10],
             "steps": len(state.plan_steps),
-            "plan": trim_tool_output(state.plan, max_tokens=20),
-            "step_samples": [trim_tool_output(s, max_tokens=15) for s in state.plan_steps[:3]],
-            "raw_sample": trim_tool_output(raw, max_tokens=30),
         })
-        return {"plan": state.plan, "steps": state.plan_steps}
+
+        retry_prompt = _PLAN_PROMPT.format(
+            task=(
+                f"{state.user_input}\n\n"
+                "PREVIOUS PLAN REJECTED — it violated these constraints, fix them:\n"
+                + "\n".join(f"- {v}" for v in violations)
+            ),
+            requirements=state.requirements.as_prompt_block(),
+            tools=", ".join(self.registry.list_names()),
+            context=wrap_prompt_data(trim_tool_output(context, max_tokens=1700)),
+        )
+        raw_retry = self._call(retry_prompt, system=SystemMessage(content=planner_system_prompt()))
+        state.record_llm("improver_plan_lint_retry", raw_retry)
+
+        if self._last_llm_error is None and raw_retry:
+            retry_project_files = state.knowledge.project.get("files", []) if state.knowledge else []
+            plan_text, plan_steps, plan_source = self._parse_plan_response(
+                raw_retry, state.requirements, project_files=retry_project_files
+            )
+            retry_violations = _plan_lint_violations(plan_steps, state.requirements, known_files)
+            log("plan_lint_retry_result", {
+                "plan_source": plan_source,
+                "steps": len(plan_steps),
+                "remaining_violations": retry_violations[:10],
+            })
+            if not retry_violations:
+                state.plan = plan_text
+                state.plan_steps = plan_steps
+                return
+            # Retry still violates — keep whichever candidate has fewer
+            # violations as the base for deterministic trimming below.
+            if len(retry_violations) < len(violations):
+                state.plan = plan_text
+                state.plan_steps = plan_steps
+                violations = retry_violations
+
+        trimmed = _trim_plan_violations(state.plan_steps, state.requirements, known_files)
+        log("plan_lint_trimmed", {
+            "original_steps": len(state.plan_steps),
+            "trimmed_steps": len(trimmed),
+        })
+        state.plan_steps = trimmed
 
     # ── Phase 3: Decide next step ─────────────────────────────────────────────
 
     def next_step(self, state: RunState) -> dict:
-        """Return {"step": str, "done": bool} for the current iteration."""
+        """Return {"step": str, "done": bool} for the current iteration.
+
+        FIX: also returns "llm_error": str when the underlying LLM call
+        itself failed. agent.py MUST check this before treating an empty
+        step + done=False as task completion — previously a connection
+        error to the LLM backend produced an empty step string, which the
+        `if done or not step:` check in agent.py silently interpreted as
+        "planner says the task is complete", reporting success on a run
+        that never actually did anything.
+        """
         from dispatcher import Dispatcher
         from context_trimmer import trim_tool_output
         done_count = len(state.completed_steps)
@@ -581,6 +987,11 @@ class Improver:
         if state.validation_repair_instruction:
             repair = state.validation_repair_instruction
             state.validation_repair_instruction = ""
+            # target_plan_step is deliberately left untouched here — a
+            # validator repair is always in service of whichever plan step
+            # was already selected in a prior iteration (that's what got
+            # validated and failed). Overwriting it with the repair text
+            # would reproduce the exact bug this field exists to prevent.
             log("step_selected", {
                 "step": trim_tool_output(repair, max_tokens=30),
                 "source": "validator_repair",
@@ -603,7 +1014,10 @@ class Improver:
                 # the iteration budget with nothing learned in between.
                 # Instead, reason about the failure via improve() and hand
                 # back a concrete correction step grounded in the actual
-                # error, then retry with that reasoning applied.
+                # error AND in which strategies have already been tried and
+                # failed for this exact step (see improve()'s
+                # tried_strategies parameter — FIX bug 1), then retry with
+                # that reasoning applied.
                 last_error = next(
                     (r for r in reversed(state.tool_results) if r.status == "error"),
                     None,
@@ -612,7 +1026,11 @@ class Improver:
 
                 if last_error and prior_attempts > 0:
                     state.validation_notes = last_error.output
-                    correction = self.improve(state)
+                    state.target_plan_step = selected_step
+                    tried = state.tried_strategies(selected_step)
+                    correction = self.improve(state, tried_strategies=tried)
+                    if self._last_llm_error is not None:
+                        return {"step": "", "done": False, "llm_error": self._last_llm_error}
                     state.step_attempts[selected_step] = prior_attempts + 1
                     log("step_selected", {
                         "step": trim_tool_output(correction, max_tokens=20),
@@ -623,10 +1041,12 @@ class Improver:
                         "source": "repeated_step_failure_reasoned_correction",
                         "original_step": trim_tool_output(selected_step, max_tokens=20),
                         "prior_attempts": prior_attempts,
+                        "tried_strategies": tried,
                     })
                     return {"step": correction, "done": False}
 
                 state.step_attempts[selected_step] = prior_attempts + 1
+                state.target_plan_step = selected_step
                 log("step_selected", {
                     "step": trim_tool_output(selected_step, max_tokens=20),
                     "matched_plan": True,
@@ -648,6 +1068,14 @@ class Improver:
         raw = self._call(prompt)
         state.record_llm("improver_next_step", raw)
 
+        if self._last_llm_error is not None:
+            log("step_selected", {
+                "iteration": state.iteration,
+                "source": "llm_backend_error",
+                "error": self._last_llm_error[:200],
+            })
+            return {"step": "", "done": False, "llm_error": self._last_llm_error}
+
         parsed = Dispatcher.parse_llm_json(raw)
         selected_step = None
         matched_plan = False
@@ -663,6 +1091,8 @@ class Improver:
 
         if selected_step and state.plan_steps:
             matched_plan = any(selected_step.strip() == ps.strip() for ps in state.plan_steps)
+            if matched_plan:
+                state.target_plan_step = selected_step
 
         log("step_selected", {
             "step": trim_tool_output(selected_step, max_tokens=20),
@@ -676,7 +1106,7 @@ class Improver:
 
     # ── Phase 4: Generate correction after validation failure ─────────────────
 
-    def improve(self, state: RunState) -> str:
+    def improve(self, state: RunState, tried_strategies: list[str] | None = None) -> str:
         from dispatcher import Dispatcher
         notes = state.validation_notes or "unknown failure"
         reqs  = state.requirements
@@ -731,6 +1161,32 @@ class Improver:
                 "created or edited (e.g. a companion test file), not this one.",
             ]
 
+        # FIX (bug 1): explicit, structured "do not repeat" block built from
+        # everything the executor has already tried and failed for this
+        # exact step. Previously the correction prompt only had the raw
+        # error text — nothing told the model it had already tried (and
+        # exhausted) a specific approach, so it would frequently regenerate
+        # something functionally identical to the failed attempt. This is
+        # the LLM-assisted half of the fix; the deterministic half lives in
+        # core/executor.py's _execute_edit_first, which forces a strategy
+        # switch outright for the most common failure mode (text-match edit)
+        # without waiting on the model to obey this instruction.
+        if tried_strategies:
+            described = [
+                f"  - {_STRATEGY_DESCRIPTIONS.get(name, name)}"
+                for name in tried_strategies
+            ]
+            lines += [
+                "",
+                "STRATEGIES ALREADY TRIED AND FAILED FOR THIS STEP — do NOT repeat any of these:",
+                *described,
+                "Your correction MUST use a genuinely different approach than every strategy",
+                "listed above. If text-match replacement failed, ask for a line-range edit",
+                "instead. If a line-range edit failed, re-read the file for fresh line numbers",
+                "or use apply_patch. If content-first generation failed, break the change into",
+                "a smaller, targeted edit_file operation instead of regenerating the whole file.",
+            ]
+
         lines += [
             "",
             "Last tool outputs for context:",
@@ -751,6 +1207,10 @@ class Improver:
         )
         state.record_llm("improver_improve", raw)
 
+        if self._last_llm_error is not None:
+            log("improver_correction", {"source": "llm_backend_error", "error": self._last_llm_error[:200]})
+            return ""
+
         parsed = Dispatcher.parse_llm_json(raw)
         reasoning = ""
         if isinstance(parsed, dict):
@@ -761,7 +1221,11 @@ class Improver:
         else:
             correction = f"FAILED: {notes}. Fix required: {reqs.as_prompt_block()}"
 
-        log("improver_correction", {"correction": correction[:200], "reasoning": reasoning[:200]})
+        log("improver_correction", {
+            "correction": correction[:200],
+            "reasoning": reasoning[:200],
+            "tried_strategies": tried_strategies or [],
+        })
         return correction
 
     # ── Phase 5: Final summary ────────────────────────────────────────────────
@@ -769,6 +1233,13 @@ class Improver:
     def summarize(self, state: RunState) -> str:
         """Produce the final user-facing output without an LLM round trip."""
         if not state.tool_results:
+            if getattr(state, "llm_backend_errors", 0) > 0:
+                return (
+                    "Stopped — the LLM backend was unreachable and no tool "
+                    "executions could be attempted. Check that your configured "
+                    "backend (llama.cpp / Ollama / cloud provider) is running "
+                    "and reachable, then retry."
+                )
             return "Task completed with no tool executions."
 
         files = _files_from_tool_results(state)

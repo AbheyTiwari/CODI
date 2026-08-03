@@ -13,7 +13,7 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-_LAUNCH_DIR = os.getcwd()
+_LAUNCH_DIR = os.path.realpath(os.getcwd())
 os.environ.setdefault("CODI_WORKING_DIR", _LAUNCH_DIR)
 
 _path_hash  = hashlib.md5(_LAUNCH_DIR.encode()).hexdigest()[:10]
@@ -126,7 +126,7 @@ def startup_sequence():
     console.print()
 
 # ── Auto-index ────────────────────────────────────────────────────────────────
-def _auto_index(target_dir: str = None):
+def _auto_index(target_dir: str = None, quiet: bool = False):
     """Index target_dir (defaults to current CODI_WORKING_DIR)."""
     index_dir = target_dir or os.environ.get("CODI_WORKING_DIR", _LAUNCH_DIR)
     chroma    = os.environ.get("CODI_CHROMA_DIR", _chroma_dir)
@@ -141,17 +141,36 @@ def _auto_index(target_dir: str = None):
             console.print(Text("  ⚠  >5000 files — skipping auto-index. Run /index . manually.", style="yellow"))
             return
     t = _t()
-    with console.status(Text(f"  indexing {os.path.basename(index_dir)}/...", style="dim"),
-                        spinner="dots", spinner_style=t["accent"]):
+    label = os.path.basename(index_dir)
+    if quiet:
+        # Rich Live output from a background thread fights prompt_toolkit's
+        # redraw buffer, making typed input appear to disappear. Auto-index
+        # silently; an explicit /index still displays normal progress.
         try:
-            index_codebase(index_dir, db_path=chroma)
+            index_codebase(index_dir, db_path=chroma, quiet=True)
+        except Exception as e:
+            log("background_index_error", {"path": index_dir, "error": str(e)})
+        return
+    with console.status(Text(f"  indexing {label}/...", style="dim"),
+                        spinner="dots", spinner_style=t["accent"]) as status:
+        # Live progress so a large/first-time index shows real movement
+        # ("142/4302 — app/models/user.py") instead of a static spinner
+        # that looks identical whether it's stuck or just working through
+        # thousands of files with no cache yet.
+        def _on_progress(done, total, path, changed):
+            name = os.path.basename(path) if path else ""
+            pct = f"{done}/{total}" if total else str(done)
+            status.update(Text(f"  indexing {label}/... ({pct}) {name}", style="dim"))
+
+        try:
+            index_codebase(index_dir, db_path=chroma, progress_callback=_on_progress)
         except Exception as e:
             console.print(Text(f"  ⚠  index warning: {e}", style="yellow"))
     console.print(Text(f"  ✓  indexed {os.path.basename(index_dir)}/", style=t["accent"]))
     console.print()
 
 def _auto_index_background(target_dir: str = None):
-    thread = threading.Thread(target=_auto_index, args=(target_dir,), daemon=True)
+    thread = threading.Thread(target=_auto_index, args=(target_dir, True), daemon=True)
     thread.start()
     return thread
 
@@ -168,6 +187,29 @@ _COMPOUND_ACTION_RE = re.compile(
     r"\b(?:and|then|also)\b.+\b(?:update|edit|change|modify|fix|improve|make|create|write|build|add|refactor)\b",
     re.IGNORECASE
 )
+
+_PLAN_FEEDBACK_RE = re.compile(
+    r"\b(?:plan|planner|step|steps|invent(?:s|ed|ing)?|contradic(?:t|ts|tion)|"
+    r"evidence|confidence|existing (?:file|component)|minimal change|"
+    r"do not (?:create|invent)|should (?:use|modify))\b", re.IGNORECASE
+)
+
+
+def _looks_like_plan_feedback(value: str) -> bool:
+    """Keep critique of a pending plan in the same agent run."""
+    return bool(_PLAN_FEEDBACK_RE.search(value or ""))
+
+
+_PENDING_CONVERSATION_RE = re.compile(
+    r"^(?:why|what|how|can you explain|could you explain|is (?:that|this)|"
+    r"are we|do you|did you|thanks|thank you)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_pending_conversation(value: str) -> bool:
+    """Keep clearly conversational turns from discarding an awaiting plan."""
+    return bool(_PENDING_CONVERSATION_RE.match((value or "").strip()))
 
 def _try_fast_path(user_input: str) -> str | None:
     from tools.local.file_tools import read_file, list_files
@@ -272,10 +314,20 @@ def render_response(output: str, tool_outputs: list = None):
     t = _t()
     console.print()
     if tool_outputs:
-        for line in tool_outputs[-5:]:
-            name, _, rest = line.partition(":")
+        for item in tool_outputs[-5:]:
+            if isinstance(item, dict):
+                name = item.get("tool", "")
+                status = item.get("status", "ok")
+                rest = item.get("output", "")
+            else:
+                name, _, rest = str(item).partition(":")
+                status = "error" if "error" in name.lower() or "error" in rest.lower() else "ok"
+
             row = Text()
-            row.append(f"  ✓  {name.strip()}", style=t["accent"])
+            if status == "ok" or status == "success":
+                row.append(f"  ✓  {name.strip()}", style=t["accent"])
+            else:
+                row.append(f"  ✗  {name.strip()}", style="red")
             row.append(f"  {rest.strip()[:80]}", style="dim")
             console.print(row)
         console.print()
@@ -322,8 +374,19 @@ def _change_working_dir(raw_path: str):
     _auto_index(target)
 
 def _set_working_dir(target: str):
-    """Central function — always call this when changing the active project dir."""
+    """Central function — always call this when changing the active project dir.
+
+    FIX: resolve via os.path.realpath() so the stored CODI_WORKING_DIR is always
+    the canonical path the filesystem reports. Without this, a user typing
+    ``cd C:\\users\\Abhey\\project`` (lowercase 'u') stores that form, but
+    _abs() in file_tools.py calls os.path.realpath() which may canonicalize to
+    ``C:\\Users\\Abhey\\project`` (uppercase 'U') — and even though the
+    _normcase_path containment check handles this, other code paths that read
+    CODI_WORKING_DIR directly (context_builder, plan.md location, log display,
+    _cleanup_session_on_exit) were operating on the non-canonical form.
+    """
     global _LAUNCH_DIR, _path_hash, _chroma_dir
+    target       = os.path.realpath(target)
     _LAUNCH_DIR  = target
     _path_hash   = hashlib.md5(target.encode()).hexdigest()[:10]
     _chroma_dir  = os.path.join(_REPO_ROOT, "chroma_db", _path_hash)
@@ -521,8 +584,12 @@ def main():
                 # Always update working dir when /index is given a path
                 if raw_path:
                     _set_working_dir(target)
-                with console.status(Text(f"  indexing {target}...", style="dim"), spinner="dots"):
-                    index_codebase(target, db_path=os.environ["CODI_CHROMA_DIR"])
+                with console.status(Text(f"  indexing {target}...", style="dim"), spinner="dots") as status:
+                    def _on_progress(done, total, path, changed):
+                        name = os.path.basename(path) if path else ""
+                        pct = f"{done}/{total}" if total else str(done)
+                        status.update(Text(f"  indexing {target}... ({pct}) {name}", style="dim"))
+                    index_codebase(target, db_path=os.environ["CODI_CHROMA_DIR"], progress_callback=_on_progress)
                 console.print(Text(f"  ✓  indexed {target}", style=t["accent"]))
 
         elif cmd == "/mode":
@@ -620,6 +687,7 @@ def main():
                         console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
                     continue
                 if user_input.strip().lower() in ("y", "yes"):
+                    session_memory.add("user", user_input)
                     confirmed_state = pending_plan_state["state"]
                     pending_plan_state["awaiting"] = False
                     pending_plan_state["state"] = None
@@ -630,7 +698,7 @@ def main():
                     console.print()
  
                     try:
-                        response = agent_executor.invoke({}, resume_state=confirmed_state)
+                        response = agent_executor.invoke({"confirm_plan": True}, resume_state=confirmed_state)
                         output       = response.get("output") or "No output returned."
                         tool_outputs = response.get("tool_outputs", [])
  
@@ -644,6 +712,61 @@ def main():
                         console.print(Panel(Text(str(e), style="red"),
                                             title=Text("error", style="red"),
                                             border_style="red", padding=(0, 2)))
+                    continue
+                elif (
+                    user_input.strip().lower() in {"retry", "try again"}
+                    or _looks_like_plan_feedback(user_input)
+                ) and not _is_pending_conversation(user_input):
+                    session_memory.add("user", user_input)
+                    console.print(Text("  revising the pending plan from your feedback", style="dim"))
+                    renderer = LiveRenderer(pending_state.user_input)
+                    renderer.start()
+                    console.print()
+                    try:
+                        pending_state.status = "awaiting_plan_revision"
+                        response = agent_executor.invoke({"plan_feedback": user_input}, resume_state=pending_state)
+                        output = response.get("output") or "No output returned."
+                        run_state = response.get("state")
+                        renderer.stop()
+                        console.print()
+                        _refresh_status_panel()
+                        pending_plan_state["awaiting"] = bool(run_state and run_state.status == "awaiting_plan_confirmation")
+                        pending_plan_state["state"] = run_state if pending_plan_state["awaiting"] else None
+                        console.print(Panel(Markdown(output), border_style=t["dim"], padding=(0, 2)))
+                        session_memory.add("assistant", output)
+                    except Exception as e:
+                        renderer.stop()
+                        console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
+                    continue
+                elif _is_pending_conversation(user_input):
+                    # Answer a question about active work without losing the
+                    # pending plan. A later y/yes still resumes that exact
+                    # plan, while a concrete plan comment takes the branch
+                    # above.
+                    session_memory.add("user", user_input)
+                    renderer = LiveRenderer(user_input)
+                    renderer.start()
+                    try:
+                        pending_context = (
+                            "\n\nACTIVE PENDING PLAN (not executed yet):\n"
+                            f"Goal: {pending_state.plan}\n"
+                            + "\n".join(
+                                f"{index}. {step}" for index, step in enumerate(pending_state.plan_steps, start=1)
+                            )
+                        )
+                        response = agent_executor.invoke({
+                            "input": user_input,
+                            "history": get_trimmed_history() + pending_context,
+                        })
+                        output = response.get("output") or "No output returned."
+                        renderer.stop()
+                        console.print()
+                        _refresh_status_panel()
+                        render_response(output, response.get("tool_outputs", []))
+                        session_memory.add("assistant", output)
+                    except Exception as e:
+                        renderer.stop()
+                        console.print(Panel(Text(str(e), style="red"), title=Text("error", style="red"), border_style="red", padding=(0, 2)))
                     continue
                 else:
                     # Not a confirmation — drop the pending plan and treat this
@@ -660,6 +783,21 @@ def main():
                 session_memory.add("assistant", fast_result)
                 continue
  
+            # ── /read prefix: force read-only intent ──────────────────────────
+            # When the user types "/read <prompt>", the agent is forced into
+            # read-only mode (inspect/explain code, never write). Without this
+            # prefix, the word "read" in natural language is treated like any
+            # other word and does NOT trigger read-only mode.
+            force_read = False
+            if cmd.startswith("/read ") or cmd == "/read":
+                remainder = user_input[len("/read"):].strip()
+                if not remainder:
+                    console.print(Text("  usage: /read <prompt>  — e.g. /read explain what auth.py does", style="yellow"))
+                    continue
+                user_input = remainder
+                force_read = True
+                console.print(Text("  → read-only mode (no files will be changed)", style=t["accent"]))
+
             # Only refine action-oriented longer inputs — skip for short/simple
             if len(user_input) > 60:
                 refined = refine_prompt(user_input)
@@ -685,6 +823,7 @@ def main():
                     "input": refined,
                     "history": history_str,
                     "read_entire_codebase": read_entire_codebase,
+                    "force_read": force_read,
                 })
                 output       = response.get("output") or "No output returned."
                 tool_outputs = response.get("tool_outputs", [])

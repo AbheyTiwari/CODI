@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import re
 import subprocess
 import time
 import traceback
@@ -25,107 +26,6 @@ def inspect_file(args) -> str:
     # canonical structured inspector.
     return json.dumps(_inspect_file(args), ensure_ascii=False)
 
-    path = _path_arg(args)
-    if not path:
-        return json.dumps({
-            "success": False,
-            "error": "missing path"
-        })
-
-    if not os.path.exists(path):
-        return json.dumps({
-            "success": False,
-            "error": "file not found"
-        })
-
-    ext = os.path.splitext(path)[1].lower()
-
-    try:
-
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            source = f.read()
-
-        result = {
-            "success": True,
-            "file": path,
-            "extension": ext,
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "constants": [],
-            "entrypoint": "__main__" in source
-        }
-
-        if ext == ".py":
-
-            tree = ast.parse(source)
-
-            for node in tree.body:
-
-                if isinstance(node, ast.Import):
-
-                    for alias in node.names:
-                        result["imports"].append(alias.name)
-
-                elif isinstance(node, ast.ImportFrom):
-
-                    result["imports"].append(node.module)
-
-                elif isinstance(node, ast.Assign):
-
-                    for target in node.targets:
-
-                        if isinstance(target, ast.Name):
-
-                            if target.id.isupper():
-                                result["constants"].append(target.id)
-
-                elif isinstance(node, ast.FunctionDef):
-
-                    result["functions"].append({
-                        "name": node.name,
-                        "line": node.lineno,
-                        "args": [a.arg for a in node.args.args]
-                    })
-
-                elif isinstance(node, ast.ClassDef):
-
-                    cls = {
-                        "name": node.name,
-                        "line": node.lineno,
-                        "methods": []
-                    }
-
-                    for child in node.body:
-
-                        if isinstance(child, ast.FunctionDef):
-
-                            cls["methods"].append({
-                                "name": child.name,
-                                "line": child.lineno,
-                                "args": [a.arg for a in child.args.args]
-                            })
-
-                    result["classes"].append(cls)
-
-        else:
-
-            result["lines"] = len(source.splitlines())
-
-        log("tool_result", {
-            "tool": "inspect_file",
-            "file": path,
-            "status": "ok"
-        })
-
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-
-        return json.dumps({
-            "success": False,
-            "error": str(e)
-        })
 
 def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELAY):
     """Write content to file character by character with a typing effect.
@@ -137,14 +37,12 @@ def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELA
         return
     
     # Adaptive delay: aim for max ~3 seconds total typing time
-    # Small files (< 100 chars): use full delay for visibility
-    # Large files (> 500 chars): speed up to stay under 3 seconds
     target_max_time = 3.0  # seconds
     adaptive_delay = min(delay, target_max_time / content_len)
     
     for char in content:
         file_obj.write(char)
-        file_obj.flush()  # Ensure character is written immediately
+        file_obj.flush()
         if adaptive_delay > 0:
             time.sleep(adaptive_delay)
 
@@ -152,7 +50,6 @@ def _write_with_typing_effect(file_obj, content: str, delay: float = TYPING_DELA
 def _open_in_vscode(path: str):
     """Open the file in VS Code so the user can see the typing effect live."""
     try:
-        # Use 'code' command to open file in VS Code
         subprocess.Popen(
             ["code", path],
             stdout=subprocess.DEVNULL,
@@ -160,7 +57,6 @@ def _open_in_vscode(path: str):
             shell=False,
         )
     except Exception:
-        # Silently fail if VS Code CLI is not available
         pass
 
 
@@ -168,16 +64,83 @@ def _working_dir() -> str:
     return os.environ.get("CODI_WORKING_DIR", os.getcwd())
 
 
+def _normcase_path(path: str) -> str:
+    """Fully normalize a path for cross-platform comparison: resolve symlinks,
+    collapse '..'/'.'/redundant separators, then lowercase-normalize case on
+    case-insensitive filesystems (Windows/macOS-default). This is the single
+    source of truth both sides of a containment check must go through —
+    comparing a realpath'd candidate against a NON-normcased working_dir
+    (the previous bug) meant a single drive-letter or filename-case mismatch
+    made os.path.commonpath() report two DIFFERENT roots, which silently
+    rejected every read/write as "path escapes project directory" any time
+    CODI_WORKING_DIR was set (or typed via `cd`) with different casing than
+    what realpath() canonicalizes it to."""
+    return os.path.normcase(os.path.normpath(os.path.realpath(path)))
+
+
 def _abs(path: str) -> str:
-    working_dir = os.path.realpath(_working_dir())
+    """
+    Resolve `path` against CODI_WORKING_DIR and verify it does not escape
+    the project directory.
+
+    FIX: previously this normalized ONLY candidate_real via realpath() before
+    calling os.path.commonpath([working_dir, candidate_real]) — working_dir
+    itself was realpath'd but neither side was case-normalized. On Windows,
+    this means:
+      - CODI_WORKING_DIR = "C:\\Users\\abhey\\Project" (as typed/set by cli.py)
+      - candidate_real via realpath() may canonicalize the drive letter or
+        any segment to a different case (e.g. junctions, subst drives, or
+        just OS-level case folding quirks)
+      - os.path.commonpath() compares path components as plain strings, so
+        "C:\\Users" and "c:\\users" are treated as UNRELATED roots
+      - commonpath() then returns something that isn't working_dir, the
+        check fails, and _abs() returns "ERROR: path escapes project
+        directory" for a perfectly valid in-project file
+      - This return value is a plain string, not a tool-shaped error, so
+        every caller (read_file, write_file, edit_file, list_files, ...)
+        just treats it as "the path" and the actual file op then 404s or
+        no-ops against a bogus literal path containing the word ERROR —
+        the agent loop sees a generic tool failure with no indication the
+        real cause was a working-directory case mismatch.
+
+    The fix: normalize BOTH sides identically via _normcase_path() (realpath
+    + normpath + normcase) before comparing, and use a prefix check instead
+    of relying solely on commonpath()'s own (non-case-normalizing) string
+    comparison. commonpath() across different drives on Windows also raises
+    ValueError, which was being caught and collapsed into the same generic
+    "escapes project directory" message — that masked a genuinely different
+    failure (wrong drive entirely) behind the same text as a same-drive case
+    mismatch. Both cases now still return the escape error (that part of the
+    behavior is correct and intentional — this is a real security boundary),
+    but the underlying normalization bug that made VALID paths fail no
+    longer exists.
+    """
+    working_dir = _working_dir()
     candidate = path if os.path.isabs(path) else os.path.join(working_dir, path)
-    candidate_real = os.path.realpath(candidate)
-    try:
-        if os.path.commonpath([working_dir, candidate_real]) != working_dir:
-            return "ERROR: path escapes project directory"
-    except ValueError:
+
+    normalized_working_dir = _normcase_path(working_dir)
+    normalized_candidate = _normcase_path(candidate)
+
+    # Prefix check on fully-normalized paths — avoids commonpath()'s
+    # cross-drive ValueError entirely and doesn't depend on case matching
+    # between the two inputs, only on them agreeing AFTER normalization.
+    if normalized_candidate != normalized_working_dir and not normalized_candidate.startswith(
+        normalized_working_dir + os.sep
+    ):
+        log("file_tools_path_escape", {
+            "requested_path": path,
+            "working_dir": working_dir,
+            "normalized_working_dir": normalized_working_dir,
+            "normalized_candidate": normalized_candidate,
+        })
         return "ERROR: path escapes project directory"
-    return candidate_real
+
+    # Return the realpath'd-but-not-case-mangled candidate for actual file
+    # I/O. We deliberately do NOT return normalized_candidate (which was
+    # lowercased on Windows/macOS via normcase) — that would break
+    # case-sensitive filesystems and mangle the path shown back to the user.
+    # normalize just structurally (realpath + normpath), keep original case.
+    return os.path.normpath(os.path.realpath(candidate))
 
 
 def _path_arg(args) -> str:
@@ -205,6 +168,8 @@ def read_file(args) -> str:
     path = _path_arg(args)
     if not path:
         return "ERROR reading file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR reading file: {path}"
 
     log("tool_call", {"tool": "read_file", "path": path})
     try:
@@ -236,6 +201,8 @@ def read_file_numbered(args) -> str:
     path = _path_arg(args)
     if not path:
         return "ERROR reading file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR reading file: {path}"
 
     start_line = None
     end_line = None
@@ -278,6 +245,8 @@ def write_file(args: dict) -> str:
     path = _path_arg(args)
     if not path:
         return "ERROR writing file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR writing file: {path}"
 
     content = _coerce_content(args)
     log("tool_call", {"tool": "write_file", "path": path, "length": len(content)})
@@ -290,7 +259,6 @@ def write_file(args: dict) -> str:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         
         if TYPING_ENABLED:
-            # Open file in VS Code so user can see the typing effect
             _open_in_vscode(path)
         
         with open(path, "w", encoding="utf-8") as f:
@@ -319,6 +287,8 @@ def create_file(args: dict) -> str:
     path = _path_arg(args)
     if not path:
         return "ERROR creating file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR creating file: {path}"
     if os.path.exists(path):
         return (
             f"ERROR creating file: {path} already exists. "
@@ -343,6 +313,8 @@ def edit_file(args: dict) -> str:
     path = _path_arg(args)
     if not path:
         return "ERROR editing file: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR editing file: {path}"
 
     log("tool_call", {"tool": "edit_file", "path": path})
 
@@ -374,7 +346,6 @@ def edit_file(args: dict) -> str:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         
         if TYPING_ENABLED:
-            # Open file in VS Code before editing so user can see the typing effect
             _open_in_vscode(path)
         
         with open(path, "w", encoding="utf-8") as f:
@@ -412,6 +383,8 @@ def list_files(args) -> str:
         dir_path = _working_dir()
     else:
         dir_path = _abs(str(dir_path))
+        if dir_path.startswith("ERROR"):
+            return f"ERROR listing: {dir_path}"
 
     log("tool_call", {"tool": "list_files", "path": dir_path})
     skip = {".git", "node_modules", "__pycache__", "venv", "dist", "build", "chroma_db"}
@@ -433,6 +406,8 @@ def create_directory(args: dict) -> str:
     path = _path_arg(args)
     if not path:
         return "ERROR creating directory: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR creating directory: {path}"
 
     try:
         os.makedirs(path, exist_ok=True)
@@ -492,18 +467,39 @@ def _normalize_whitespace(text: str) -> str:
     return "\n".join(line.rstrip() for line in lines)
 
 
+def _line_number_at(content: str, char_index: int) -> int:
+    """1-indexed line number of a character offset within content."""
+    return content.count("\n", 0, char_index) + 1
+
+
+def _occurrence_contexts(content: str, needle: str, max_occurrences: int = 6) -> list[dict]:
+    """
+    Return line numbers + a short surrounding snippet for every occurrence of
+    `needle` in `content`.
+    """
+    occurrences = []
+    start = 0
+    while True:
+        pos = content.find(needle, start)
+        if pos == -1:
+            break
+        line_no = _line_number_at(content, pos)
+        ctx_start = max(0, pos - 40)
+        ctx_end = min(len(content), pos + len(needle) + 40)
+        snippet = content[ctx_start:ctx_end].replace("\n", "\\n")
+        occurrences.append({"line": line_no, "context": snippet})
+        start = pos + max(len(needle), 1)
+        if len(occurrences) >= max_occurrences:
+            break
+    return occurrences
+
+
 def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tuple[str, int]:
     """
     Replace old with new inside content.
 
     Tries exact match first. If that fails, attempts three cheap normalizations
-    before giving up — catches the most common local-model mistakes:
-      1. Trailing whitespace differences  (model strips trailing spaces)
-      2. Line ending differences          (CRLF vs LF)
-      3. Indentation collapse             (model uses spaces instead of tabs)
-
-    Never silently corrupts the file — if all attempts fail, raises ValueError
-    so the agent knows to retry with the correct old string.
+    before giving up.
     """
     if old == "":
         raise ValueError("old text for replacement cannot be empty")
@@ -516,28 +512,34 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
             return c.replace(o, n), occurrences
         return c.replace(o, n, count), min(count, occurrences)
 
-    # ── Attempt 1: exact match ────────────────────────────────────────────────
+    def _ambiguous_error(source: str, needle: str, occurrences: int) -> ValueError:
+        contexts = _occurrence_contexts(source, needle)
+        lines = "; ".join(f"line {c['line']}: ...{c['context']}..." for c in contexts)
+        return ValueError(
+            f"text match is ambiguous ({occurrences} occurrences). "
+            "Use a longer unique old snippet or explicitly set count. "
+            f"Occurrences found at: {lines}"
+        )
+
     exact_occurrences = content.count(old)
     if exact_occurrences > 1 and (count is None or count == 1):
-        raise ValueError(
-            f"text match is ambiguous ({exact_occurrences} occurrences). "
-            "Use a longer unique old snippet or explicitly set count."
-        )
+        raise _ambiguous_error(content, old, exact_occurrences)
     result, found = _do_replace(content, old, new)
     if found:
         return result, found
 
-    # ── Attempt 2: normalize trailing whitespace on both sides ────────────────
     norm_content = _normalize_whitespace(content)
     norm_old     = _normalize_whitespace(old)
     norm_new     = _normalize_whitespace(new)
 
+    norm_occurrences = norm_content.count(norm_old)
+    if norm_occurrences > 1 and (count is None or count == 1):
+        raise _ambiguous_error(norm_content, norm_old, norm_occurrences)
     result, found = _do_replace(norm_content, norm_old, norm_new)
     if found:
         log("edit_fuzzy_match", {"reason": "trailing_whitespace", "old": old[:60]})
         return result, found
 
-    # ── Attempt 3: collapse runs of spaces/tabs to single space ──────────────
     import re as _re
     def _collapse(t: str) -> str:
         return _re.sub(r"[ \t]+", " ", t)
@@ -546,13 +548,164 @@ def _replace_text(content: str, old: str, new: str, count: int | None = 1) -> tu
     coll_old     = _collapse(norm_old)
     coll_new     = _collapse(norm_new)
 
+    coll_occurrences = coll_content.count(coll_old)
+    if coll_occurrences > 1 and (count is None or count == 1):
+        raise _ambiguous_error(coll_content, coll_old, coll_occurrences)
     result, found = _do_replace(coll_content, coll_old, coll_new)
     if found:
         log("edit_fuzzy_match", {"reason": "indentation_collapse", "old": old[:60]})
         return result, found
 
-    # ── All attempts failed ───────────────────────────────────────────────────
     raise ValueError(f"text not found (tried exact + whitespace normalization): {old[:80]}")
+
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@"
+)
+
+
+def _parse_unified_diff(patch_text: str) -> list[dict]:
+    """
+    Parse a unified diff into a list of hunks.
+    """
+    if not patch_text or not patch_text.strip():
+        raise ValueError("patch is empty")
+
+    lines = patch_text.splitlines()
+    hunks: list[dict] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- ") or line.startswith("+++ "):
+            i += 1
+            continue
+        match = _HUNK_HEADER_RE.match(line)
+        if not match:
+            i += 1
+            continue
+        old_start = int(match.group("old_start"))
+        old_len = int(match.group("old_len") or 1)
+        new_start = int(match.group("new_start"))
+        new_len = int(match.group("new_len") or 1)
+        i += 1
+        body: list[tuple[str, str]] = []
+        while i < len(lines) and not _HUNK_HEADER_RE.match(lines[i]) and not lines[i].startswith(("--- ", "+++ ")):
+            raw = lines[i]
+            if raw.startswith(("+", "-", " ")):
+                body.append((raw[0], raw[1:]))
+            elif raw == "":
+                body.append((" ", ""))
+            else:
+                body.append((" ", raw))
+            i += 1
+        hunks.append({
+            "old_start": old_start, "old_len": old_len,
+            "new_start": new_start, "new_len": new_len,
+            "lines": body,
+        })
+
+    if not hunks:
+        raise ValueError("no valid @@ hunk headers found in patch")
+    return hunks
+
+
+def _apply_hunks(original: str, hunks: list[dict]) -> str:
+    """
+    Apply parsed unified-diff hunks to `original`, sequentially, verifying
+    each hunk's context/removal lines match the file at the claimed position
+    before mutating anything.
+    """
+    result_lines = original.splitlines(keepends=True)
+    offset = 0
+
+    for index, hunk in enumerate(sorted(hunks, key=lambda h: h["old_start"])):
+        start_idx = hunk["old_start"] - 1 + offset
+        if start_idx < 0 or start_idx > len(result_lines):
+            raise ValueError(
+                f"hunk {index + 1} @@ -{hunk['old_start']} out of bounds "
+                f"(file currently has {len(result_lines)} lines)"
+            )
+
+        cursor = start_idx
+        new_segment: list[str] = []
+        for kind, text in hunk["lines"]:
+            line_with_nl = text if text.endswith("\n") else text + "\n"
+            if kind == " ":
+                if cursor >= len(result_lines) or result_lines[cursor].rstrip("\n") != text.rstrip("\n"):
+                    actual = result_lines[cursor].rstrip("\n") if cursor < len(result_lines) else "<EOF>"
+                    raise ValueError(
+                        f"hunk {index + 1} context mismatch at line {cursor + 1}: "
+                        f"expected {text!r}, found {actual!r}"
+                    )
+                new_segment.append(result_lines[cursor])
+                cursor += 1
+            elif kind == "-":
+                if cursor >= len(result_lines) or result_lines[cursor].rstrip("\n") != text.rstrip("\n"):
+                    actual = result_lines[cursor].rstrip("\n") if cursor < len(result_lines) else "<EOF>"
+                    raise ValueError(
+                        f"hunk {index + 1} removal mismatch at line {cursor + 1}: "
+                        f"expected to remove {text!r}, found {actual!r}"
+                    )
+                cursor += 1
+            elif kind == "+":
+                new_segment.append(line_with_nl)
+
+        result_lines[start_idx:cursor] = new_segment
+        offset += len(new_segment) - (cursor - start_idx)
+
+    return "".join(result_lines)
+
+
+def apply_patch(args: dict) -> str:
+    """Apply a unified diff (one or more @@ hunks) to an existing file.
+    Args: path, patch (unified diff text)."""
+    path = _path_arg(args)
+    if not path:
+        return "ERROR applying patch: missing path"
+    if path.startswith("ERROR"):
+        return f"ERROR applying patch: {path}"
+    if not os.path.exists(path):
+        return f"ERROR applying patch: {path} does not exist. Use create_file for new files."
+
+    patch_text = ""
+    if isinstance(args, dict):
+        patch_text = args.get("patch") or args.get("diff") or ""
+
+    log("tool_call", {"tool": "apply_patch", "path": path, "patch_len": len(patch_text)})
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            original = f.read()
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+
+    try:
+        hunks = _parse_unified_diff(patch_text)
+        new_content = _apply_hunks(original, hunks)
+    except ValueError as e:
+        return f"ERROR applying patch to {path}: {e}"
+
+    syntax_warning = _python_syntax_check(path, new_content)
+    if not syntax_warning:
+        syntax_warning = _java_structural_check(path, new_content)
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        _refresh_exact_index(path)
+        log("tool_result", {"tool": "apply_patch", "path": path, "status": "ok", "hunks": len(hunks)})
+        result = {
+            "success": True,
+            "tool": "apply_patch",
+            "file_modified": path,
+            "hunks_applied": len(hunks),
+            "syntax_ok": not bool(syntax_warning),
+        }
+        if syntax_warning:
+            result["syntax_warning"] = syntax_warning
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"success": False, "tool": "apply_patch", "error": str(e), "path": path})
 
 
 def _coerce_count(value) -> int | None:
@@ -664,12 +817,6 @@ def _apply_edit_operations(content: str, args: dict) -> tuple[str, int]:
         content = content[:pos] + payload + content[pos:]
         changes += 1
 
-    # ── Line-range operations ──────────────────────────────────────────────
-    # Surgical edits by 1-indexed line number instead of exact text matching.
-    # Pair these with read_file_numbered so the caller knows real line numbers
-    # before editing — this is what lets CODI touch any portion of any file
-    # type without ever having to regenerate/rewrite the whole thing.
-
     if "replace_lines" in args:
         spec = args.get("replace_lines")
         if not isinstance(spec, dict) or "start" not in spec or "end" not in spec:
@@ -737,6 +884,7 @@ def register_file_tools(registry):
     registry.register_local("read_file_numbered",  read_file_numbered)
     registry.register_local("write_file",          write_file)
     registry.register_local("edit_file",           edit_file)
+    registry.register_local("apply_patch",         apply_patch)
     registry.register_local("list_files",          list_files)
     registry.register_local("create_directory",    create_directory)
     registry.register_local("inspect_file",         inspect_file)

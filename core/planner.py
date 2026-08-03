@@ -31,7 +31,7 @@ ACTION_TRIGGERS = (
     "run", "execute", "generate", "refactor", "implement", "add", "code",
     "put", "save", "html", "css", "script", "file", "folder", "index",
     "function", "class", "api", "page", "deploy", "install", "setup",
-    "rename", "move", "copy", "read", "open", "parse", "fetch", "download",
+    "rename", "move", "copy", "open", "parse", "fetch", "download",
     "list", "search", "find", "show", "get", "check", "access", "browse",
     "navigate", "click", "screenshot", "scrape", "query", "lookup", "pull",
     "push", "commit", "clone", "diff", "status", "remember", "store",
@@ -65,6 +65,14 @@ EDIT_VERBS = (
     "edit", "fix", "update", "change", "modify", "rename", "refactor",
     "remove", "delete", "replace", "append", "prepend", "insert", "patch",
     "debug", "troubleshoot", "diagnose",
+    # "redo"/"redesign"/etc. are ordinary phrasing for an edit request
+    # ("redo the navbar", "redesign the header") but substring-matching
+    # against ACTION_TRIGGERS/EDIT_VERBS/BUILD_VERBS found none of them,
+    # so route_reason() fell through to the short_no_action default and
+    # classify_intent() answered as plain chat instead of routing to real
+    # execution — see agent.py's _qa_answer_is_unexecuted_change backstop,
+    # which reuses this exact tuple and was blind to the same gap.
+    "redo", "redesign", "revamp", "rework", "restyle", "overhaul",
 )
 
 BUILD_VERBS = (
@@ -220,8 +228,18 @@ def classify_intent(text: str) -> str:
     if broad_scope_hint:
         return "build"
 
-    if has_read_verb and not has_build_verb and not has_edit_verb:
-        return "read"
+    # FIX: read-intent is no longer inferred from keywords. The word "read"
+    # appearing in natural language (e.g. "the chatbot should be able to read
+    # answer from those files") was incorrectly locking Codi into read-only
+    # mode, preventing any writes. Read-intent is now ONLY activated by the
+    # explicit /read command prefix (handled in Planner.classify via
+    # state.force_read). When has_read_verb fires without edit/build verbs,
+    # we fall through to the build classification below instead of returning
+    # "read" — this lets the full pipeline decide whether the task actually
+    # needs file modifications.
+    #
+    # OLD: if has_read_verb and not has_build_verb and not has_edit_verb:
+    #          return "read"
 
     # NOTE: " and " is deliberately NOT a build signal on its own anymore.
     # "edit index.html and add content there" has one file and one edit
@@ -269,7 +287,23 @@ class Planner:
         return result
 
     def classify(self, state: RunState) -> str:
-        """Return one of "qa" | "read" | "edit" | "build" for state.user_input."""
+        """Return one of "qa" | "read" | "edit" | "build" for state.user_input.
+
+        The "read" intent is ONLY returned when state.force_read is True
+        (set by main.py when the user types /read). Keyword-based read
+        detection was removed from classify_intent() because the word
+        "read" in natural language too easily downgraded real edit/build
+        tasks to read-only mode.
+        """
+        if state.force_read:
+            log("planner_classify", {
+                "input": state.user_input[:160],
+                "intent": "read",
+                "input_len": len(state.user_input or ""),
+                "reason": "force_read_via_slash_command",
+            })
+            return "read"
+
         intent = classify_intent(state.user_input)
         log("planner_classify", {
             "input": state.user_input[:160],
@@ -281,9 +315,14 @@ class Planner:
     def direct_answer(self, state: RunState) -> str:
         """For simple Q&A that doesn't need tools. Returns plain text answer."""
         try:
+            history = (state.history or "No earlier conversation.")[-12000:]
             resp = self.llm.invoke([
                 SystemMessage(content=self._system_prompt()),
-                HumanMessage(content=state.user_input),
+                HumanMessage(content=(
+                    "Conversation so far (use it to resolve references such as "
+                    "'that', 'it', and 'what you changed'; do not invent actions):\n"
+                    f"{history}\n\nCurrent user message: {state.user_input}"
+                )),
             ])
             answer = resp.content.strip()
             log("planner_direct", {"output": answer[:100]})

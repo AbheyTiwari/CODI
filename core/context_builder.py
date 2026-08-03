@@ -8,9 +8,11 @@ import re
 from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage, SystemMessage
+
 from dispatcher import Dispatcher
 from llm_factory import get_refiner_llm
 from logger import log
+from state.code_index import resolve_component
 from state.knowledge import KnowledgeBase
 from tools.registry import ToolRegistry, registry
 
@@ -22,6 +24,17 @@ already taken and never request a file that is reported missing.
 Return JSON only: {\"action\":\"inspect_file\",\"path\":\"...\",\"reason\":\"short evidence need\"}.
 For done include {\"action\":\"done\",\"confidence\":0.95,\"summary\":\"...\"}."""
 
+# Penalty applied to confidence per unresolved "unknown" the discovery
+# process recorded (a failed tool call, a repeated/blocked action, a
+# genuinely missing requested file, etc). Previously confidence was floored
+# UP to 0.90 whenever state.complete was true, regardless of how many
+# unknowns remained unresolved — so a run that had e.g. a failed
+# inspect_file call still reported confidence=1.00 if the LLM's own "done"
+# call happened to say so. This constant makes each unresolved unknown cost
+# real, visible confidence instead of being silently absorbed by the floor.
+_CONFIDENCE_PENALTY_PER_UNKNOWN = 0.12
+_MIN_FLOOR_CONFIDENCE = 0.55
+
 @dataclass
 class ContextState:
     confidence: float = 0.0
@@ -30,20 +43,21 @@ class ContextState:
     context: str = ""
     complete: bool = False
     source_evidence: list[str] = field(default_factory=list)
-    # Files the mission explicitly named that could not be resolved against
-    # any known project path, even fuzzily. This is distinct from a generic
-    # "unknown" — it means planning must not proceed on a silent guess.
+    # Files the mission explicitly named as EXISTING that could not be
+    # resolved against any known project path, even fuzzily. This is
+    # distinct from a generic "unknown" — it means planning must not
+    # proceed on a silent guess. Populated ONLY from mission.files_needed,
+    # never from mission.files_new (see _looks_like_file_path usage below).
     missing_requested_files: list[str] = field(default_factory=list)
     needs_user_clarification: bool = False
     clarification_question: str = ""
 
-# The Mission Analyzer's files_needed list is meant to hold actual project
-# file paths, but a small model sometimes fills it with capability/dependency
-# descriptions instead — e.g. "Library or service for PDF extraction" for a
-# brand-new feature that names no existing file at all. Those are not file
-# paths and must never be run through the missing-file hard-stop below; doing
-# so previously blocked a plain "add a new feature" request by demanding the
-# user "confirm the exact file path" for something that was never a file.
+# The Mission Analyzer's files_needed list is meant to hold only files that
+# already exist; files_new holds suggested-but-unconfirmed filenames for
+# brand-new code. Older mission data (or a degraded fallback) may still
+# hand this builder a single-field shape — _looks_like_file_path is kept as
+# a defensive filter either way so a stray capability description never
+# gets treated as a real path.
 
 
 def _looks_like_file_path(candidate: str) -> bool:
@@ -83,6 +97,108 @@ def _looks_like_file_path(candidate: str) -> bool:
     return True
 
 
+def _resolve_via_capability(requested: str, known_paths: set[str], working_dir: str) -> tuple[str | None, int]:
+    """
+    Second-chance resolution for a files_needed entry that failed the
+    fuzzy-basename match in _resolve_close_path().
+
+    WHY THIS EXISTS: MissionAnalyzer guesses files_needed from the words in
+    the user's raw prompt, BEFORE the project's real file list has been
+    inspected (see agent.py — mission.analyze() runs ahead of
+    context_builder.build()). "Add a navbar" plausibly produces a guess
+    like "navbar.html" even when the project's actual file is "index.html".
+    A pure filename-similarity check (_resolve_close_path, cutoff=0.75)
+    correctly rejects that — "navbar.html" and "index.html" are not close
+    strings.
+
+    CORRECTED IMPLEMENTATION (v2): the first version of this function
+    called state.code_index.resolve_component(), which queries the SQLite
+    symbol index built by index_file()'s _facts(). That indexer's
+    _SYMBOL_RE only matches JS/Python-style declarations (class/def/
+    function/const/let/var/interface/type/enum) — it is structurally BLIND
+    to HTML markup. id="navbar" and class="navbar-link" attributes are
+    never recorded there no matter how well-populated the index is, so
+    resolve_component("navbar") on an HTML project always returned zero
+    candidates, and the "couldn't find navbar.html" hard-stop kept firing
+    even with that patch in place.
+
+    The parser that DOES see HTML ids/classes/landmarks already exists:
+    tools/local/project_inspector.py's inspect_file() — the exact function
+    the inspect_file TOOL calls, and the source of the "symbols=['navbar',
+    'navbar-link', ...]" evidence that already appears in PROJECT
+    KNOWLEDGE once a file has been inspected. This calls that same parser
+    directly (no dispatcher round trip needed — it's a pure, cheap regex
+    parse of a file already on disk) against every known project file with
+    a plausible extension, and checks whether the requested capability
+    term appears in that file's ids/classes/landmarks/functions/classes.
+
+    resolve_component() is also checked as a secondary signal — it remains
+    genuinely useful for actual code symbols (Python/JS functions/classes),
+    just not for HTML markup, so this keeps both evidence sources rather
+    than picking one at the expense of the other.
+
+    Returns (resolved_path_or_None, confidence_score). The caller decides
+    the acceptance threshold so this stays a pure, testable lookup.
+    """
+    stem = os.path.splitext(os.path.basename(requested))[0].lower()
+    if not stem or len(stem) < 3:
+        return None, 0
+
+    from tools.local.project_inspector import inspect_file as _inspect_structural
+
+    best_path, best_score = None, 0
+    for candidate in known_paths:
+        ext = os.path.splitext(candidate)[1].lower()
+        if ext not in (".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".py"):
+            continue
+        absolute = candidate if os.path.isabs(candidate) else os.path.join(working_dir, candidate)
+        try:
+            result = _inspect_structural({"path": absolute})
+        except Exception as exc:
+            log("context_capability_inspect_error", {"path": candidate, "error": str(exc)[:160]})
+            continue
+        if not isinstance(result, dict) or not result.get("success"):
+            continue
+
+        haystack_terms: set[str] = set()
+        haystack_terms.update(str(v).lower() for v in result.get("ids", []))
+        haystack_terms.update(str(v).lower() for v in result.get("landmarks", []))
+        for entry in result.get("classes", []):
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if name:
+                haystack_terms.add(str(name).lower())
+        for entry in result.get("functions", []):
+            name = entry.get("name") if isinstance(entry, dict) else entry
+            if name:
+                haystack_terms.add(str(name).lower())
+        # css_classes surfaced separately from "classes" for HTML (see
+        # project_inspector._inspect_html) under the same "classes" key
+        # already handled above, plus raw CSS class strings may include
+        # multi-word values ("navbar-link active") — split them.
+        for term in list(haystack_terms):
+            haystack_terms.update(term.replace("-", " ").replace("_", " ").split())
+
+        score = sum(1 for term in haystack_terms if term and (stem in term or term in stem))
+        if score > best_score:
+            best_score = score
+            best_path = candidate
+
+    if best_path:
+        return best_path, best_score
+
+    # Secondary check: genuine code-symbol capabilities (a Python/JS
+    # function or class named after the capability) still benefit from the
+    # SQLite index — this just stops being the ONLY source of truth.
+    candidates = resolve_component(stem, limit=3)
+    if candidates:
+        top = candidates[0]
+        path = str(top.get("path", "")).replace("\\", "/")
+        if path and path in known_paths:
+            return path, int(top.get("score", 0))
+
+    return None, 0
+
+
 def _resolve_close_path(requested: str, known_paths: set[str]) -> str | None:
     """
     If `requested` doesn't exact-match anything in known_paths, look for the
@@ -99,6 +215,23 @@ def _resolve_close_path(requested: str, known_paths: set[str]) -> str | None:
     if matches:
         return by_basename[matches[0]]
     return None
+
+
+def _penalized_confidence(raw_confidence: float, unknown_count: int) -> float:
+    """
+    Apply a deterministic penalty per unresolved unknown so a discovery run
+    with failed/blocked tool calls can never report full confidence just
+    because the discovery-controller LLM's own "done" call said so, or
+    because the completion floor below would otherwise round it up.
+
+    This does not replace the floor logic in build() — it clips the value
+    BEFORE the floor is applied, so a genuinely evidence-backed run with
+    zero unknowns still gets floored up to a workable minimum, while a run
+    with several unresolved unknowns is visibly and proportionally less
+    confident instead of being indistinguishable from a clean run.
+    """
+    penalty = min(0.9, unknown_count * _CONFIDENCE_PENALTY_PER_UNKNOWN)
+    return max(0.0, min(raw_confidence, 1.0) - penalty)
 
 
 class ContextBuilder:
@@ -126,7 +259,16 @@ class ContextBuilder:
 
     def _decide(self, state: ContextState, mission, conversation_history: str) -> dict | None:
         evidence = "\n\n".join(state.source_evidence)[-70000:]
-        prompt = f"Mission: {mission.goal}\nLikely files: {mission.files_needed}\nLikely symbols: {mission.symbols_needed}\n{state.knowledge.summary_for_prompt()}\nConversation history:\n{conversation_history[-50000:]}\nSource/history evidence:\n{evidence}\nActions already taken: {state.actions}"
+        prompt = (
+            f"Mission: {mission.goal}\n"
+            f"Likely existing files: {mission.files_needed}\n"
+            f"Suggested new files (may not exist yet): {getattr(mission, 'files_new', [])}\n"
+            f"Likely symbols: {mission.symbols_needed}\n"
+            f"{state.knowledge.summary_for_prompt()}\n"
+            f"Conversation history:\n{conversation_history[-50000:]}\n"
+            f"Source/history evidence:\n{evidence}\n"
+            f"Actions already taken: {state.actions}"
+        )
         try:
             response = self.llm.invoke([SystemMessage(content=_PROMPT), HumanMessage(content=prompt)])
             return self._parse(response.content)
@@ -134,12 +276,100 @@ class ContextBuilder:
             log("context_llm_error", {"error": str(exc)})
             return None
 
+    def apply_user_supplied_paths(self, knowledge: KnowledgeBase, candidates: list[str]) -> list[str]:
+        """
+        Deterministically resolve and inspect file paths the USER supplied
+        in a clarification answer — bypassing _decide()'s LLM discovery loop
+        entirely for these paths.
+
+        Why this exists: previously, a clarification answer like "the file
+        is in src/utils/parser.py" was appended to state.history as prose
+        and handed back to context_builder.build(), which re-ran the exact
+        same LLM-driven discovery loop that already failed to find the file.
+        A small discovery-controller model has no special reason to notice
+        one sentence buried in a growing history blob — the answer was
+        technically present but never treated as ground truth. This method
+        treats it as ground truth: resolve it against real project paths
+        (exact match, then fuzzy basename match, then a direct filesystem
+        check in case the project index is stale), inspect_file + read_file
+        it immediately, record it in knowledge, and clear any stale
+        "not present" unknown for that filename so the missing-file hard
+        stop in build() doesn't re-fire on a file that was just verified.
+
+        Returns the list of resolved (verified-to-exist) paths.
+        """
+        known_paths = {str(p).replace("\\", "/") for p in knowledge.project.get("files", [])}
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+        resolved_paths: list[str] = []
+
+        for candidate in candidates:
+            if not _looks_like_file_path(candidate):
+                continue
+            normalized = candidate.strip().strip("'\"`").replace("\\", "/")
+
+            resolved = _resolve_close_path(normalized, known_paths)
+            if not resolved:
+                # Not in the pre-scanned project file list (index may be
+                # stale, or the user gave a path relative to a subdirectory)
+                # — check the filesystem directly before giving up.
+                absolute = normalized if os.path.isabs(normalized) else os.path.join(working_dir, normalized)
+                absolute = os.path.realpath(absolute)
+                if os.path.isfile(absolute):
+                    resolved = normalized
+
+            if not resolved:
+                log("context_user_path_unresolved", {"candidate": candidate})
+                continue
+
+            result = self.dispatcher.dispatch(
+                {"action": "tool_call", "tools": [
+                    {"name": "inspect_file", "args": {"path": resolved}},
+                    {"name": "read_file", "args": {"path": resolved}},
+                ]},
+                knowledge=knowledge,
+            )
+            verified = any(
+                item.get("tool") == "read_file" and item.get("status") == "ok"
+                for item in result.get("results", [])
+            )
+            if not verified:
+                log("context_user_path_verify_failed", {"candidate": candidate, "resolved": resolved})
+                continue
+
+            # Make the path visible to build()'s own known_paths computation
+            # (which reads knowledge.project.get("files", [])) so the
+            # deterministic files_needed resolution there matches this
+            # verified path on the next pass instead of treating it as
+            # still-missing.
+            files_list = knowledge.project.setdefault("files", [])
+            if resolved not in files_list:
+                files_list.append(resolved)
+
+            # Clear any stale hard-stop unknown naming this exact file —
+            # it is no longer missing, it was just verified above.
+            base = os.path.basename(resolved).lower()
+            knowledge.unknowns = [
+                u for u in knowledge.unknowns
+                if not (u.startswith("Requested file is not present:") and base in u.lower())
+            ]
+
+            knowledge.summaries.append(f"User-supplied path verified in clarification response: {resolved}")
+            log("context_user_path_resolved", {"candidate": candidate, "resolved": resolved})
+            resolved_paths.append(resolved)
+
+        return resolved_paths
+
     def build(self, mission, history: str = "", knowledge: KnowledgeBase | None = None,
               max_iterations: int = 8, full_codebase: bool = False) -> ContextState:
         state = ContextState(knowledge=knowledge or KnowledgeBase())
         # Project shape is deterministic and required for every code-changing task.
         if not state.knowledge.project:
             self._run(state, "inspect_project", {"path": "."})
+            # Repository instructions are durable context: architecture,
+            # commands, conventions, and safety constraints that should be
+            # known before mission planning rather than rediscovered later.
+            for instruction_path in state.knowledge.project.get("instructions", []):
+                self._run(state, "read_file", {"path": instruction_path})
             # Chroma remains the semantic search layer; SQLite supplies exact
             # paths, declarations, and references for surgical changes.
             self._run(state, "refresh_code_index", {"path": "."})
@@ -159,10 +389,18 @@ class ContextBuilder:
                 state.knowledge.add_unknown(
                     f"Full-codebase read capped at {limit} of {len(eligible)} eligible files."
                 )
+
+        known_paths = {str(path).replace("\\", "/") for path in state.knowledge.project.get("files", [])}
+        working_dir = os.environ.get("CODI_WORKING_DIR", os.getcwd())
+
+        # ── files_needed: files the mission believes ALREADY EXIST ─────────────
         # Give the planner actual source, not only AST metadata. This is a
         # high-value deterministic step for a 7B model and avoids repeated
         # discovery turns for files that were already named by the task.
-        known_paths = {str(path).replace("\\", "/") for path in state.knowledge.project.get("files", [])}
+        # If NONE of these can be resolved (even fuzzily), that's a real
+        # signal something is wrong (typo'd/renamed existing file, or the
+        # mission analyzer miscategorized a suggestion as "existing") and
+        # planning should not proceed on a silent guess.
         filelike_requested = []
         for path in mission.files_needed:
             if not (isinstance(path, str) and path):
@@ -177,34 +415,88 @@ class ContextBuilder:
             filelike_requested.append(path)
             normalized = path.replace("\\", "/")
             resolved = _resolve_close_path(normalized, known_paths)
+            resolution_source = "fuzzy_filename" if resolved else None
+
+            if not resolved:
+                # Filename similarity failed (e.g. "nav.html" vs the real
+                # "index.html" — not a close string match). Before giving
+                # up, check whether this is actually a CAPABILITY the user
+                # named ("navbar") rather than a real path the mission
+                # analyzer copied verbatim. resolve_component() answers
+                # that from the already-built symbol/file index — this is
+                # evidence-grounded (real project data), not another guess.
+                capability_match, score = _resolve_via_capability(normalized, known_paths, working_dir)
+                if capability_match and score > 0:
+                    resolved = capability_match
+                    resolution_source = "capability_resolution"
+                    state.knowledge.summaries.append(
+                        f"'{path}' did not match any existing filename directly, "
+                        f"but resolved as a capability to existing file {resolved} "
+                        f"(component match score={score})."
+                    )
+                    log("context_capability_resolved", {
+                        "requested": path, "resolved": resolved, "score": score,
+                    })
+
             if resolved:
                 self._run(state, "inspect_file", {"path": resolved})
                 self._run(state, "read_file", {"path": resolved})
+                if resolution_source == "capability_resolution":
+                    state.knowledge.add_unknown(
+                        f"'{path}' was requested but does not exist as a literal filename; "
+                        f"treating it as the existing file {resolved} based on capability match. "
+                        f"Verify this is the intended target before large structural changes."
+                    )
             else:
-                # No exact match and no close fuzzy match — this file is
-                # genuinely not identifiable in the project. Track it
+                # No exact match, no close fuzzy match, and no capability/
+                # component match — this file is genuinely not identifiable
+                # in the project even after checking real evidence. Track it
                 # explicitly instead of silently dropping it into
                 # "unknowns" and continuing, which previously let an
                 # edit task plan against a guessed substitute file.
                 state.missing_requested_files.append(path)
                 state.knowledge.add_unknown(f"Requested file is not present: {path}")
-        # Hard stop: if the mission named specific, real-looking file path(s)
-        # (the normal case for a single-file edit task) and NONE could be
-        # resolved, even fuzzily, planning must not proceed on a silent
-        # substitute guess. Ask the user instead of quietly continuing on
-        # weak evidence. A new-feature request with no actual file paths
-        # named (only capability descriptions) never reaches this branch.
+
+        # ── files_new: suggested filenames for code that doesn't exist yet ──────
+        # These are advisory only — a brand-new feature legitimately has no
+        # existing file to point to, and "doesn't exist yet" is the correct,
+        # expected state here, not an error. NEVER fed into the missing-file
+        # hard-stop below. If a suggested name happens to already exist on
+        # disk (the mission analyzer under-estimated), surface that as real
+        # context so the plan edits it instead of blindly creating it fresh.
+        for path in getattr(mission, "files_new", []) or []:
+            if not (isinstance(path, str) and path and _looks_like_file_path(path)):
+                continue
+            normalized = path.replace("\\", "/")
+            resolved = _resolve_close_path(normalized, known_paths)
+            if resolved:
+                self._run(state, "inspect_file", {"path": resolved})
+                self._run(state, "read_file", {"path": resolved})
+                state.knowledge.add_unknown(
+                    f"Suggested new file '{path}' already exists as {resolved} — treat as an edit, not a create."
+                )
+            else:
+                state.knowledge.summaries.append(f"Planned new file (does not exist yet): {path}")
+
+        # Hard stop: if the mission named specific, real-looking EXISTING
+        # file path(s) (the normal case for a single-file edit task) and
+        # NONE could be resolved, even fuzzily, planning must not proceed on
+        # a silent substitute guess. Ask the user instead of quietly
+        # continuing on weak evidence. A new-feature request with no actual
+        # existing-file paths named (only files_new suggestions or
+        # capability descriptions) never reaches this branch — files_new
+        # entries are handled entirely above and never counted here.
         if filelike_requested and len(state.missing_requested_files) == len(filelike_requested):
             state.needs_user_clarification = True
             state.clarification_question = (
-                "I couldn't find "
+                "I checked the project files and couldn't find "
                 + (
                     f"the file '{state.missing_requested_files[0]}'"
                     if len(state.missing_requested_files) == 1
                     else f"any of these files: {', '.join(state.missing_requested_files)}"
                 )
-                + " in the current project directory. Could you confirm the exact "
-                "file path, or let me know if it should be created as a new file?"
+                + ", or anything close enough to safely treat as the same target. "
+                "Should I create it as a new file? Reply 'yes, create it' or give me the exact existing path to use instead."
             )
             state.complete = False
             log("context_missing_requested_file", {
@@ -222,8 +514,21 @@ class ContextBuilder:
                 break
             name = str(action.get("action", "done")).lower()
             if name == "done":
-                state.confidence = float(action.get("confidence", 0.0))
+                # Clip the LLM's self-reported confidence against the actual
+                # number of unresolved unknowns BEFORE storing it. Without
+                # this, a run that hit e.g. a failed inspect_file call still
+                # ends up reporting confidence=1.00 purely because the
+                # discovery-controller LLM said so — the unknown was tracked
+                # in state.knowledge.unknowns but nothing ever read that list
+                # when computing confidence.
+                raw_confidence = float(action.get("confidence", 0.0))
+                state.confidence = _penalized_confidence(raw_confidence, len(state.knowledge.unknowns))
                 state.knowledge.summaries.append(str(action.get("summary", "")))
+                log("context_confidence_penalized", {
+                    "raw_confidence": raw_confidence,
+                    "unknown_count": len(state.knowledge.unknowns),
+                    "penalized_confidence": state.confidence,
+                })
                 break
             if name not in {"inspect_file", "search_codebase", "read_file"}:
                 state.knowledge.add_unknown(f"Unsupported context action: {name}")
@@ -243,8 +548,15 @@ class ContextBuilder:
             self._run(state, "read_agent_history", {})
             action = self._decide(state, mission, history)
             if action and str(action.get("action", "")).lower() == "done":
-                state.confidence = float(action.get("confidence", 0.0))
+                raw_confidence = float(action.get("confidence", 0.0))
+                state.confidence = _penalized_confidence(raw_confidence, len(state.knowledge.unknowns))
                 state.knowledge.summaries.append(str(action.get("summary", "")))
+                log("context_confidence_penalized", {
+                    "raw_confidence": raw_confidence,
+                    "unknown_count": len(state.knowledge.unknowns),
+                    "penalized_confidence": state.confidence,
+                    "source": "post_history",
+                })
         # Planning is evidence-gated, not model-confidence-gated. A 7B model
         # can emit weak confidence or malformed JSON despite the project and
         # relevant files already being inspected.
@@ -253,9 +565,18 @@ class ContextBuilder:
         # legitimately create every file it names, so requiring an existing
         # inspected file wrongly blocks new projects and empty directories.
         state.complete = has_project
-        if state.complete and state.confidence < 0.90:
-            state.confidence = 0.90
-            state.knowledge.summaries.append("Planning permitted from verified project and file evidence.")
+        if state.complete and state.confidence < _MIN_FLOOR_CONFIDENCE:
+            # Floor confidence so a project/file-evidence-backed run is never
+            # blocked purely by a low or missing self-reported number — but
+            # the floor is now BELOW the old 0.90, and is applied AFTER the
+            # unknown-count penalty above, not instead of it. A run with
+            # several unresolved unknowns will floor at 0.55 (visibly
+            # "planning permitted, but shaky"), not silently jump to 0.90+.
+            state.confidence = _MIN_FLOOR_CONFIDENCE
+            state.knowledge.summaries.append(
+                "Planning permitted from verified project and file evidence "
+                "(confidence floored at minimum working threshold)."
+            )
         # Source code goes FIRST, metadata summary AFTER. This matters
         # because create_plan() only ever shows the planner LLM the first
         # ~6000 chars of this string (a hard local-model context budget
@@ -273,5 +594,10 @@ class ContextBuilder:
         state.context = source_block + "\n\n" + metadata_block if source_block else metadata_block
         if not state.complete:
             state.knowledge.add_unknown("Context confidence/evidence threshold was not met; planning is blocked.")
-        log("context_complete", {"confidence": state.confidence, "complete": state.complete, "actions": state.actions})
+        log("context_complete", {
+            "confidence": state.confidence,
+            "complete": state.complete,
+            "actions": state.actions,
+            "unknown_count": len(state.knowledge.unknowns),
+        })
         return state

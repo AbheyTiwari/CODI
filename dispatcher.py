@@ -10,15 +10,15 @@
 # Nothing here talks to an LLM. It is a pure router/executor.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import json
 import inspect
+import json
 import os
-import re
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from logger import log
+from state.checkpoints import checkpoint_before_write
+from tools.contracts import validate_tool_args
 from tools.registry import ToolRegistry
 
 _handler_info_cache: dict[int, dict] = {}
@@ -148,7 +148,17 @@ class Dispatcher:
 
         # ── Fix 1: action IS a tool name (e.g. "action": "write_file") ───────
         if action in tool_names:
-            args = {k: v for k, v in raw.items() if k not in ("action",)}
+            # Small/local models often emit the valid tool arguments under an
+            # ``args`` wrapper even when they incorrectly use the tool name as
+            # ``action``.  The old normalizer retained that wrapper, so a
+            # handler received {"args": {"path": ...}} and could never find
+            # its top-level path.  Unwrap first, then retain genuine root-level
+            # arguments for compatibility with the older direct-action shape.
+            nested_args = raw.get("args", {})
+            args = dict(nested_args) if isinstance(nested_args, dict) else {}
+            for key, value in raw.items():
+                if key not in ("action", "args", "reason", "truncation_warning") and key not in args:
+                    args[key] = value
             # content_lines → content (fix 3 inline)
             if "content_lines" in args:
                 args["content"] = "\n".join(str(l) for l in args.pop("content_lines"))
@@ -175,6 +185,13 @@ class Dispatcher:
                 args = t.get("args", {})
                 if not isinstance(args, dict):
                     args = {}
+                # A second common small-model shape is
+                # {"name":"tool","args":{"args":{...}}}.  Flatten this
+                # one accidental wrapper before contract validation so a
+                # recoverable schema slip does not consume a repair attempt.
+                nested_args = args.get("args")
+                if isinstance(nested_args, dict):
+                    args = {**nested_args, **{key: value for key, value in args.items() if key != "args"}}
                 # content_lines → content string
                 if "content_lines" in args:
                     args["content"] = "\n".join(str(l) for l in args.pop("content_lines"))
@@ -241,6 +258,11 @@ class Dispatcher:
 
         log("dispatcher_call", {"tool": name, "args": str(args)[:500]})
 
+        contract_error = validate_tool_args(name, args)
+        if contract_error:
+            log("dispatcher_contract_error", {"tool": name, "error": contract_error, "args": str(args)[:500]})
+            return {"tool": name, "status": "error", "output": contract_error, "args": args}
+
         handler = self.registry.get(name)
         if handler is None and name:
             alias_map = {
@@ -271,6 +293,9 @@ class Dispatcher:
 
         handler_info = _handler_info(handler)
         log("dispatcher_handler", {"tool": name, **handler_info})
+        checkpoint = checkpoint_before_write(name, args)
+        if checkpoint:
+            log("dispatcher_checkpoint", {"tool": name, **checkpoint})
 
         try:
             output = handler(args)
@@ -318,6 +343,7 @@ class Dispatcher:
                 "status": status,
                 "output": output_text,
                 "args": args,
+                "checkpoint": checkpoint,
                 **handler_info,
             }
         except Exception as e:
@@ -327,6 +353,7 @@ class Dispatcher:
                 "status": "error",
                 "output": f"Tool error: {e}",
                 "args": args,
+                "checkpoint": checkpoint,
                 **handler_info,
             }
 

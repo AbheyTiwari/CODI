@@ -30,6 +30,15 @@ dependencies = [
     "pydantic",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.ruff.lint]
+select = ["F", "I"]
+
 [project.scripts]
 codi = "cli:main"
 
@@ -37,7 +46,9 @@ codi = "cli:main"
 py-modules = [
     "main", "cli", "agent", "dispatcher", "memory", "indexer",
     "llm_factory", "logger", "log_viewer",
-    "config", "config_loader", "context_trimmer", "mcp_manager"
+    "config", "config_loader", "context_trimmer", "mcp_manager",
+    "status_stream", "quantized_embeddings", "football_theme",
+    "mcp_client", "validator", "executor",
 ]
 
 [tool.setuptools.packages.find]
