@@ -13,7 +13,7 @@
 import inspect
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from typing import Any
 
 from logger import log
@@ -22,6 +22,23 @@ from tools.contracts import validate_tool_args
 from tools.registry import ToolRegistry
 
 _handler_info_cache: dict[int, dict] = {}
+
+# Tools whose textual output is allowed to be sniffed for failure markers.
+# Fix #1: string-matching is opt-in per tool now, not a global heuristic that
+# can misclassify any tool whose legitimate output happens to contain these
+# substrings (e.g. a linter emitting a "### Error" markdown section, or an
+# error-log summarizer reporting "ERROR count: 0").
+TEXT_SNIFF_ALLOWLIST: set[str] = {
+    "browser_navigate",
+    "browser_click",
+    "browser_snapshot",
+    "browser_tool",
+}
+
+# Default per-tool-call timeout (seconds) when executing in parallel.
+# Fix #4: prevents one hung tool call (network call, subprocess that never
+# returns) from blocking the entire dispatch indefinitely.
+DEFAULT_TOOL_TIMEOUT_S = float(os.environ.get("DISPATCHER_TOOL_TIMEOUT_S", "120"))
 
 
 def wrap_prompt_data(content: str, *, path: str | None = None) -> str:
@@ -50,6 +67,12 @@ class Dispatcher:
                 payload = json.loads(output)
             except (TypeError, ValueError):
                 payload = None
+            # Fix #5: previously, if the underlying tool didn't return JSON,
+            # code_generation_complete/completion_sentinel/continuation_attempts
+            # metadata silently vanished with no trace. Now we log the loss and
+            # fall back to attaching the metadata as a separate top-level key
+            # on the result so callers relying on the sentinel don't silently
+            # lose it.
             if isinstance(payload, dict):
                 payload.update({
                     "code_generation_complete": metadata.get("code_generation_complete", False),
@@ -57,6 +80,18 @@ class Dispatcher:
                     "continuation_attempts": metadata.get("continuation_attempts", 0),
                 })
                 result["output"] = json.dumps(payload)
+            else:
+                log("dispatcher_metadata_dropped", {
+                    "tool": tool,
+                    "path": path,
+                    "reason": "tool output was not JSON; metadata could not be merged into output",
+                    "metadata_keys": list(metadata.keys()),
+                })
+                result["unmerged_metadata"] = {
+                    "code_generation_complete": metadata.get("code_generation_complete", False),
+                    "completion_sentinel": metadata.get("completion_sentinel"),
+                    "continuation_attempts": metadata.get("continuation_attempts", 0),
+                }
         status = "success" if result.get("status") == "ok" else "error"
         return {"status": status, "results": [result]}
 
@@ -221,16 +256,28 @@ class Dispatcher:
         if len(tool_calls) == 1:
             results.append(self._run_one(tool_calls[0]))
         else:
+            # Fix #4: bound total wait time per future so a hung tool call
+            # (network call, subprocess that never returns) cannot block the
+            # whole batch forever. On timeout we still return a well-formed
+            # error result for that tool instead of hanging or crashing.
             with ThreadPoolExecutor(max_workers=min(len(tool_calls), 6)) as pool:
                 futures = {
                     pool.submit(self._run_one, tc): tc
                     for tc in tool_calls
                 }
-                for future in as_completed(futures):
+                for future in as_completed(futures, timeout=None):
+                    tc = futures[future]
                     try:
-                        results.append(future.result())
+                        results.append(future.result(timeout=DEFAULT_TOOL_TIMEOUT_S))
+                    except FutureTimeoutError:
+                        log("dispatcher_timeout", {"tool": tc.get("name", "unknown"), "timeout_s": DEFAULT_TOOL_TIMEOUT_S})
+                        results.append({
+                            "tool":   tc.get("name", "unknown"),
+                            "status": "error",
+                            "output": f"Tool call timed out after {DEFAULT_TOOL_TIMEOUT_S}s",
+                            "args": tc.get("args", {}),
+                        })
                     except Exception as e:
-                        tc = futures[future]
                         results.append({
                             "tool":   tc.get("name", "unknown"),
                             "status": "error",
@@ -265,17 +312,15 @@ class Dispatcher:
 
         handler = self.registry.get(name)
         if handler is None and name:
+            # Fix #6: dropped the no-op self-mapped aliases (e.g.
+            # "write_file": "write_file") that could never fire — if
+            # registry.get(name) already failed for that exact name, mapping
+            # it to itself and trying again is dead code. Only genuine
+            # renames remain.
             alias_map = {
                 "list_directory": "list_files",
-                "create_directory": "create_directory",
-                "create_file": "create_file",
-                "write_file": "write_file",
-                "edit_file": "edit_file",
-                "read_file": "read_file",
                 "search": "search_codebase",
-                "search_codebase": "search_codebase",
                 "run_shell_command": "run_command",
-                "run_command": "run_command",
                 "shell": "run_command",
             }
             alias = alias_map.get(name)
@@ -293,9 +338,28 @@ class Dispatcher:
 
         handler_info = _handler_info(handler)
         log("dispatcher_handler", {"tool": name, **handler_info})
-        checkpoint = checkpoint_before_write(name, args)
-        if checkpoint:
-            log("dispatcher_checkpoint", {"tool": name, **checkpoint})
+
+        # Fix #2: checkpoint_before_write now runs inside the try/except.
+        # Previously, an exception here propagated straight out of
+        # dispatch()/​_execute_tools(), breaking this module's own stated
+        # invariant ("never crash, always return a usable dict"). A bad
+        # checkpoint call now degrades to a normal error result like every
+        # other failure mode in this function.
+        checkpoint = None
+        try:
+            checkpoint = checkpoint_before_write(name, args)
+            if checkpoint:
+                log("dispatcher_checkpoint", {"tool": name, **checkpoint})
+        except Exception as e:
+            log("dispatcher_checkpoint_error", {"tool": name, "error": str(e), **handler_info})
+            return {
+                "tool":   name,
+                "status": "error",
+                "output": f"Checkpoint error: {e}",
+                "args": args,
+                "checkpoint": None,
+                **handler_info,
+            }
 
         try:
             output = handler(args)
@@ -314,23 +378,30 @@ class Dispatcher:
                     output_text = json.dumps(payload)
                 else:
                     output_text = f"{output_text}\n{warning}" if output_text else warning
+
             status = "error" if output_text.startswith(("ERROR", "WRITE REJECTED", "BLOCKED")) else "ok"
-            # Some MCP adapters serialize a remote failure as a successful
-            # text response (for example "### Error\nError: browser...").
-            # Treat that as a real tool failure; otherwise a failed browser
-            # check can incorrectly complete a verification plan step.
-            lowered_output = output_text.lower()
-            if "### error" in lowered_output or "browserbackend.calltool:" in lowered_output:
-                status = "error"
-            # Most local tools return structured JSON.  A payload declaring
+
+            # Fix #1: text-sniffing for MCP-style failure markers is now
+            # opt-in per tool (TEXT_SNIFF_ALLOWLIST) instead of applying to
+            # every tool's output globally. A linter, doc generator, or
+            # scraped page containing the literal substring "### Error" no
+            # longer gets misclassified as a dispatcher failure.
+            if name in TEXT_SNIFF_ALLOWLIST:
+                lowered_output = output_text.lower()
+                if "### error" in lowered_output or "browserbackend.calltool:" in lowered_output:
+                    status = "error"
+
+            # Most local tools return structured JSON. A payload declaring
             # success:false is a real failure even though its serialized form
-            # does not start with the word "ERROR".
+            # does not start with the word "ERROR". This is the preferred,
+            # non-heuristic signal — push tools toward this contract.
             try:
                 payload = json.loads(output_text)
             except (TypeError, ValueError):
                 payload = None
             if isinstance(payload, dict) and payload.get("success") is False:
                 status = "error"
+
             log("dispatcher_ok", {
                 "tool": name,
                 "status": status,
@@ -486,11 +557,26 @@ class Dispatcher:
 
 
 def _handler_info(handler: Any) -> dict:
-    """Return Python source metadata for a registered tool handler."""
-    key = id(handler)
-    cached = _handler_info_cache.get(key)
-    if cached is not None:
-        return cached
+    """Return Python source metadata for a registered tool handler.
+
+    Fix #3: cache key is now (id(handler), qualified function identity) instead
+    of id(handler) alone. id() is only unique for an object's lifetime — if
+    handlers are ever rebuilt or hot-reloaded, a freed handler's id can be
+    reused by an unrelated object, silently returning stale module/file info.
+    Including the function's __module__/__qualname__ in the key means a reused
+    id with a different underlying function can't hit a stale cache entry.
+    This assumes handler identity (module + qualname) is stable for objects
+    that legitimately share it — true for normal function/method handlers.
+    """
+    func_identity = (
+        getattr(handler, "__module__", ""),
+        getattr(handler, "__qualname__", getattr(handler, "__name__", repr(handler))),
+    )
+    key = (id(handler), func_identity)
+    cache_key = hash(key)
+    cached = _handler_info_cache.get(cache_key)
+    if cached is not None and cached.get("_identity") == func_identity:
+        return {k: v for k, v in cached.items() if k != "_identity"}
 
     try:
         module = inspect.getmodule(handler)
@@ -507,5 +593,5 @@ def _handler_info(handler: Any) -> dict:
             "handler_file": "",
         }
 
-    _handler_info_cache[key] = result
+    _handler_info_cache[cache_key] = {**result, "_identity": func_identity}
     return result
